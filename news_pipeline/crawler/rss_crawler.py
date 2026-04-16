@@ -11,8 +11,9 @@ from news_pipeline.storage.database import get_connection
 
 NEWS_SOURCES = {
     "Mawbima": "https://www.mawbima.lk/feed",
-    "Ceylon Today Sinhala": "https://www.ceylontoday.lk/feed",
     "Divaina": "https://www.divaina.lk/feed",
+    "Silumina": "https://www.silumina.lk/feed",
+    "BBC Sinhala": "https://www.bbc.com/sinhala/index.xml",
 }
 
 def discover_urls(source_name, rss_url):
