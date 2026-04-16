@@ -1,12 +1,9 @@
 import feedparser
 import sqlite3
-import sys
-import os
 from datetime import datetime
 
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from news_pipeline.storage.database import get_connection
 
 NEWS_SOURCES = {
@@ -30,29 +27,31 @@ def discover_urls(source_name, rss_url):
 
     new_count = 0
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    for entry in feed.entries:
-        url = entry.get("link", "").strip()
-        if not url and entry.get("links"):
-            url = entry.links[0].get("href", "").strip()
-        if not url:
-            continue
+        for entry in feed.entries:
+            url = entry.get("link", "").strip()
+            if not url and entry.get("links"):
+                url = entry.links[0].get("href", "").strip()
+            if not url:
+                continue
 
-        try:
-            cursor.execute('''
-                INSERT OR IGNORE INTO discovered_urls (url, source, discovered_at, fetched)
-                VALUES (?, ?, ?, 0)
-            ''', (url, source_name, datetime.now()))
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO discovered_urls (url, source, discovered_at, fetched)
+                    VALUES (?, ?, ?, 0)
+                ''', (url, source_name, datetime.now()))
 
-            if cursor.rowcount > 0:
-                new_count += 1
+                if cursor.rowcount > 0:
+                    new_count += 1
 
-        except sqlite3.Error as e:
-            print(f"[{source_name}] DB error for {url}: {e}")
+            except sqlite3.Error as e:
+                print(f"[{source_name}] DB error for {url}: {e}")
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
     print(f"[{source_name}] Done — {new_count} new URLs saved.")
     return new_count
 

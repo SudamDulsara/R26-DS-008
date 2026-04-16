@@ -1,17 +1,22 @@
 import trafilatura
 import sqlite3
-import sys
-import os
 import requests
 import cloudscraper
 from datetime import datetime
+from urllib.parse import urlparse
 
 _scraper = cloudscraper.create_scraper()
 
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from news_pipeline.storage.database import get_connection
+
+def extract_category_from_url(url, source):
+    if source == 'Dinamina':
+        parts = [p for p in urlparse(url).path.split('/') if p]
+        if len(parts) >= 4:
+            return parts[3]
+    return ''
 
 def fetch_article(url):
     try:
@@ -78,18 +83,18 @@ def extract_articles():
                     print(f"    Skipped — text too short or empty")
                     failed += 1
                 else:
-                    lines = raw_text.strip().split('\n')
-                    title = lines[0].strip() if len(lines) > 0 else ''
-                    date = lines[1].strip() if len(lines) > 1 else ''
-                    body = '\n'.join(lines[2:]).strip()
+                    title = data.get('title', '')
+                    author = data.get('author', '')
+                    date = data.get('date', '')
+                    category = extract_category_from_url(url, source)
 
                     cursor.execute('''
-                        INSERT OR IGNORE INTO articles 
+                        INSERT OR IGNORE INTO articles
                         (url, source, title, author, published_date, category, raw_text, crawl_timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (url, source, title, '', date, '', body, datetime.now()))
+                    ''', (url, source, title, author, date, category, raw_text, datetime.now()))
 
-                    print(f"    Saved — {len(body)} chars | Title: {title[:50]}")
+                    print(f"    Saved — {len(raw_text)} chars | Title: {title[:50]}")
                     success += 1
 
             except json.JSONDecodeError:

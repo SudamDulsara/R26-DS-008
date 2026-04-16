@@ -1,16 +1,11 @@
 import unicodedata
 import re
 import sqlite3
-import sys
-import os
 from datetime import datetime
 
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-NEWS_PIPELINE_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'storage'))
-sys.path.insert(0, NEWS_PIPELINE_DIR)
-from database import get_connection
+from news_pipeline.storage.database import get_connection
 
 SINHALA_START = '\u0D80'
 SINHALA_END = '\u0DFF'
