@@ -10,10 +10,15 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from news_pipeline.storage.database import get_connection
 
 NEWS_SOURCES = {
-    "Mawbima": "https://www.mawbima.lk/feed",
-    "Divaina": "https://www.divaina.lk/feed",
-    "Silumina": "https://www.silumina.lk/feed",
-    "BBC Sinhala": "https://www.bbc.com/sinhala/index.xml",
+    "Mawbima":           "https://www.mawbima.lk/feed",
+    "Divaina":           "https://www.divaina.lk/feed",
+    "Silumina":          "https://www.silumina.lk/feed",
+    "BBC Sinhala":       "https://www.bbc.com/sinhala/index.xml",
+    "Ada Derana Sinhala": "https://sinhala.adaderana.lk/rsshotnews.php",
+    "Anidda":            "https://www.anidda.lk/feed",
+    "NethnewsLk":        "https://www.nethnews.lk/feed",
+    "Navaliya":          "https://www.navaliya.lk/feed",
+    "Dinamina":          "https://www.dinamina.lk/feed",
 }
 
 def discover_urls(source_name, rss_url):

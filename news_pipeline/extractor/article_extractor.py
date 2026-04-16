@@ -3,7 +3,10 @@ import sqlite3
 import sys
 import os
 import requests
+import cloudscraper
 from datetime import datetime
+
+_scraper = cloudscraper.create_scraper()
 
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
@@ -18,6 +21,11 @@ def fetch_article(url):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         response = requests.get(url, headers=headers, timeout=15)
+
+        if response.status_code == 403:
+            print(f"    HTTP 403 — retrying with cloudscraper...")
+            response = _scraper.get(url, timeout=20)
+
         if response.status_code != 200:
             print(f"    HTTP {response.status_code}")
             return None
