@@ -6,6 +6,9 @@ from datetime import datetime
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
 from news_pipeline.storage.database import get_connection
+from news_pipeline.storage.logger import get_logger
+
+logger = get_logger()
 
 SINHALA_START = '\u0D80'
 SINHALA_END = '\u0DFF'
@@ -45,7 +48,7 @@ def run_cleaner():
     cursor = conn.cursor()
 
     cursor.execute('SELECT COUNT(*) FROM articles')
-    print("Total articles in DB:", cursor.fetchone()[0])
+    logger.info(f"Total articles in DB: {cursor.fetchone()[0]}")
 
     cursor.execute('''
         SELECT id, url, source, raw_text FROM articles
@@ -54,8 +57,8 @@ def run_cleaner():
     articles = cursor.fetchall()
     conn.close()
 
-    print(f"=== Sinhala Cleaner Started ===")
-    print(f"Found {len(articles)} articles to clean\n")
+    logger.info(f"=== Sinhala Cleaner Started ===")
+    logger.info(f"Found {len(articles)} articles to clean\n")
 
     passed = 0
     failed = 0
@@ -77,7 +80,7 @@ def run_cleaner():
                 SET clean_text = ?, sinhala_purity = ?
                 WHERE id = ?
             ''', (clean_text, purity, article_id))
-            print(f"[{source}] ✓ PASSED — Purity: {purity_percent}%")
+            logger.info(f"[{source}] PASSED — Purity: {purity_percent}%")
             passed += 1
         else:
             cursor.execute('''
@@ -85,18 +88,18 @@ def run_cleaner():
                 SET clean_text = NULL, sinhala_purity = ?
                 WHERE id = ?
             ''', (purity, article_id))
-            print(f"[{source}] ✗ FAILED — Purity: {purity_percent}% (below {PURITY_THRESHOLD*100}%)")
+            logger.warning(f"[{source}] FAILED — Purity: {purity_percent}% (below {PURITY_THRESHOLD*100}%)")
             failed += 1
 
         conn.commit()
         conn.close()
 
-    print(f"\n=== Cleaning Complete ===")
+    logger.info(f"\n=== Cleaning Complete ===")
     if passed + failed > 0:
-        print(f"Passed: {passed} | Failed: {failed}")
-        print(f"Overall purity pass rate: {round(passed/(passed+failed)*100, 1)}%")
+        logger.info(f"Passed: {passed} | Failed: {failed}")
+        logger.info(f"Overall purity pass rate: {round(passed/(passed+failed)*100, 1)}%")
     else:
-        print("No articles to process.")
+        logger.info("No articles to process.")
 
 if __name__ == "__main__":
     run_cleaner()

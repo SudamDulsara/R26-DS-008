@@ -5,6 +5,9 @@ from datetime import datetime
 sqlite3.register_adapter(datetime, lambda d: d.isoformat())
 
 from news_pipeline.storage.database import get_connection
+from news_pipeline.storage.logger import get_logger
+
+logger = get_logger()
 
 NEWS_SOURCES = {
     "Mawbima":           "https://www.mawbima.lk/feed",
@@ -19,11 +22,11 @@ NEWS_SOURCES = {
 }
 
 def discover_urls(source_name, rss_url):
-    print(f"\n[{source_name}] Fetching RSS feed...")
+    logger.info(f"\n[{source_name}] Fetching RSS feed...")
     feed = feedparser.parse(rss_url)
 
     if feed.bozo:
-        print(f"[{source_name}] WARNING: Feed may have issues — {feed.bozo_exception}")
+        logger.warning(f"[{source_name}] Feed may have issues — {feed.bozo_exception}")
 
     new_count = 0
     conn = get_connection()
@@ -47,20 +50,20 @@ def discover_urls(source_name, rss_url):
                     new_count += 1
 
             except sqlite3.Error as e:
-                print(f"[{source_name}] DB error for {url}: {e}")
+                logger.error(f"[{source_name}] DB error for {url}: {e}")
 
         conn.commit()
     finally:
         conn.close()
-    print(f"[{source_name}] Done — {new_count} new URLs saved.")
+    logger.info(f"[{source_name}] Done — {new_count} new URLs saved.")
     return new_count
 
 def run_discovery():
-    print("=== URL Discovery Started ===")
+    logger.info("=== URL Discovery Started ===")
     total = 0
     for source_name, rss_url in NEWS_SOURCES.items():
         total += discover_urls(source_name, rss_url)
-    print(f"\n=== Discovery Complete — {total} total new URLs found ===")
+    logger.info(f"\n=== Discovery Complete — {total} total new URLs found ===")
 
 if __name__ == "__main__":
     run_discovery()
