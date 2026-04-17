@@ -58,6 +58,11 @@ def initialize_db():
         )
     ''')
 
+    try:
+        cursor.execute('ALTER TABLE discovered_urls ADD COLUMN fetch_attempts INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
     print("Database initialized successfully.")
