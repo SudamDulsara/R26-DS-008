@@ -1,10 +1,26 @@
+# Python bytecode
 __pycache__/
-data/
-logs/
+*.py[cod]
 
+# Environments
 .env
 .envrc
 .venv
 env/
 venv/
 ENV/
+
+# Logs and Data
+logs/
+data/
+*.wav
+audio-text-project_1/downloaded_audio.wav
+
+# Dataset files (Prevents large chunks from being pushed)
+dataset/
+audio-text-project_1/dataset/
+*.tsv
+
+# OS generated files
+.DS_Store
+Thumbs.db
