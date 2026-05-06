@@ -1,0 +1,152 @@
+import json
+from datetime import datetime
+
+from news_pipeline.config import load_config
+from news_pipeline.statuses import CLEAN_STATUS_CLEANED, DEDUPE_STATUS_UNIQUE
+from news_pipeline.storage.database import get_connection
+from news_pipeline.storage.logger import get_logger
+
+
+logger = get_logger()
+
+
+def _write_jsonl(path, rows):
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def export_snapshot():
+    config = load_config()
+    config.snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    snapshot_dir = config.snapshots_dir / snapshot_name
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            url,
+            source,
+            title,
+            author,
+            published_date,
+            category,
+            clean_text,
+            raw_text,
+            sinhala_purity,
+            content_hash,
+            clean_hash,
+            crawl_timestamp
+        FROM articles
+        WHERE clean_status = ?
+          AND dedupe_status = ?
+        ORDER BY id
+        """,
+        (CLEAN_STATUS_CLEANED, DEDUPE_STATUS_UNIQUE),
+    )
+    rows = cursor.fetchall()
+
+    fulltext_rows = []
+    metadata_rows = []
+    exported_ids = []
+
+    for row in rows:
+        record = dict(row)
+        article_id = record.pop("id")
+        raw_text = record.pop("raw_text", "")
+        clean_text = record.get("clean_text", "")
+
+        fulltext_rows.append(record)
+        metadata_rows.append(
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"clean_text"}
+            }
+            | {
+                "clean_text_length": len(clean_text or ""),
+                "raw_text_length": len(raw_text or ""),
+            }
+        )
+        exported_ids.append(article_id)
+
+    generated_at = datetime.now().isoformat(timespec="seconds")
+
+    cursor.execute("SELECT COUNT(*) AS count FROM discovered_urls")
+    total_urls = cursor.fetchone()["count"]
+    cursor.execute("SELECT status, COUNT(*) AS count FROM discovered_urls GROUP BY status")
+    url_status_counts = {row["status"]: row["count"] for row in cursor.fetchall()}
+
+    cursor.execute("SELECT COUNT(*) AS count FROM articles")
+    total_articles = cursor.fetchone()["count"]
+    cursor.execute(
+        "SELECT clean_status, COUNT(*) AS count FROM articles GROUP BY clean_status"
+    )
+    clean_status_counts = {
+        row["clean_status"]: row["count"] for row in cursor.fetchall()
+    }
+    cursor.execute(
+        "SELECT dedupe_status, COUNT(*) AS count FROM articles GROUP BY dedupe_status"
+    )
+    dedupe_status_counts = {
+        row["dedupe_status"]: row["count"] for row in cursor.fetchall()
+    }
+    cursor.execute("SELECT source, COUNT(*) AS count FROM articles GROUP BY source")
+    articles_by_source = {row["source"]: row["count"] for row in cursor.fetchall()}
+
+    if exported_ids:
+        cursor.executemany(
+            "UPDATE articles SET exported_at = ? WHERE id = ?",
+            [(generated_at, article_id) for article_id in exported_ids],
+        )
+
+    conn.commit()
+    conn.close()
+
+    fulltext_path = snapshot_dir / "dataset_fulltext.jsonl"
+    metadata_path = snapshot_dir / "dataset_metadata.jsonl"
+    report_path = snapshot_dir / "report.json"
+
+    _write_jsonl(fulltext_path, fulltext_rows)
+    _write_jsonl(metadata_path, metadata_rows)
+
+    report = {
+        "generated_at": generated_at,
+        "snapshot_name": snapshot_name,
+        "paths": {
+            "fulltext": str(fulltext_path),
+            "metadata": str(metadata_path),
+        },
+        "counts": {
+            "discovered_urls": total_urls,
+            "articles_total": total_articles,
+            "exported_unique_articles": len(fulltext_rows),
+        },
+        "url_status_counts": url_status_counts,
+        "clean_status_counts": clean_status_counts,
+        "dedupe_status_counts": dedupe_status_counts,
+        "articles_by_source": articles_by_source,
+    }
+
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    logger.info("=== Snapshot Export Complete ===")
+    logger.info("Exported %s unique cleaned articles", len(fulltext_rows))
+    logger.info("Snapshot directory: %s", snapshot_dir)
+
+    return {
+        "snapshot_dir": str(snapshot_dir),
+        "fulltext_path": str(fulltext_path),
+        "metadata_path": str(metadata_path),
+        "report_path": str(report_path),
+        "exported_unique_articles": len(fulltext_rows),
+    }
