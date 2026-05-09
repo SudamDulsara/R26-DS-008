@@ -22,11 +22,15 @@ the orchestrator, schema, and loader didn't change at all.
 from collections import Counter
 from pathlib import Path
 
-from .io import JsonlLoader, XlsxWriter
-from .linguistic import UnicodeNormalizer
 from .pipeline import QualityPipeline
-from .quality import ExactHashDeduplicator
 from .schema import Verdict
+
+from .linguistic.normalizer import UnicodeNormalizer
+from .quality.deduplicator import ExactHashDeduplicator
+from .io.loader import JsonlLoader
+from .io.writer import XlsxWriter
+from .quality.morphology import MorphologyQualityScorer
+
 
 
 def main() -> None:
@@ -40,6 +44,7 @@ def main() -> None:
     pipeline = QualityPipeline(stages=[
         UnicodeNormalizer(),
         ExactHashDeduplicator(),
+        MorphologyQualityScorer(),
     ])
 
     loader = JsonlLoader(sample_file)
