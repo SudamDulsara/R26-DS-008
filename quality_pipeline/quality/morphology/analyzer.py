@@ -28,7 +28,7 @@ What this analyzer is NOT:
   - It does NOT handle sandhi (morphophonological) rules at boundaries
   - It does NOT use POS context to disambiguate overlapping suffixes (-lā as
     plural vs. -lā as past participle) — it just records both possibilities.
-  These limitations are honest, documented, and don't break the quality
+  These limitations are documented, and don't break the quality
   signal. Replacing the engine with a learned analyzer later is a drop-in
   swap because the output schema (Morpheme, MorphemeAnalysis) is stable.
 """
