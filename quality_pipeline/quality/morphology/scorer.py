@@ -39,8 +39,8 @@ What the score is NOT
 It is *not* a substitute for human review. It's one signal among several
 (dedup, length, language ID, safety) that together drive the final
 accept/review/reject verdict. A document with low morphological richness
-might still be valid — a list of place names, a math problem, a song
-lyric. The router (Stage 4) is what makes the actual decision.
+might still be valid — a list of place names, a math problem, a song lyric. 
+The router (Stage 4) is what makes the actual decision.
 """
 
 from collections import Counter
@@ -73,31 +73,40 @@ class MorphologyQualityScorer(Stage):
         features = self._compute_features(analyses)
         score = self._combine_score(features) if features["scoreable"] else 0.0
 
-        # Record everything on the document.
         doc.quality["morphology"] = {
             "features": features,
             "score": round(score, 1),
             "per_word": [self._summarize_word(a) for a in analyses],
         }
 
-        # Update verdict if we already have enough signal.
-        # We only mark REJECT here; a REVIEW or ACCEPT can be overridden by
-        # later stages, but a clear morphological reject usually stays rejected.
-        if features["scoreable"]:
-            if score < REJECT_THRESHOLD:
-                doc.verdict = Verdict.REJECT
+        # NEW: docs with no Sinhala at all are rejected regardless of why we couldn't score them. 
+        # The pipeline produces a Sinhala corpus; non-Sinhala has no place in it.
+        
+        if features["sinhala_words"] == 0:
+            doc.verdict = Verdict.REJECT
+            doc.verdict_reasons.append("no_sinhala_content")
+            return doc
+
+        # Docs that are too short to score reliably go to REVIEW, not ACCEPT.
+        # A human can decide; we shouldn't tentatively accept on no information.
+        if not features["scoreable"]:
+            if doc.verdict == Verdict.PENDING:
+                doc.verdict = Verdict.REVIEW
                 doc.verdict_reasons.append(
-                    f"low_morphology_score:{score:.1f}<{REJECT_THRESHOLD}"
+                    f"too_short_to_score:{features['sinhala_words']}_sinhala_words"
                 )
-            elif score < ACCEPT_THRESHOLD:
-                if doc.verdict == Verdict.PENDING:
-                    doc.verdict = Verdict.REVIEW
-                    doc.verdict_reasons.append(
-                        f"borderline_morphology:{score:.1f}"
-                    )
+            return doc
+
+        # Existing scoring-based routing.
+        if score < REJECT_THRESHOLD:
+            doc.verdict = Verdict.REJECT
+            doc.verdict_reasons.append(f"low_morphology_score:{score:.1f}<{REJECT_THRESHOLD}")
+        elif score < ACCEPT_THRESHOLD:
+            if doc.verdict == Verdict.PENDING:
+                doc.verdict = Verdict.REVIEW
+                doc.verdict_reasons.append(f"borderline_morphology:{score:.1f}")
 
         return doc
-
     # --- Feature computation ----------------------------------------------
 
     def _compute_features(self, analyses: list[MorphemeAnalysis]) -> dict:

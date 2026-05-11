@@ -36,10 +36,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 import streamlit as st
 
-from quality_pipeline.linguistic import UnicodeNormalizer
+from quality_pipeline.linguistic.normalizer import UnicodeNormalizer
+from quality_pipeline.quality.deduplicator import ExactHashDeduplicator
+from quality_pipeline.quality.morphology.scorer import MorphologyQualityScorer
 from quality_pipeline.pipeline import QualityPipeline
-from quality_pipeline.quality import ExactHashDeduplicator
-from quality_pipeline.quality.morphology import MorphologyQualityScorer
 from quality_pipeline.schema import Document, Source, Verdict
 
 from quality_pipeline.frontend.components.feature_chart import render_feature_chart
