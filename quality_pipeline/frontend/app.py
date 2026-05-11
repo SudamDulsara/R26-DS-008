@@ -37,9 +37,9 @@ if str(_REPO_ROOT) not in sys.path:
 import streamlit as st
 
 from quality_pipeline.linguistic.normalizer import UnicodeNormalizer
-from quality_pipeline.quality.deduplicator import ExactHashDeduplicator
-from quality_pipeline.quality.morphology.scorer import MorphologyQualityScorer
 from quality_pipeline.pipeline import QualityPipeline
+from quality_pipeline.quality.deduplicator import ExactHashDeduplicator
+from quality_pipeline.quality.morphology import MorphologyQualityScorer
 from quality_pipeline.schema import Document, Source, Verdict
 
 from quality_pipeline.frontend.components.feature_chart import render_feature_chart
@@ -47,6 +47,7 @@ from quality_pipeline.frontend.components.score_display import (
     render_score_gauge,
     render_verdict_badge,
 )
+from quality_pipeline.frontend.components.stage_details import render_stage_details
 from quality_pipeline.frontend.components.word_breakdown import render_word_breakdown
 
 
@@ -72,6 +73,11 @@ DEMO_EXAMPLES = {
         "ශ්‍රී ලංකා ක්‍රිකට් කණ්ඩායම අද ජයග්‍රහණය ලබා ගත්තේය. තරගය "
         "කොළඹදී පැවැත්වුණි. ක්‍රීඩකයන් 11 දෙනා හොඳින් ක්‍රීඩා කළහ. "
         "ජනාධිපතිවරයා කණ්ඩායමට සුබපැතුම් එක් කළේය."
+    ),
+    "🧪 Same news with hidden junk (BOM + ZWSP + extra spaces)": (
+        "\ufeffශ්‍රී ලංකා\u200b ක්‍රිකට්   කණ්ඩායම   අද\u200b ජයග්‍රහණය ලබා ගත්තේය. "
+        "තරගය කොළඹදී    පැවැත්වුණි. ක්‍රීඩකයන් 11 දෙනා හොඳින් ක්‍රීඩා කළහ. "
+        "ජනාධිපතිවරයා කණ්ඩායමට සුබපැතුම් එක් කළේය.\ufeff"
     ),
     "📚 OCR — clean book page": (
         "ශ්‍රී ලංකාවේ ඉතිහාසය පුරාණ රාජවංශ සමයේ සිට පටන් ගනී. "
@@ -195,6 +201,9 @@ def render_document_result(doc: Document, header: str | None = None) -> None:
 
     with st.expander("🔍 Per-word morphological breakdown", expanded=False):
         render_word_breakdown(doc)
+
+    with st.expander("⚙️ Pipeline stage details (Unicode, dedup, scoring)", expanded=False):
+        render_stage_details(doc)
 
 
 # ---------------------------------------------------------------------------
