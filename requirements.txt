@@ -19,11 +19,13 @@ regex==2026.4.4
 requests==2.33.1
 schedule==1.2.2
 scipy==1.17.1
+sentence-transformers>=3.0.0
 sgmllib3k==1.0.0
 six==1.17.0
 soupsieve==2.8.3
 tld==0.13.2
 trafilatura==2.0.0
+truststore>=0.10.4
 typing_extensions==4.15.0
 tzdata==2026.1
 tzlocal==5.3.1

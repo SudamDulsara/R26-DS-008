@@ -100,6 +100,47 @@ def export_snapshot():
     cursor.execute("SELECT source, COUNT(*) AS count FROM articles GROUP BY source")
     articles_by_source = {row["source"]: row["count"] for row in cursor.fetchall()}
 
+    cursor.execute(
+        """
+        SELECT
+            id,
+            cluster_key,
+            representative_article_id,
+            model_name,
+            text_variant,
+            similarity_threshold,
+            event_date_start,
+            event_date_end,
+            article_count,
+            source_count,
+            confidence,
+            created_at
+        FROM story_clusters
+        ORDER BY id
+        """
+    )
+    cluster_rows = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute(
+        """
+        SELECT
+            members.cluster_id,
+            clusters.cluster_key,
+            members.article_id,
+            members.similarity_score,
+            members.is_representative,
+            articles.url,
+            articles.source,
+            articles.title,
+            articles.published_date
+        FROM story_cluster_members AS members
+        JOIN story_clusters AS clusters ON clusters.id = members.cluster_id
+        JOIN articles ON articles.id = members.article_id
+        ORDER BY members.cluster_id, members.is_representative DESC, members.article_id
+        """
+    )
+    cluster_member_rows = [dict(row) for row in cursor.fetchall()]
+
     if exported_ids:
         cursor.executemany(
             "UPDATE articles SET exported_at = ? WHERE id = ?",
@@ -111,10 +152,14 @@ def export_snapshot():
 
     fulltext_path = snapshot_dir / "dataset_fulltext.jsonl"
     metadata_path = snapshot_dir / "dataset_metadata.jsonl"
+    clusters_path = snapshot_dir / "story_clusters.jsonl"
+    cluster_members_path = snapshot_dir / "story_cluster_members.jsonl"
     report_path = snapshot_dir / "report.json"
 
     _write_jsonl(fulltext_path, fulltext_rows)
     _write_jsonl(metadata_path, metadata_rows)
+    _write_jsonl(clusters_path, cluster_rows)
+    _write_jsonl(cluster_members_path, cluster_member_rows)
 
     report = {
         "generated_at": generated_at,
@@ -122,11 +167,15 @@ def export_snapshot():
         "paths": {
             "fulltext": str(fulltext_path),
             "metadata": str(metadata_path),
+            "story_clusters": str(clusters_path),
+            "story_cluster_members": str(cluster_members_path),
         },
         "counts": {
             "discovered_urls": total_urls,
             "articles_total": total_articles,
             "exported_unique_articles": len(fulltext_rows),
+            "story_clusters": len(cluster_rows),
+            "story_cluster_members": len(cluster_member_rows),
         },
         "url_status_counts": url_status_counts,
         "clean_status_counts": clean_status_counts,
@@ -141,12 +190,16 @@ def export_snapshot():
 
     logger.info("=== Snapshot Export Complete ===")
     logger.info("Exported %s unique cleaned articles", len(fulltext_rows))
+    logger.info("Exported %s story clusters", len(cluster_rows))
     logger.info("Snapshot directory: %s", snapshot_dir)
 
     return {
         "snapshot_dir": str(snapshot_dir),
         "fulltext_path": str(fulltext_path),
         "metadata_path": str(metadata_path),
+        "clusters_path": str(clusters_path),
+        "cluster_members_path": str(cluster_members_path),
         "report_path": str(report_path),
         "exported_unique_articles": len(fulltext_rows),
+        "story_clusters": len(cluster_rows),
     }

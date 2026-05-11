@@ -1,4 +1,5 @@
 from news_pipeline.cleaner.sinhala_cleaner import run_cleaner
+from news_pipeline.clustering.event_clusterer import run_event_clustering
 from news_pipeline.crawler.rss_crawler import run_discovery
 from news_pipeline.dataset.exporter import export_snapshot
 from news_pipeline.deduplicator.exact_deduper import run_exact_dedup
@@ -40,7 +41,11 @@ def run_pipeline():
         stats["deduplication"] = run_exact_dedup()
 
         logger.info("")
-        _log_step(logger, "STEP 5: Export - Versioned Snapshot")
+        _log_step(logger, "STEP 5: Cluster - Same-Event Story Groups")
+        stats["clustering"] = run_event_clustering()
+
+        logger.info("")
+        _log_step(logger, "STEP 6: Export - Versioned Snapshot")
         stats["export"] = export_snapshot()
 
         finish_pipeline_run(run_id, "completed", stats)

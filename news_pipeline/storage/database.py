@@ -97,6 +97,41 @@ def initialize_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS story_clusters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_key TEXT UNIQUE NOT NULL,
+            representative_article_id INTEGER,
+            model_name TEXT NOT NULL,
+            text_variant TEXT NOT NULL,
+            similarity_threshold REAL NOT NULL,
+            event_date_start TEXT,
+            event_date_end TEXT,
+            article_count INTEGER NOT NULL,
+            source_count INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (representative_article_id) REFERENCES articles(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS story_cluster_members (
+            cluster_id INTEGER NOT NULL,
+            article_id INTEGER NOT NULL,
+            similarity_score REAL,
+            is_representative INTEGER DEFAULT 0,
+            PRIMARY KEY (cluster_id, article_id),
+            FOREIGN KEY (cluster_id) REFERENCES story_clusters(id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (article_id) REFERENCES articles(id)
+        )
+        """
+    )
+
     _ensure_column(cursor, "discovered_urls", "rss_title", "rss_title TEXT")
     _ensure_column(cursor, "discovered_urls", "rss_published", "rss_published TEXT")
     _ensure_column(
@@ -171,6 +206,18 @@ def initialize_db():
         """
         CREATE INDEX IF NOT EXISTS idx_articles_clean_hash
         ON articles(clean_hash)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_story_clusters_representative
+        ON story_clusters(representative_article_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_story_cluster_members_article
+        ON story_cluster_members(article_id)
         """
     )
 
