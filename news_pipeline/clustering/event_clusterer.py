@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from news_pipeline.clustering.candidate_builder import CandidatePair, build_candidate_pairs
+from news_pipeline.clustering.candidate_builder import (
+    CandidatePair,
+    build_candidate_pairs,
+)
 from news_pipeline.clustering.embedder import cosine_similarity, create_embedder
 from news_pipeline.clustering.text import (
     ClusterArticle,
@@ -37,6 +40,16 @@ class StoryCluster:
     member_scores: dict[int, float]
 
 
+@dataclass(frozen=True)
+class ClusterBuildResult:
+    clusters: list[StoryCluster]
+    initial_components: int
+    changed_components: int
+    split_components: int
+    unclustered_articles: int
+    cohesion_fallback_members: int
+
+
 class UnionFind:
     def __init__(self, values: list[int]):
         self.parent = {value: value for value in values}
@@ -56,15 +69,41 @@ class UnionFind:
 
 def run_event_clustering(
     model_name: Optional[str] = None,
+    model_revision: Optional[str] = None,
     similarity_threshold: Optional[float] = None,
+    representative_threshold: Optional[float] = None,
+    cohesion_threshold: Optional[float] = None,
 ):
     config = load_config()
     selected_model = model_name or config.cluster_model_name
+    selected_revision = model_revision
+    if selected_revision is None and selected_model == config.cluster_model_name:
+        selected_revision = config.cluster_model_revision
     threshold = (
         similarity_threshold
         if similarity_threshold is not None
         else config.cluster_similarity_threshold
     )
+    representative_cutoff = (
+        representative_threshold
+        if representative_threshold is not None
+        else config.cluster_representative_threshold
+    )
+    cohesion_cutoff = (
+        cohesion_threshold
+        if cohesion_threshold is not None
+        else config.cluster_cohesion_threshold
+    )
+    _validate_similarity_threshold("similarity_threshold", threshold)
+    _validate_similarity_threshold(
+        "representative_threshold",
+        representative_cutoff,
+    )
+    _validate_similarity_threshold("cohesion_threshold", cohesion_cutoff)
+    if cohesion_cutoff > representative_cutoff:
+        raise ValueError(
+            "cohesion_threshold cannot exceed representative_threshold"
+        )
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -72,7 +111,15 @@ def run_event_clustering(
     articles = _load_cluster_articles(cursor, config.cluster_lead_char_limit)
     logger.info("=== Same-Event Clustering Started ===")
     logger.info("Eligible unique cleaned articles: %s", len(articles))
-    logger.info("Model: %s | Threshold: %s", selected_model, threshold)
+    logger.info(
+        "Model: %s@%s | Link threshold: %s | Representative threshold: %s | "
+        "Cohesion threshold: %s",
+        selected_model,
+        selected_revision or "latest",
+        threshold,
+        representative_cutoff,
+        cohesion_cutoff,
+    )
 
     if len(articles) < config.cluster_min_articles:
         _replace_clusters(cursor)
@@ -86,7 +133,10 @@ def run_event_clustering(
             "story_clusters": 0,
             "clustered_articles": 0,
             "model_name": selected_model,
+            "model_revision": selected_revision,
             "similarity_threshold": threshold,
+            "representative_threshold": representative_cutoff,
+            "cohesion_threshold": cohesion_cutoff,
         }
 
     candidates = build_candidate_pairs(
@@ -98,17 +148,21 @@ def run_event_clustering(
     logger.info("Candidate pairs: %s", len(candidates))
 
     article_by_id = {article.id: article for article in articles}
-    embedder = create_embedder(selected_model)
+    embedder = create_embedder(selected_model, selected_revision)
     embeddings = _embed_articles(articles, embedder, config.cluster_batch_size)
     scored_pairs = _score_pairs(candidates, embeddings)
     linked_pairs = [
         pair for pair in scored_pairs if pair.similarity_score >= threshold
     ]
-    clusters = _build_story_clusters(
+    build_result = _build_story_clusters(
         articles,
         linked_pairs,
+        embeddings=embeddings,
         min_articles=config.cluster_min_articles,
+        representative_threshold=representative_cutoff,
+        cohesion_threshold=cohesion_cutoff,
     )
+    clusters = build_result.clusters
 
     _replace_clusters(cursor)
     _persist_clusters(
@@ -116,8 +170,11 @@ def run_event_clustering(
         clusters=clusters,
         article_by_id=article_by_id,
         model_name=embedder.model_name,
+        model_revision=embedder.model_revision,
         text_variant="title_lead",
         similarity_threshold=threshold,
+        representative_threshold=representative_cutoff,
+        cohesion_threshold=cohesion_cutoff,
     )
     conn.commit()
     conn.close()
@@ -129,6 +186,17 @@ def run_event_clustering(
     logger.info("Linked pairs over threshold: %s", len(linked_pairs))
     logger.info("Story clusters created: %s", len(clusters))
     logger.info("Clustered articles: %s", len(clustered_article_ids))
+    logger.info(
+        "Representative validation changed %s components, split %s, and left "
+        "%s component articles unclustered",
+        build_result.changed_components,
+        build_result.split_components,
+        build_result.unclustered_articles,
+    )
+    logger.info(
+        "Cohesion fallback retained %s borderline members",
+        build_result.cohesion_fallback_members,
+    )
 
     return {
         "eligible_articles": len(articles),
@@ -136,9 +204,22 @@ def run_event_clustering(
         "linked_pairs": len(linked_pairs),
         "story_clusters": len(clusters),
         "clustered_articles": len(clustered_article_ids),
+        "initial_story_components": build_result.initial_components,
+        "representative_changed_components": build_result.changed_components,
+        "representative_split_components": build_result.split_components,
+        "representative_unclustered_articles": build_result.unclustered_articles,
+        "cohesion_fallback_members": build_result.cohesion_fallback_members,
         "model_name": embedder.model_name,
+        "model_revision": embedder.model_revision,
         "similarity_threshold": threshold,
+        "representative_threshold": representative_cutoff,
+        "cohesion_threshold": cohesion_cutoff,
     }
+
+
+def _validate_similarity_threshold(name: str, value: float):
+    if not -1.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between -1.0 and 1.0; got {value}")
 
 
 def _load_cluster_articles(cursor, lead_char_limit: int) -> list[ClusterArticle]:
@@ -225,10 +306,13 @@ def _score_pairs(
 def _build_story_clusters(
     articles: list[ClusterArticle],
     linked_pairs: list[ScoredPair],
+    embeddings: dict[int, list[float]],
     min_articles: int,
-) -> list[StoryCluster]:
+    representative_threshold: float,
+    cohesion_threshold: float,
+) -> ClusterBuildResult:
     if not linked_pairs:
-        return []
+        return ClusterBuildResult([], 0, 0, 0, 0, 0)
 
     article_ids = [article.id for article in articles]
     article_by_id = {article.id: article for article in articles}
@@ -236,41 +320,195 @@ def _build_story_clusters(
         frozenset((pair.left_id, pair.right_id)): pair.similarity_score
         for pair in linked_pairs
     }
-    union_find = UnionFind(article_ids)
+    initial_components = [
+        component
+        for component in _connected_components(article_ids, pair_scores)
+        if len(component) >= min_articles
+    ]
 
-    for pair in linked_pairs:
-        union_find.union(pair.left_id, pair.right_id)
+    clusters: list[StoryCluster] = []
+    changed_components = 0
+    split_components = 0
+    cohesion_fallback_members = 0
+    initial_component_article_ids = set()
+    for component in initial_components:
+        initial_component_article_ids.update(component)
+        component_clusters, component_fallback_members = (
+            _partition_component_by_representative(
+                component,
+                pair_scores,
+                article_by_id,
+                embeddings,
+                min_articles,
+                representative_threshold,
+                cohesion_threshold,
+            )
+        )
+        clusters.extend(component_clusters)
+        cohesion_fallback_members += component_fallback_members
+
+        unchanged = (
+            len(component_clusters) == 1
+            and set(component_clusters[0].article_ids) == set(component)
+        )
+        if not unchanged:
+            changed_components += 1
+        if len(component_clusters) > 1:
+            split_components += 1
+
+    clustered_article_ids = {
+        article_id for cluster in clusters for article_id in cluster.article_ids
+    }
+    return ClusterBuildResult(
+        clusters=sorted(clusters, key=lambda cluster: cluster.article_ids),
+        initial_components=len(initial_components),
+        changed_components=changed_components,
+        split_components=split_components,
+        unclustered_articles=len(
+            initial_component_article_ids - clustered_article_ids
+        ),
+        cohesion_fallback_members=cohesion_fallback_members,
+    )
+
+
+def _connected_components(
+    article_ids: list[int],
+    pair_scores: dict[frozenset[int], float],
+) -> list[list[int]]:
+    if not article_ids:
+        return []
+
+    article_id_set = set(article_ids)
+    union_find = UnionFind(article_ids)
+    for pair_key in pair_scores:
+        if len(pair_key) != 2 or not pair_key.issubset(article_id_set):
+            continue
+        left_id, right_id = tuple(pair_key)
+        union_find.union(left_id, right_id)
 
     grouped_ids: dict[int, list[int]] = defaultdict(list)
     for article_id in article_ids:
         grouped_ids[union_find.find(article_id)].append(article_id)
 
+    return sorted(
+        (sorted(group) for group in grouped_ids.values()),
+        key=lambda group: group,
+    )
+
+
+def _partition_component_by_representative(
+    article_ids: list[int],
+    pair_scores: dict[frozenset[int], float],
+    article_by_id: dict[int, ClusterArticle],
+    embeddings: dict[int, list[float]],
+    min_articles: int,
+    representative_threshold: float,
+    cohesion_threshold: float,
+) -> tuple[list[StoryCluster], int]:
+    pending_groups = [sorted(article_ids)]
     clusters: list[StoryCluster] = []
-    for grouped_article_ids in grouped_ids.values():
-        if len(grouped_article_ids) < min_articles:
+    cohesion_fallback_members = 0
+
+    while pending_groups:
+        group = pending_groups.pop(0)
+        if len(group) < min_articles:
             continue
 
         representative_id = _choose_representative(
-            grouped_article_ids,
+            group,
             pair_scores,
             article_by_id,
         )
         member_scores = _member_scores_to_representative(
-            grouped_article_ids,
+            group,
             representative_id,
-            pair_scores,
+            embeddings,
         )
-        confidence = _cluster_confidence(grouped_article_ids, pair_scores)
-        clusters.append(
-            StoryCluster(
-                article_ids=sorted(grouped_article_ids),
-                representative_article_id=representative_id,
-                confidence=confidence,
-                member_scores=member_scores,
-            )
+        accepted_ids = [
+            article_id
+            for article_id in group
+            if member_scores[article_id] >= representative_threshold
+        ]
+        accepted_ids, fallback_ids = _add_cohesive_borderline_members(
+            group,
+            accepted_ids,
+            member_scores,
+            embeddings,
+            cohesion_threshold,
         )
 
-    return sorted(clusters, key=lambda cluster: cluster.article_ids)
+        if len(accepted_ids) >= min_articles:
+            accepted_scores = {
+                article_id: member_scores[article_id]
+                for article_id in accepted_ids
+            }
+            clusters.append(
+                StoryCluster(
+                    article_ids=sorted(accepted_ids),
+                    representative_article_id=representative_id,
+                    confidence=_cluster_confidence(
+                        accepted_scores,
+                        representative_id,
+                    ),
+                    member_scores=accepted_scores,
+                )
+            )
+            cohesion_fallback_members += len(fallback_ids)
+            remaining_ids = [
+                article_id
+                for article_id in group
+                if article_id not in accepted_scores
+            ]
+        else:
+            remaining_ids = [
+                article_id
+                for article_id in group
+                if article_id != representative_id
+            ]
+
+        pending_groups.extend(
+            component
+            for component in _connected_components(remaining_ids, pair_scores)
+            if len(component) >= min_articles
+        )
+
+    return clusters, cohesion_fallback_members
+
+
+def _add_cohesive_borderline_members(
+    article_ids: list[int],
+    accepted_ids: list[int],
+    representative_scores: dict[int, float],
+    embeddings: dict[int, list[float]],
+    cohesion_threshold: float,
+) -> tuple[list[int], list[int]]:
+    accepted = list(accepted_ids)
+    accepted_set = set(accepted_ids)
+    fallback_ids = []
+    candidates = sorted(
+        (
+            article_id
+            for article_id in article_ids
+            if article_id not in accepted_set
+            and representative_scores[article_id] >= cohesion_threshold
+        ),
+        key=lambda article_id: (-representative_scores[article_id], article_id),
+    )
+
+    for candidate_id in candidates:
+        candidate_embedding = embeddings.get(candidate_id)
+        if not candidate_embedding:
+            continue
+        is_cohesive = all(
+            cosine_similarity(candidate_embedding, embeddings.get(member_id, []))
+            >= cohesion_threshold
+            for member_id in accepted
+        )
+        if is_cohesive:
+            accepted.append(candidate_id)
+            fallback_ids.append(candidate_id)
+
+    return accepted, fallback_ids
 
 
 def _choose_representative(
@@ -297,29 +535,31 @@ def _choose_representative(
 def _member_scores_to_representative(
     article_ids: list[int],
     representative_article_id: int,
-    pair_scores: dict[frozenset[int], float],
+    embeddings: dict[int, list[float]],
 ) -> dict[int, float]:
+    representative_embedding = embeddings.get(representative_article_id)
     member_scores = {}
     for article_id in article_ids:
         if article_id == representative_article_id:
             member_scores[article_id] = 1.0
         else:
-            member_scores[article_id] = pair_scores.get(
-                frozenset((representative_article_id, article_id)),
-                0.0,
+            member_embedding = embeddings.get(article_id)
+            member_scores[article_id] = (
+                cosine_similarity(representative_embedding, member_embedding)
+                if representative_embedding and member_embedding
+                else 0.0
             )
     return member_scores
 
 
 def _cluster_confidence(
-    article_ids: list[int],
-    pair_scores: dict[frozenset[int], float],
+    member_scores: dict[int, float],
+    representative_article_id: int,
 ) -> float:
-    article_id_set = set(article_ids)
     scores = [
         score
-        for key, score in pair_scores.items()
-        if key.issubset(article_id_set)
+        for article_id, score in member_scores.items()
+        if article_id != representative_article_id
     ]
     if not scores:
         return 0.0
@@ -336,18 +576,30 @@ def _persist_clusters(
     clusters: list[StoryCluster],
     article_by_id: dict[int, ClusterArticle],
     model_name: str,
+    model_revision: str,
     text_variant: str,
     similarity_threshold: float,
+    representative_threshold: float,
+    cohesion_threshold: float,
 ):
     created_at = datetime.now().isoformat(timespec="seconds")
     for cluster in clusters:
-        member_articles = [article_by_id[article_id] for article_id in cluster.article_ids]
+        member_articles = [
+            article_by_id[article_id] for article_id in cluster.article_ids
+        ]
         event_times = [
             article.event_time
             for article in member_articles
             if article.event_time is not None
         ]
-        cluster_key = _cluster_key(cluster.article_ids, model_name, similarity_threshold)
+        cluster_key = _cluster_key(
+            cluster.article_ids,
+            model_name,
+            model_revision,
+            similarity_threshold,
+            representative_threshold,
+            cohesion_threshold,
+        )
         source_count = len({article.source for article in member_articles})
 
         cursor.execute(
@@ -356,8 +608,11 @@ def _persist_clusters(
                 cluster_key,
                 representative_article_id,
                 model_name,
+                model_revision,
                 text_variant,
                 similarity_threshold,
+                representative_threshold,
+                cohesion_threshold,
                 event_date_start,
                 event_date_end,
                 article_count,
@@ -365,14 +620,17 @@ def _persist_clusters(
                 confidence,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cluster_key,
                 cluster.representative_article_id,
                 model_name,
+                model_revision,
                 text_variant,
                 similarity_threshold,
+                representative_threshold,
+                cohesion_threshold,
                 min(event_times) if event_times else None,
                 max(event_times) if event_times else None,
                 len(cluster.article_ids),
@@ -407,8 +665,16 @@ def _persist_clusters(
 def _cluster_key(
     article_ids: list[int],
     model_name: str,
+    model_revision: str,
     similarity_threshold: float,
+    representative_threshold: float,
+    cohesion_threshold: float,
 ) -> str:
-    raw_key = f"{model_name}|{similarity_threshold}|{','.join(map(str, article_ids))}"
+    raw_key = (
+        f"{model_name}@{model_revision}|{similarity_threshold}|"
+        f"{representative_threshold}|"
+        f"{cohesion_threshold}|"
+        f"{','.join(map(str, article_ids))}"
+    )
     digest = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:16]
     return f"story_{digest}"

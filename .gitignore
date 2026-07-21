@@ -8,3 +8,5 @@ logs/
 env/
 venv/
 ENV/
+
+news_pipeline/docs

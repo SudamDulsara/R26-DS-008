@@ -36,6 +36,17 @@ class ClusterReviewTests(unittest.TestCase):
 
         self.assertIn("indirect_graph_member", flags)
 
+    def test_build_member_flags_marks_cohesion_fallback_members(self):
+        flags = build_member_flags(
+            [
+                {"is_representative": 1, "similarity_score": 1.0},
+                {"is_representative": 0, "similarity_score": 0.915},
+            ],
+            representative_threshold=0.92,
+        )
+
+        self.assertIn("cohesion_fallback_member", flags)
+
 
 if __name__ == "__main__":
     unittest.main()

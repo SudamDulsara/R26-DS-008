@@ -1,6 +1,13 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+
+DEFAULT_CLUSTER_MODEL = "intfloat/multilingual-e5-base"
+DEFAULT_CLUSTER_MODEL_REVISION = (
+    "d128750597153bb5987e10b1c3493a34e5a4502a"
+)
 
 
 DEFAULT_NEWS_SOURCES = {
@@ -29,7 +36,10 @@ class PipelineConfig:
     min_article_length: int
     purity_threshold: float
     cluster_model_name: str
+    cluster_model_revision: Optional[str]
     cluster_similarity_threshold: float
+    cluster_representative_threshold: float
+    cluster_cohesion_threshold: float
     cluster_window_hours: int
     cluster_min_articles: int
     cluster_lead_char_limit: int
@@ -60,6 +70,13 @@ def _bool_from_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _optional_string_from_env(name: str, default: Optional[str]) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip() or None
+
+
 def load_config() -> PipelineConfig:
     project_root = Path(__file__).resolve().parent.parent
     data_dir = Path(os.getenv("NEWS_PIPELINE_DATA_DIR", project_root / "data"))
@@ -69,6 +86,27 @@ def load_config() -> PipelineConfig:
     )
     reviews_dir = Path(os.getenv("NEWS_PIPELINE_REVIEWS_DIR", data_dir / "reviews"))
     db_path = Path(os.getenv("NEWS_PIPELINE_DB_PATH", data_dir / "news_pipeline.db"))
+    cluster_similarity_threshold = _float_from_env(
+        "NEWS_PIPELINE_CLUSTER_SIMILARITY_THRESHOLD",
+        0.92,
+    )
+    cluster_representative_threshold = _float_from_env(
+        "NEWS_PIPELINE_CLUSTER_REPRESENTATIVE_THRESHOLD",
+        cluster_similarity_threshold,
+    )
+    default_cohesion_threshold = max(
+        -1.0,
+        round(cluster_representative_threshold - 0.02, 6),
+    )
+    cluster_model_name = os.getenv(
+        "NEWS_PIPELINE_CLUSTER_MODEL",
+        DEFAULT_CLUSTER_MODEL,
+    )
+    default_model_revision = (
+        DEFAULT_CLUSTER_MODEL_REVISION
+        if cluster_model_name == DEFAULT_CLUSTER_MODEL
+        else None
+    )
 
     return PipelineConfig(
         project_root=project_root,
@@ -81,13 +119,16 @@ def load_config() -> PipelineConfig:
         retry_delay_seconds=_int_from_env("NEWS_PIPELINE_RETRY_DELAY", 3),
         min_article_length=_int_from_env("NEWS_PIPELINE_MIN_ARTICLE_LENGTH", 50),
         purity_threshold=_float_from_env("NEWS_PIPELINE_PURITY_THRESHOLD", 0.85),
-        cluster_model_name=os.getenv(
-            "NEWS_PIPELINE_CLUSTER_MODEL",
-            "intfloat/multilingual-e5-base",
+        cluster_model_name=cluster_model_name,
+        cluster_model_revision=_optional_string_from_env(
+            "NEWS_PIPELINE_CLUSTER_MODEL_REVISION",
+            default_model_revision,
         ),
-        cluster_similarity_threshold=_float_from_env(
-            "NEWS_PIPELINE_CLUSTER_SIMILARITY_THRESHOLD",
-            0.92,
+        cluster_similarity_threshold=cluster_similarity_threshold,
+        cluster_representative_threshold=cluster_representative_threshold,
+        cluster_cohesion_threshold=_float_from_env(
+            "NEWS_PIPELINE_CLUSTER_COHESION_THRESHOLD",
+            default_cohesion_threshold,
         ),
         cluster_window_hours=_int_from_env("NEWS_PIPELINE_CLUSTER_WINDOW_HOURS", 72),
         cluster_min_articles=_int_from_env("NEWS_PIPELINE_CLUSTER_MIN_ARTICLES", 2),

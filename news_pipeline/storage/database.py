@@ -109,8 +109,11 @@ def initialize_db():
             cluster_key TEXT UNIQUE NOT NULL,
             representative_article_id INTEGER,
             model_name TEXT NOT NULL,
+            model_revision TEXT,
             text_variant TEXT NOT NULL,
             similarity_threshold REAL NOT NULL,
+            representative_threshold REAL NOT NULL,
+            cohesion_threshold REAL NOT NULL,
             event_date_start TEXT,
             event_date_end TEXT,
             article_count INTEGER NOT NULL,
@@ -203,6 +206,24 @@ def initialize_db():
     )
     _ensure_column(cursor, "articles", "cleaned_at", "cleaned_at TEXT")
     _ensure_column(cursor, "articles", "exported_at", "exported_at TEXT")
+    _ensure_column(
+        cursor,
+        "story_clusters",
+        "model_revision",
+        "model_revision TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "story_clusters",
+        "representative_threshold",
+        "representative_threshold REAL",
+    )
+    _ensure_column(
+        cursor,
+        "story_clusters",
+        "cohesion_threshold",
+        "cohesion_threshold REAL",
+    )
 
     cursor.execute(
         """

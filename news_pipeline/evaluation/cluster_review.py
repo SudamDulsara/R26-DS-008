@@ -34,7 +34,10 @@ def build_cluster_flags(cluster: dict) -> list[str]:
     return flags
 
 
-def build_member_flags(members: list[dict]) -> list[str]:
+def build_member_flags(
+    members: list[dict],
+    representative_threshold: Optional[float] = None,
+) -> list[str]:
     flags = []
     has_indirect_member = any(
         not member.get("is_representative")
@@ -43,6 +46,17 @@ def build_member_flags(members: list[dict]) -> list[str]:
     )
     if has_indirect_member:
         flags.append("indirect_graph_member")
+    has_cohesion_fallback_member = (
+        representative_threshold is not None
+        and any(
+            not member.get("is_representative")
+            and 0.0 < float(member.get("similarity_score") or 0.0)
+            < representative_threshold
+            for member in members
+        )
+    )
+    if has_cohesion_fallback_member:
+        flags.append("cohesion_fallback_member")
     return flags
 
 
@@ -101,8 +115,11 @@ def _load_clusters(cursor):
             cluster_key,
             representative_article_id,
             model_name,
+            model_revision,
             text_variant,
             similarity_threshold,
+            representative_threshold,
+            cohesion_threshold,
             event_date_start,
             event_date_end,
             article_count,
@@ -146,7 +163,10 @@ def _build_review_record(cluster: dict, members: list[dict], max_snippet_chars: 
         (member for member in members if member["is_representative"]),
         members[0] if members else {},
     )
-    flags = build_cluster_flags(cluster) + build_member_flags(members)
+    flags = build_cluster_flags(cluster) + build_member_flags(
+        members,
+        cluster.get("representative_threshold"),
+    )
 
     return {
         "cluster_id": cluster["id"],
@@ -156,8 +176,11 @@ def _build_review_record(cluster: dict, members: list[dict], max_snippet_chars: 
         "review_notes": "",
         "flags": flags,
         "model_name": cluster["model_name"],
+        "model_revision": cluster.get("model_revision") or "",
         "text_variant": cluster["text_variant"],
         "similarity_threshold": cluster["similarity_threshold"],
+        "representative_threshold": cluster["representative_threshold"],
+        "cohesion_threshold": cluster["cohesion_threshold"],
         "confidence": cluster["confidence"],
         "article_count": cluster["article_count"],
         "source_count": cluster["source_count"],
@@ -199,7 +222,10 @@ def _write_csv(path: Path, records: list[dict]):
         "review_notes",
         "flags",
         "model_name",
+        "model_revision",
         "similarity_threshold",
+        "representative_threshold",
+        "cohesion_threshold",
         "confidence",
         "article_count",
         "source_count",
@@ -233,7 +259,12 @@ def _write_csv(path: Path, records: list[dict]):
                     "review_notes": record["review_notes"],
                     "flags": "; ".join(record["flags"]),
                     "model_name": record["model_name"],
+                    "model_revision": record["model_revision"],
                     "similarity_threshold": record["similarity_threshold"],
+                    "representative_threshold": record[
+                        "representative_threshold"
+                    ],
+                    "cohesion_threshold": record["cohesion_threshold"],
                     "confidence": record["confidence"],
                     "article_count": record["article_count"],
                     "source_count": record["source_count"],

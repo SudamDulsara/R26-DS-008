@@ -1,12 +1,13 @@
 import hashlib
 import math
-from typing import Protocol
+from typing import Optional, Protocol
 
 from news_pipeline.clustering.text import tokenize_for_similarity
 
 
 class TextEmbedder(Protocol):
     model_name: str
+    model_revision: str
 
     def encode(self, texts: list[str], batch_size: int) -> list[list[float]]:
         ...
@@ -17,6 +18,7 @@ class HashingEmbedder:
 
     def __init__(self, dimensions: int = 384):
         self.model_name = "hashing"
+        self.model_revision = "builtin-v1"
         self.dimensions = dimensions
 
     def encode(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
@@ -24,7 +26,7 @@ class HashingEmbedder:
 
 
 class SentenceTransformerEmbedder:
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, model_revision: Optional[str] = None):
         self.model_name = model_name
         _enable_system_cert_store()
         try:
@@ -36,7 +38,12 @@ class SentenceTransformerEmbedder:
                 "lightweight offline smoke test."
             ) from exc
 
-        self._model = SentenceTransformer(model_name)
+        self._model = SentenceTransformer(model_name, revision=model_revision)
+        first_module = self._model[0]
+        auto_model = getattr(first_module, "auto_model", None)
+        model_config = getattr(auto_model, "config", None)
+        resolved_revision = getattr(model_config, "_commit_hash", None)
+        self.model_revision = resolved_revision or model_revision or "unresolved"
 
     def encode(self, texts: list[str], batch_size: int = 16) -> list[list[float]]:
         formatted_texts = [_format_for_model(self.model_name, text) for text in texts]
@@ -49,10 +56,13 @@ class SentenceTransformerEmbedder:
         return [list(map(float, embedding)) for embedding in embeddings]
 
 
-def create_embedder(model_name: str) -> TextEmbedder:
+def create_embedder(
+    model_name: str,
+    model_revision: Optional[str] = None,
+) -> TextEmbedder:
     if model_name.strip().lower() == "hashing":
         return HashingEmbedder()
-    return SentenceTransformerEmbedder(model_name)
+    return SentenceTransformerEmbedder(model_name, model_revision=model_revision)
 
 
 def _enable_system_cert_store():
