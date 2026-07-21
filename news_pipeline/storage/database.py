@@ -63,9 +63,13 @@ def initialize_db():
             url TEXT UNIQUE NOT NULL,
             source TEXT NOT NULL,
             title TEXT,
+            title_source TEXT,
             author TEXT,
+            author_source TEXT,
             published_date TEXT,
+            published_date_source TEXT,
             category TEXT,
+            category_source TEXT,
             raw_html TEXT,
             raw_text TEXT,
             clean_text TEXT,
@@ -77,6 +81,7 @@ def initialize_db():
             clean_status TEXT DEFAULT 'pending',
             dedupe_status TEXT DEFAULT 'pending',
             quality_flags TEXT DEFAULT '[]',
+            metadata_flags TEXT DEFAULT '[]',
             crawl_timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
             cleaned_at TEXT,
             exported_at TEXT
@@ -156,6 +161,15 @@ def initialize_db():
     _ensure_column(cursor, "discovered_urls", "fetched_at", "fetched_at TEXT")
 
     _ensure_column(cursor, "articles", "raw_html", "raw_html TEXT")
+    _ensure_column(cursor, "articles", "title_source", "title_source TEXT")
+    _ensure_column(cursor, "articles", "author_source", "author_source TEXT")
+    _ensure_column(
+        cursor,
+        "articles",
+        "published_date_source",
+        "published_date_source TEXT",
+    )
+    _ensure_column(cursor, "articles", "category_source", "category_source TEXT")
     _ensure_column(cursor, "articles", "clean_hash", "clean_hash TEXT")
     _ensure_column(
         cursor,
@@ -180,6 +194,12 @@ def initialize_db():
         "articles",
         "quality_flags",
         "quality_flags TEXT DEFAULT '[]'",
+    )
+    _ensure_column(
+        cursor,
+        "articles",
+        "metadata_flags",
+        "metadata_flags TEXT DEFAULT '[]'",
     )
     _ensure_column(cursor, "articles", "cleaned_at", "cleaned_at TEXT")
     _ensure_column(cursor, "articles", "exported_at", "exported_at TEXT")
@@ -294,6 +314,13 @@ def initialize_db():
         UPDATE articles
         SET quality_flags = '[]'
         WHERE quality_flags IS NULL OR quality_flags = ''
+        """
+    )
+    cursor.execute(
+        """
+        UPDATE articles
+        SET metadata_flags = '[]'
+        WHERE metadata_flags IS NULL OR metadata_flags = ''
         """
     )
 

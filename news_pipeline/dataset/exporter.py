@@ -34,14 +34,19 @@ def export_snapshot():
             url,
             source,
             title,
+            title_source,
             author,
+            author_source,
             published_date,
+            published_date_source,
             category,
+            category_source,
             clean_text,
             raw_text,
             sinhala_purity,
             content_hash,
             clean_hash,
+            metadata_flags,
             crawl_timestamp
         FROM articles
         WHERE clean_status = ?
@@ -99,6 +104,39 @@ def export_snapshot():
     }
     cursor.execute("SELECT source, COUNT(*) AS count FROM articles GROUP BY source")
     articles_by_source = {row["source"]: row["count"] for row in cursor.fetchall()}
+
+    cursor.execute(
+        """
+        SELECT
+            SUM(CASE WHEN title IS NULL OR TRIM(title) = '' THEN 1 ELSE 0 END)
+                AS missing_title,
+            SUM(CASE WHEN published_date IS NULL OR TRIM(published_date) = '' THEN 1 ELSE 0 END)
+                AS missing_published_date,
+            SUM(CASE WHEN content_hash IS NULL OR TRIM(content_hash) = '' THEN 1 ELSE 0 END)
+                AS missing_content_hash
+        FROM articles
+        """
+    )
+    metadata_missing_counts = dict(cursor.fetchone())
+    cursor.execute(
+        """
+        SELECT COALESCE(NULLIF(title_source, ''), 'unknown') AS source, COUNT(*) AS count
+        FROM articles
+        GROUP BY COALESCE(NULLIF(title_source, ''), 'unknown')
+        """
+    )
+    title_source_counts = {row["source"]: row["count"] for row in cursor.fetchall()}
+    cursor.execute(
+        """
+        SELECT COALESCE(NULLIF(published_date_source, ''), 'unknown') AS source,
+               COUNT(*) AS count
+        FROM articles
+        GROUP BY COALESCE(NULLIF(published_date_source, ''), 'unknown')
+        """
+    )
+    published_date_source_counts = {
+        row["source"]: row["count"] for row in cursor.fetchall()
+    }
 
     cursor.execute(
         """
@@ -181,6 +219,9 @@ def export_snapshot():
         "clean_status_counts": clean_status_counts,
         "dedupe_status_counts": dedupe_status_counts,
         "articles_by_source": articles_by_source,
+        "metadata_missing_counts": metadata_missing_counts,
+        "title_source_counts": title_source_counts,
+        "published_date_source_counts": published_date_source_counts,
     }
 
     report_path.write_text(

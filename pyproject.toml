@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Sinhala news dataset generation pipeline"
 requires-python = ">=3.9"
 dependencies = [
+    "beautifulsoup4>=4.14.3",
     "cloudscraper>=1.2.71",
+    "dateparser>=1.4.0",
     "feedparser>=6.0.12",
     "numpy>=1.26.0",
     "requests>=2.33.1",

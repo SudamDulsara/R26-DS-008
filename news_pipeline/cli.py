@@ -12,6 +12,15 @@ def build_parser():
     subparsers.add_parser("init-db", help="Initialize the SQLite database")
     subparsers.add_parser("discover", help="Discover article URLs from RSS feeds")
     subparsers.add_parser("extract", help="Fetch and extract article content")
+    metadata_parser = subparsers.add_parser(
+        "improve-metadata",
+        help="Backfill article metadata from stored HTML, RSS, and URL fallbacks",
+    )
+    metadata_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing metadata when a stronger extracted value is available",
+    )
     subparsers.add_parser("clean", help="Clean extracted Sinhala text")
     subparsers.add_parser("dedupe", help="Run exact duplicate detection")
     cluster_parser = subparsers.add_parser(
@@ -68,6 +77,10 @@ def main(argv=None):
         from news_pipeline.extractor.article_extractor import extract_articles
 
         return extract_articles()
+    if args.command == "improve-metadata":
+        from news_pipeline.extractor.metadata_backfill import run_metadata_backfill
+
+        return run_metadata_backfill(overwrite=args.overwrite)
     if args.command == "clean":
         from news_pipeline.cleaner.sinhala_cleaner import run_cleaner
 

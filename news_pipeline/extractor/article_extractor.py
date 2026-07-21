@@ -1,11 +1,15 @@
-import hashlib
 import json
 import sqlite3
 import time
 from datetime import datetime
-from urllib.parse import urlparse
 
 from news_pipeline.config import load_config
+from news_pipeline.extractor.metadata_extractor import (
+    compute_text_hash,
+    extract_category_from_url as metadata_category_from_url,
+    extract_metadata,
+    final_metadata_flags,
+)
 from news_pipeline.statuses import (
     CLEAN_STATUS_PENDING,
     DEDUPE_STATUS_PENDING,
@@ -37,11 +41,7 @@ def _get_scraper():
 
 
 def extract_category_from_url(url, source):
-    if source == "Dinamina":
-        parts = [part for part in urlparse(url).path.split("/") if part]
-        if len(parts) >= 4:
-            return parts[3]
-    return ""
+    return metadata_category_from_url(url, source)
 
 
 def fetch_article(url):
@@ -138,12 +138,17 @@ def _upsert_article(cursor, payload):
             url,
             source,
             title,
+            title_source,
             author,
+            author_source,
             published_date,
+            published_date_source,
             category,
+            category_source,
             raw_html,
             raw_text,
             content_hash,
+            metadata_flags,
             crawl_timestamp,
             clean_text,
             sinhala_purity,
@@ -156,16 +161,21 @@ def _upsert_article(cursor, payload):
             cleaned_at,
             exported_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, '[]', NULL, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, '[]', NULL, NULL)
         ON CONFLICT(url) DO UPDATE SET
             source = excluded.source,
             title = excluded.title,
+            title_source = excluded.title_source,
             author = excluded.author,
+            author_source = excluded.author_source,
             published_date = excluded.published_date,
+            published_date_source = excluded.published_date_source,
             category = excluded.category,
+            category_source = excluded.category_source,
             raw_html = excluded.raw_html,
             raw_text = excluded.raw_text,
             content_hash = excluded.content_hash,
+            metadata_flags = excluded.metadata_flags,
             crawl_timestamp = excluded.crawl_timestamp,
             clean_text = NULL,
             sinhala_purity = NULL,
@@ -330,24 +340,39 @@ def extract_articles():
                 logger.warning("    Rejected - text too short")
                 continue
 
-            title = (data.get("title") or "").strip() or rss_title
-            author = (data.get("author") or "").strip()
-            published_date = (data.get("date") or "").strip() or rss_published
-            category = extract_category_from_url(url, source)
-            content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            content_hash = compute_text_hash(raw_text)
+            metadata = extract_metadata(
+                url=url,
+                source=source,
+                trafilatura_data=data,
+                html=fetch_result["html"] or "",
+                rss_title=rss_title,
+                rss_published=rss_published,
+            )
+            metadata_flags = final_metadata_flags(
+                metadata.title,
+                metadata.published_date,
+                content_hash,
+                metadata.metadata_flags,
+            )
 
             _upsert_article(
                 cursor,
                 (
                     url,
                     source,
-                    title,
-                    author,
-                    published_date,
-                    category,
+                    metadata.title,
+                    metadata.title_source,
+                    metadata.author,
+                    metadata.author_source,
+                    metadata.published_date,
+                    metadata.published_date_source,
+                    metadata.category,
+                    metadata.category_source,
                     fetch_result["html"],
                     raw_text,
                     content_hash,
+                    json.dumps(metadata_flags, ensure_ascii=False),
                     now,
                     CLEAN_STATUS_PENDING,
                     DEDUPE_STATUS_PENDING,
@@ -375,7 +400,11 @@ def extract_articles():
             )
 
             success += 1
-            logger.info("    Saved - %s chars | Title: %s", len(raw_text), title[:60])
+            logger.info(
+                "    Saved - %s chars | Title: %s",
+                len(raw_text),
+                metadata.title[:60],
+            )
 
         connection.commit()
     finally:
