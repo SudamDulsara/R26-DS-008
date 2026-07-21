@@ -10,3 +10,5 @@ venv/
 ENV/
 
 news_pipeline/docs
+news_pipeline/tests
+news_pipeline/evaluation
