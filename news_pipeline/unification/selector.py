@@ -1,9 +1,12 @@
+import re
 from dataclasses import asdict, dataclass
 from typing import Optional
 
 from news_pipeline.unification.conflicts import detect_potential_conflicts
+from news_pipeline.unification.contract import EXTRACTIVE_SELECTION_METHOD
 from news_pipeline.unification.near_duplicates import (
     calculate_sentence_similarity,
+    extract_number_facts,
 )
 from news_pipeline.unification.sentences import (
     CLOSING_PUNCTUATION,
@@ -40,6 +43,17 @@ DOCUMENT_REFERENCE_PREFIXES = (
 )
 COMPETING_EVENT_ENTITY_GROUPS = (
     ("ලිට්රෝ", "ලාෆ්ස්"),
+)
+FACILITY_POPULATION_PREFIXES = (
+    "රැඳවූන් ",
+    "රැදවූන් ",
+    "සිරකරුවන් ",
+    "සිරකරුවෝ ",
+)
+MALFORMED_INLINE_DATE_PATTERN = re.compile(r":\s*\d+\*")
+MERGED_CLAUSE_BOUNDARY_MARKERS = (
+    " වේ රජයේ ප්රවෘත්ති දෙපාර්තමේන්තුව ",
+    " වේ රජයේ ප්‍රවෘත්ති දෙපාර්තමේන්තුව ",
 )
 
 
@@ -86,7 +100,14 @@ def select_extractive_story(
             candidates.append(candidate)
 
     selected = []
-    remaining = candidates.copy()
+    preselection_heading_fragments = []
+    remaining = []
+    for candidate in candidates:
+        reason = _heading_fragment_reason(candidate)
+        if reason == "malformed_heading_fragment":
+            preselection_heading_fragments.append((candidate, reason))
+        else:
+            remaining.append(candidate)
     current_chars = 0
     lead_anchor = None
     if config.anchor_representative_lead:
@@ -150,11 +171,21 @@ def select_extractive_story(
     selected, suppressed_context_sentences = (
         _suppress_orphan_context_sentences(selected)
     )
-    selected, suppressed_heading_fragments = _suppress_heading_fragments(
+    selected, postselection_heading_fragments = _suppress_heading_fragments(
         selected
+    )
+    suppressed_heading_fragments = (
+        preselection_heading_fragments + postselection_heading_fragments
+    )
+    selected, suppressed_fact_poor_restatements = (
+        _suppress_fact_poor_numeric_restatements(selected)
     )
     selected, suppressed_relevance_sentences = _suppress_relevance_sentences(
         selected
+    )
+    suppressed_relevance_sentences = (
+        suppressed_fact_poor_restatements
+        + suppressed_relevance_sentences
     )
     selected, suppressed_residual_repetitions = (
         _suppress_residual_repetitions(selected)
@@ -198,7 +229,7 @@ def select_extractive_story(
         ]
     unified_text = "\n".join(record["text"] for record in unified_sentences)
     return {
-        "selection_method": "extractive_lead_mmr_v6",
+        "selection_method": EXTRACTIVE_SELECTION_METHOD,
         "selection_config": asdict(config),
         "candidate_group_count": len(evidence_groups),
         "eligible_group_count": len(candidates),
@@ -434,6 +465,35 @@ def _relevance_suppression_match(
     if document_match is not None:
         return document_match
 
+    population_match = _orphan_facility_population_match(
+        candidate,
+        selected,
+    )
+    if population_match is not None:
+        return population_match
+
+    malformed_date_match = _malformed_inline_date_match(candidate)
+    if malformed_date_match is not None:
+        return malformed_date_match
+
+    merged_clause_match = _merged_clause_boundary_match(candidate)
+    if merged_clause_match is not None:
+        return merged_clause_match
+
+    colloquial_match = _unframed_colloquial_statement_match(
+        candidate,
+        selected,
+    )
+    if colloquial_match is not None:
+        return colloquial_match
+
+    superseded_status_match = _superseded_status_match(
+        candidate,
+        selected,
+    )
+    if superseded_status_match is not None:
+        return superseded_status_match
+
     low_confidence_match = _low_confidence_unanchored_match(candidate)
     if low_confidence_match is not None:
         return low_confidence_match
@@ -472,6 +532,156 @@ def _orphan_document_reference_match(
             ),
         },
     )
+
+
+def _orphan_facility_population_match(
+    candidate: dict,
+    selected: list[dict],
+) -> Optional[tuple[str, dict]]:
+    text = normalize_sentence(candidate["variant"]["text"])
+    if not text.startswith(FACILITY_POPULATION_PREFIXES):
+        return None
+    if "අතර පිරිසක්" not in text or "එහි" not in text:
+        return None
+    number_facts = sorted(extract_number_facts(text))
+    if len(number_facts) < 2:
+        return None
+
+    support_positions = _candidate_support_positions(candidate)
+    other_selected_positions = {
+        position
+        for other_candidate in selected
+        if other_candidate is not candidate
+        for position in _candidate_support_positions(other_candidate)
+    }
+    has_preceding_sentence = any(
+        (article_id, sentence_index - 1) in other_selected_positions
+        for article_id, sentence_index in support_positions
+    )
+    if has_preceding_sentence:
+        return None
+    return (
+        "generic_facility_population_without_preceding_context",
+        {
+            "number_facts": number_facts,
+            "support_positions": sorted(support_positions),
+            "required_preceding_positions": sorted(
+                (article_id, sentence_index - 1)
+                for article_id, sentence_index in support_positions
+            ),
+        },
+    )
+
+
+def _malformed_inline_date_match(
+    candidate: dict,
+) -> Optional[tuple[str, dict]]:
+    text = normalize_sentence(candidate["variant"]["text"])
+    match = MALFORMED_INLINE_DATE_PATTERN.search(text)
+    if match is None:
+        return None
+    return (
+        "malformed_inline_date_fragment",
+        {"matched_text": match.group(0)},
+    )
+
+
+def _merged_clause_boundary_match(
+    candidate: dict,
+) -> Optional[tuple[str, dict]]:
+    text = normalize_sentence(candidate["variant"]["text"])
+    marker = next(
+        (
+            item
+            for item in MERGED_CLAUSE_BOUNDARY_MARKERS
+            if item in text
+        ),
+        None,
+    )
+    if marker is None:
+        return None
+    return (
+        "merged_source_clause_boundary",
+        {"boundary_marker": marker.strip()},
+    )
+
+
+def _unframed_colloquial_statement_match(
+    candidate: dict,
+    selected: list[dict],
+) -> Optional[tuple[str, dict]]:
+    text = normalize_sentence(candidate["variant"]["text"])
+    if "කියන" not in text or "තියෙනවා" not in text:
+        return None
+
+    support_positions = _candidate_support_positions(candidate)
+    other_selected_positions = {
+        position
+        for other_candidate in selected
+        if other_candidate is not candidate
+        for position in _candidate_support_positions(other_candidate)
+    }
+    has_preceding_sentence = any(
+        (article_id, sentence_index - 1) in other_selected_positions
+        for article_id, sentence_index in support_positions
+    )
+    if has_preceding_sentence:
+        return None
+    return (
+        "unframed_colloquial_source_statement",
+        {
+            "support_positions": sorted(support_positions),
+            "required_preceding_positions": sorted(
+                (article_id, sentence_index - 1)
+                for article_id, sentence_index in support_positions
+            ),
+        },
+    )
+
+
+def _superseded_status_match(
+    candidate: dict,
+    selected: list[dict],
+) -> Optional[tuple[str, dict]]:
+    text = normalize_sentence(candidate["variant"]["text"])
+    if not all(term in text for term in ("තුවාල", "රෝහල", "ඇතුළත්")):
+        return None
+
+    candidate_article_ids = {
+        support.get("article_id")
+        for support in candidate["variant"].get(
+            "supporting_articles", []
+        )
+    }
+    for lead in selected:
+        if lead.get("selection_reason") != "representative_lead":
+            continue
+        lead_text = normalize_sentence(lead["variant"]["text"])
+        if not any(
+            marker in lead_text
+            for marker in ("මියගොස්", "මිය ගොස්", "මරුට")
+        ):
+            continue
+        lead_article_ids = {
+            support.get("article_id")
+            for support in lead["variant"].get(
+                "supporting_articles", []
+            )
+        }
+        shared_article_ids = sorted(
+            candidate_article_ids & lead_article_ids
+        )
+        if shared_article_ids:
+            return (
+                "superseded_pre_death_hospital_status",
+                {
+                    "superseding_sentence_id": lead["variant"][
+                        "sentence_id"
+                    ],
+                    "shared_article_ids": shared_article_ids,
+                },
+            )
+    return None
 
 
 def _low_confidence_unanchored_match(
@@ -575,6 +785,65 @@ def _suppress_residual_repetitions(
     return kept, suppressed
 
 
+def _suppress_fact_poor_numeric_restatements(
+    selected: list[dict],
+) -> tuple[list[dict], list[tuple[dict, str, dict]]]:
+    """Prefer a strongly matching later sentence that adds concrete numbers.
+
+    This runs after MMR because the more informative restatement can only
+    become eligible once a malformed heading has been removed from the
+    selection pool. The thresholds are deliberately strict so that ordinary
+    supporting detail is not mistaken for a replacement.
+    """
+    kept = []
+    suppressed = []
+    for candidate_index, candidate in enumerate(selected):
+        match = _fact_richer_numeric_restatement_match(
+            candidate,
+            selected[candidate_index + 1 :],
+        )
+        if match is None:
+            kept.append(candidate)
+            continue
+        replacement, similarity = match
+        suppressed.append(
+            (
+                candidate,
+                "less_informative_numeric_restatement",
+                {
+                    "replacement_sentence_id": replacement["variant"][
+                        "sentence_id"
+                    ],
+                    "replacement_text": replacement["variant"]["text"],
+                    "replacement_number_facts": similarity["right_numbers"],
+                    "similarity": similarity,
+                },
+            )
+        )
+    return kept, suppressed
+
+
+def _fact_richer_numeric_restatement_match(
+    candidate: dict,
+    later_candidates: list[dict],
+) -> Optional[tuple[dict, dict]]:
+    for replacement in later_candidates:
+        similarity = calculate_sentence_similarity(
+            candidate["variant"]["text"],
+            replacement["variant"]["text"],
+        )
+        if (
+            not similarity["left_numbers"]
+            and len(similarity["right_numbers"]) >= 2
+            and not similarity["numeric_conflict"]
+            and similarity["shared_token_count"] >= 15
+            and similarity["token_containment"] >= 0.60
+            and similarity["sequence_ratio"] >= 0.65
+        ):
+            return replacement, similarity
+    return None
+
+
 def _residual_repetition_match(
     candidate: dict,
     earlier_candidates: list[dict],
@@ -638,7 +907,9 @@ def _suppressed_candidate_record(candidate: dict, reason: str) -> dict:
         "text": variant["text"],
         "suppression_reason": reason,
         "selection_reason": candidate.get("selection_reason", "mmr"),
-        "selection_score": candidate["selection_score"],
+        "selection_score": candidate.get(
+            "selection_score", candidate["base_score"]
+        ),
         "supporting_articles": variant.get("supporting_articles", []),
     }
 

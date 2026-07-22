@@ -6,6 +6,11 @@ from news_pipeline.config import load_config
 from news_pipeline.statuses import CLEAN_STATUS_CLEANED, DEDUPE_STATUS_UNIQUE
 from news_pipeline.storage.database import get_connection
 from news_pipeline.storage.logger import get_logger
+from news_pipeline.unification.contract import (
+    UNIFIED_STORY_SCHEMA_VERSION,
+    unified_story_contract_metadata,
+    validate_unified_story_record,
+)
 from news_pipeline.unification.evidence import build_sentence_evidence
 from news_pipeline.unification.near_duplicates import (
     group_near_duplicate_evidence,
@@ -97,7 +102,7 @@ def build_unified_story_rows(
         else:
             unification_status = "unavailable"
 
-        unified_stories.append(
+        story = (
             {
                 "story_id": cluster["cluster_key"],
                 "cluster_id": cluster["id"],
@@ -120,7 +125,7 @@ def build_unified_story_rows(
                 ],
                 "conflict_flags": extractive_story["conflict_flags"],
                 "unification": {
-                    "version": "extractive_v2",
+                    "version": UNIFIED_STORY_SCHEMA_VERSION,
                     "status": unification_status,
                     "selection_method": extractive_story[
                         "selection_method"
@@ -223,6 +228,8 @@ def build_unified_story_rows(
                 ],
             }
         )
+        validate_unified_story_record(story)
+        unified_stories.append(story)
     return unified_stories
 
 
@@ -470,6 +477,9 @@ def export_snapshot():
     report = {
         "generated_at": generated_at,
         "snapshot_name": snapshot_name,
+        "contracts": {
+            "unified_stories": unified_story_contract_metadata(),
+        },
         "paths": {
             "fulltext": str(fulltext_path),
             "metadata": str(metadata_path),
@@ -529,6 +539,7 @@ def export_snapshot():
         "cluster_members_path": str(cluster_members_path),
         "unified_stories_path": str(unified_stories_path),
         "report_path": str(report_path),
+        "unified_story_contract": unified_story_contract_metadata(),
         "exported_unique_articles": len(fulltext_rows),
         "story_clusters": len(cluster_rows),
         "unified_stories": len(unified_story_rows),
