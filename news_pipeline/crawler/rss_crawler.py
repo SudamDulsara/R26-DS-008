@@ -1,69 +1,104 @@
-import feedparser
-import sqlite3
 from datetime import datetime
+import sqlite3
 
-sqlite3.register_adapter(datetime, lambda d: d.isoformat())
-
+from news_pipeline.config import load_config
+from news_pipeline.statuses import URL_STATUS_DISCOVERED
 from news_pipeline.storage.database import get_connection
 from news_pipeline.storage.logger import get_logger
 
+
+sqlite3.register_adapter(datetime, lambda value: value.isoformat())
+
 logger = get_logger()
 
-NEWS_SOURCES = {
-    "Mawbima":           "https://www.mawbima.lk/feed",
-    "Divaina":           "https://www.divaina.lk/feed",
-    "Silumina":          "https://www.silumina.lk/feed",
-    "BBC Sinhala":       "https://www.bbc.com/sinhala/index.xml",
-    "Ada Derana Sinhala": "https://sinhala.adaderana.lk/rsshotnews.php",
-    "Anidda":            "https://www.anidda.lk/feed",
-    "NethnewsLk":        "https://www.nethnews.lk/feed",
-    "Navaliya":          "https://www.navaliya.lk/feed",
-    "Dinamina":          "https://www.dinamina.lk/feed",
-}
 
-def discover_urls(source_name, rss_url):
-    logger.info(f"\n[{source_name}] Fetching RSS feed...")
+def discover_urls(source_name, rss_url, connection):
+    try:
+        import feedparser
+    except ModuleNotFoundError as exc:
+        logger.error("Missing dependency: %s", exc.name)
+        return 0
+
+    logger.info("")
+    logger.info("[%s] Fetching RSS feed...", source_name)
     feed = feedparser.parse(rss_url)
 
     if feed.bozo:
-        logger.warning(f"[{source_name}] Feed may have issues — {feed.bozo_exception}")
+        logger.warning("[%s] Feed may have issues - %s", source_name, feed.bozo_exception)
 
     new_count = 0
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
+    cursor = connection.cursor()
 
-        for entry in feed.entries:
-            url = entry.get("link", "").strip()
-            if not url and entry.get("links"):
-                url = entry.links[0].get("href", "").strip()
-            if not url:
-                continue
+    for entry in feed.entries:
+        url = entry.get("link", "").strip()
+        if not url and entry.get("links"):
+            url = entry.links[0].get("href", "").strip()
+        if not url:
+            continue
 
-            try:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO discovered_urls (url, source, discovered_at, fetched)
-                    VALUES (?, ?, ?, 0)
-                ''', (url, source_name, datetime.now()))
+        rss_title = entry.get("title", "").strip() or None
+        rss_published = (
+            entry.get("published", "").strip()
+            or entry.get("updated", "").strip()
+            or None
+        )
 
-                if cursor.rowcount > 0:
-                    new_count += 1
+        try:
+            cursor.execute("SELECT 1 FROM discovered_urls WHERE url = ?", (url,))
+            existed = cursor.fetchone() is not None
+            cursor.execute(
+                """
+                INSERT INTO discovered_urls
+                    (url, source, discovered_at, rss_title, rss_published, status, fetched)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(url) DO UPDATE SET
+                    rss_title = COALESCE(discovered_urls.rss_title, excluded.rss_title),
+                    rss_published = COALESCE(
+                        discovered_urls.rss_published,
+                        excluded.rss_published
+                    )
+                """,
+                (
+                    url,
+                    source_name,
+                    datetime.now().isoformat(timespec="seconds"),
+                    rss_title,
+                    rss_published,
+                    URL_STATUS_DISCOVERED,
+                ),
+            )
 
-            except sqlite3.Error as e:
-                logger.error(f"[{source_name}] DB error for {url}: {e}")
+            if not existed:
+                new_count += 1
 
-        conn.commit()
-    finally:
-        conn.close()
-    logger.info(f"[{source_name}] Done — {new_count} new URLs saved.")
+        except sqlite3.Error as exc:
+            logger.error("[%s] DB error for %s: %s", source_name, url, exc)
+
+    logger.info("[%s] Done - %s new URLs saved.", source_name, new_count)
     return new_count
 
+
 def run_discovery():
+    config = load_config()
+    connection = get_connection()
+
     logger.info("=== URL Discovery Started ===")
     total = 0
-    for source_name, rss_url in NEWS_SOURCES.items():
-        total += discover_urls(source_name, rss_url)
-    logger.info(f"\n=== Discovery Complete — {total} total new URLs found ===")
+
+    try:
+        for source_name, rss_url in config.news_sources.items():
+            total += discover_urls(source_name, rss_url, connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info("")
+    logger.info("=== Discovery Complete - %s total new URLs found ===", total)
+    return {
+        "new_urls": total,
+        "sources_checked": len(config.news_sources),
+    }
+
 
 if __name__ == "__main__":
     run_discovery()

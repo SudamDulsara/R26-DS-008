@@ -1,38 +1,43 @@
 import logging
-import os
 from datetime import datetime
 
-LOGS_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
+from news_pipeline.config import load_config
+
 
 def setup_logger():
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    log_file = os.path.join(LOGS_DIR, f'run_{timestamp}.log')
+    config = load_config()
+    config.logs_dir.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger('pipeline')
+    logger = logging.getLogger("pipeline")
     logger.setLevel(logging.DEBUG)
 
     if logger.handlers:
         return logger
 
-    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = config.logs_dir / f"run_{timestamp}.log"
 
-    fh = logging.FileHandler(log_file, encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter('%(message)s'))
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
 
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
 
-    logger.info(f"Log file: {os.path.abspath(log_file)}")
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.info("Log file: %s", log_file.resolve())
     return logger
 
+
 def get_logger():
-    logger = logging.getLogger('pipeline')
+    logger = logging.getLogger("pipeline")
     if not logger.handlers:
         setup_logger()
     return logger

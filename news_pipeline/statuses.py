@@ -1,0 +1,13 @@
+URL_STATUS_DISCOVERED = "discovered"
+URL_STATUS_FETCH_FAILED = "fetch_failed"
+URL_STATUS_EXTRACTED = "extracted"
+URL_STATUS_REJECTED = "rejected"
+URL_STATUS_EXHAUSTED = "exhausted"
+
+CLEAN_STATUS_PENDING = "pending"
+CLEAN_STATUS_CLEANED = "cleaned"
+CLEAN_STATUS_REJECTED = "rejected"
+
+DEDUPE_STATUS_PENDING = "pending"
+DEDUPE_STATUS_UNIQUE = "unique"
+DEDUPE_STATUS_EXACT_DUPLICATE = "exact_duplicate"
