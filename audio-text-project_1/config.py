@@ -6,7 +6,7 @@
 # YOUTUBE API
 # =====================================================
 
-YOUTUBE_API_KEY = "AIzaSyAyT2TFMZFVIGi_r6DzgtLo7yJP68ZRCUc"
+YOUTUBE_API_KEY = ""
 
 # =====================================================
 # SEARCH SETTINGS
