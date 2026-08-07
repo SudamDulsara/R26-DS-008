@@ -1,22 +1,99 @@
-import yt_dlp
+# =====================================================
+# download.py
+# =====================================================
+
 import os
+import yt_dlp
 
-def download_audio(url):
-    os.makedirs("temp", exist_ok=True)
+from database import mark_downloaded
 
-    output_path = "temp/audio.wav"
+# =====================================================
+# DOWNLOAD AUDIO
+# =====================================================
+
+def download_audio(video):
+
+    """
+    Downloads the audio of the selected
+    YouTube video and updates the database.
+    """
+
+    os.makedirs(
+        "temp",
+        exist_ok=True
+    )
+
+    output_template = os.path.join(
+        "temp",
+        "audio.%(ext)s"
+    )
+
+    output_audio = os.path.join(
+        "temp",
+        "audio.wav"
+    )
 
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': 'temp/audio.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'wav',
-        }],
-        'quiet': True
+
+        "format": "bestaudio/best",
+
+        "outtmpl": output_template,
+
+        "quiet": False,
+
+        "postprocessors": [
+
+            {
+
+                "key": "FFmpegExtractAudio",
+
+                "preferredcodec": "wav",
+
+                "preferredquality": "192"
+
+            }
+
+        ]
+
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    print("\nDownloading audio...")
+    print(f"Title : {video['title']}")
 
-    return output_path
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        ydl.download([video["url"]])
+
+    # ----------------------------------------------
+    # UPDATE DATABASE
+    # ----------------------------------------------
+
+    mark_downloaded(
+        video["video_id"]
+    )
+
+    print("Download Complete.")
+
+    return output_audio
+
+
+# =====================================================
+# TEST
+# =====================================================
+
+if __name__ == "__main__":
+
+    from collector import get_next_video
+
+    video = get_next_video()
+
+    if video:
+
+        audio = download_audio(video)
+
+        print("\nDownloaded File:")
+        print(audio)
+
+    else:
+
+        print("No videos available.")

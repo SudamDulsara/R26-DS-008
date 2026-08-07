@@ -1,11 +1,22 @@
+# =========================================================
 # segment.py
+# =========================================================
 
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 
+from silero_vad import (
+    load_silero_vad,
+    get_speech_timestamps
+)
+
+from database import save_clip
+
+import librosa
+import torch
+
 import os
 import re
-
 
 # =========================================================
 # CONFIG
@@ -13,11 +24,23 @@ import re
 
 OUTPUT_DIR = "dataset/clips"
 
-CHUNK_LENGTH_MS = 10000      # 10 seconds
-MIN_CHUNK_MS = 3000          # minimum useful speech
-MIN_SILENCE_LEN = 500        # silence detection
-KEEP_SILENCE = 250           # preserve natural pauses
+CHUNK_LENGTH_MS = 10000
 
+MIN_CHUNK_MS = 2500
+
+MIN_SILENCE_LEN = 650
+
+KEEP_SILENCE = 300
+
+# =========================================================
+# LOAD SILERO MODEL
+# =========================================================
+
+print("Loading Silero VAD...")
+
+vad_model = load_silero_vad()
+
+print("Silero VAD Loaded.")
 
 # =========================================================
 # GET NEXT CHUNK INDEX
@@ -35,41 +58,78 @@ def get_next_chunk_index(directory=OUTPUT_DIR):
 
     indices = [
 
-        int(re.search(r'chunk_(\d+)', f).group(1))
+        int(
+            re.search(
+                r"chunk_(\d+)",
+                file
+            ).group(1)
+        )
 
-        for f in files
+        for file in files
 
-        if re.search(r'chunk_(\d+)', f)
+        if re.search(
+            r"chunk_(\d+)",
+            file
+        )
+
     ]
 
     return max(indices) + 1 if indices else 0
 
 
 # =========================================================
-# AUDIO QUALITY VALIDATION
+# CHECK SPEECH USING SILERO
+# =========================================================
+
+def contains_speech(audio_path):
+
+    audio, sr = librosa.load(
+
+        audio_path,
+
+        sr=16000,
+
+        mono=True
+
+    )
+
+    audio = torch.from_numpy(audio).float()
+
+    speech = get_speech_timestamps(
+
+        audio,
+
+        vad_model,
+
+        sampling_rate=16000,
+
+        threshold=0.5,
+
+        min_speech_duration_ms=250,
+
+        min_silence_duration_ms=150
+
+    )
+
+    return len(speech) > 0
+
+
+# =========================================================
+# VALIDATE CHUNK
 # =========================================================
 
 def is_valid_chunk(chunk):
 
-    # -----------------------------------------------------
-    # TOO SHORT
-    # -----------------------------------------------------
-
     if len(chunk) < MIN_CHUNK_MS:
+
         return False
 
-    # -----------------------------------------------------
-    # TOO QUIET
-    # -----------------------------------------------------
+    if chunk.dBFS < -38:
 
-    if chunk.dBFS < -40:
         return False
-
-    # -----------------------------------------------------
-    # VERY LOW ENERGY
-    # -----------------------------------------------------
 
     if chunk.rms < 100:
+
         return False
 
     return True
@@ -79,18 +139,17 @@ def is_valid_chunk(chunk):
 # SPLIT AUDIO
 # =========================================================
 
-def split_audio(file_path):
+def split_audio(file_path, video):
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(
 
-    # -----------------------------------------------------
-    # LOAD AUDIO
-    # -----------------------------------------------------
+        OUTPUT_DIR,
+
+        exist_ok=True
+
+    )
 
     audio = AudioSegment.from_wav(file_path)
-
-    # Whisper preferred format
-    audio = audio.set_frame_rate(16000).set_channels(1)
 
     start_idx = get_next_chunk_index()
 
@@ -98,12 +157,11 @@ def split_audio(file_path):
 
     i = 0
 
-    print("\n🎵 Processing Audio...")
-    print(f"📏 Duration: {len(audio)/1000:.2f} seconds")
+    print("\nProcessing Audio...")
 
-    # -----------------------------------------------------
-    # SILENCE-BASED SPEECH SEGMENTATION
-    # -----------------------------------------------------
+    print(
+        f"Duration: {len(audio)/1000:.2f} seconds"
+    )
 
     segments = split_on_silence(
 
@@ -111,90 +169,155 @@ def split_audio(file_path):
 
         min_silence_len=MIN_SILENCE_LEN,
 
-        # adaptive threshold
-        silence_thresh=audio.dBFS - 16,
+        silence_thresh=audio.dBFS - 14,
 
         keep_silence=KEEP_SILENCE
+
     )
 
-    print(f"\n🔍 Found {len(segments)} speech segments")
-
-    # -----------------------------------------------------
-    # PROCESS EACH SEGMENT
-    # -----------------------------------------------------
+    print(
+        f"\nFound {len(segments)} speech segments"
+    )
 
     for segment in segments:
 
-        # skip tiny segments
         if len(segment) < MIN_CHUNK_MS:
+
             continue
 
-        # -------------------------------------------------
-        # SPLIT LONG SEGMENTS INTO 10s CHUNKS
-        # -------------------------------------------------
+        for j in range(
 
-        for j in range(0, len(segment), CHUNK_LENGTH_MS):
+            0,
 
-            chunk = segment[j:j + CHUNK_LENGTH_MS]
+            len(segment),
 
-            # -------------------------------------------------
-            # VALIDATE CHUNK
-            # -------------------------------------------------
+            CHUNK_LENGTH_MS
+
+        ):
+
+            chunk = segment[
+                j:j + CHUNK_LENGTH_MS
+            ]
 
             if not is_valid_chunk(chunk):
 
-                print("⚠ Invalid chunk skipped")
+                continue
+
+            filename = os.path.join(
+
+                OUTPUT_DIR,
+
+                f"chunk_{start_idx+i:05d}.wav"
+
+            )
+
+            chunk.export(
+
+                filename,
+
+                format="wav",
+
+                codec="pcm_s16le"
+
+            )
+
+            print(f"Checking Speech: {filename}")
+
+            try:
+
+                if not contains_speech(filename):
+
+                    print("Rejected (No Speech)")
+
+                    os.remove(filename)
+
+                    continue
+
+            except Exception as e:
+
+                print(f"Silero Error: {e}")
+
+                if os.path.exists(filename):
+
+                    os.remove(filename)
 
                 continue
 
             # -------------------------------------------------
-            # SAVE CHUNK
+            # SAVE CLIP METADATA TO DATABASE
             # -------------------------------------------------
 
-            filename = os.path.join(
-                OUTPUT_DIR,
-                f"chunk_{start_idx + i:05d}.wav"
-            )
+            save_clip(
 
-            chunk.export(
-                filename,
-                format="wav",
-                codec="pcm_s16le"
+                video_id=video["video_id"],
+
+                clip_name=os.path.basename(filename),
+
+                duration=round(len(chunk) / 1000, 2)
+
             )
 
             chunks.append(filename)
 
-            print(f"✅ Saved: {filename}")
+            print(f"Saved: {filename}")
 
             i += 1
 
-    print(f"\n🎵 Total Valid Chunks: {len(chunks)}")
+    print(
+
+        f"\nTotal Valid Chunks: {len(chunks)}"
+
+    )
+
+    try:
+
+        if os.path.exists(file_path):
+
+            os.remove(file_path)
+
+            print(
+
+                "\nTemporary clean audio deleted."
+
+            )
+
+    except Exception as e:
+
+        print(
+
+            f"Could not delete temporary file: {e}"
+
+        )
 
     return chunks
 
 
 # =========================================================
-# CLI TESTING
+# TEST
 # =========================================================
 
 if __name__ == "__main__":
 
-    import argparse
+    from collector import get_next_video
 
-    parser = argparse.ArgumentParser()
+    video = get_next_video()
 
-    parser.add_argument(
-        "--input",
-        type=str,
-        required=True,
-        help="Path to WAV audio"
-    )
+    if video:
 
-    args = parser.parse_args()
+        chunks = split_audio(
 
-    print("\n✂️ Segmenting Audio...")
-    print("-" * 40)
+            "temp/audio_clean.wav",
 
-    chunks = split_audio(args.input)
+            video
 
-    print("\n✅ Segmentation Complete")
+        )
+
+        print()
+
+        print("Segmentation Complete")
+
+        print(
+
+            f"Generated {len(chunks)} chunks."
+
+        )

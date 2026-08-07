@@ -1,4 +1,6 @@
+# =========================================================
 # transcribe.py
+# =========================================================
 
 import os
 import torch
@@ -6,19 +8,22 @@ import subprocess
 import re
 
 from transformers import pipeline
-from corrections import COMMON_CORRECTIONS
 
+from corrections import correct_text
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-os.environ['HF_HOME'] = 'E:/huggingface_cache'
+os.environ["HF_HOME"] = "E:/huggingface_cache"
 
 device = 0 if torch.cuda.is_available() else -1
 
-model_id = "Lingalingeswaran/whisper-small-sinhala"
+# =========================================================
+# MODEL
+# =========================================================
 
+model_id = "Lingalingeswaran/whisper-small-sinhala"
 
 # =========================================================
 # LOAD MODEL
@@ -26,17 +31,11 @@ model_id = "Lingalingeswaran/whisper-small-sinhala"
 
 transcriber = pipeline(
     "automatic-speech-recognition",
-
     model=model_id,
-
     device=device,
-
-    # Stable settings for Sinhala speech
     chunk_length_s=15,
-
     stride_length_s=5
 )
-
 
 # =========================================================
 # AUDIO FILTERING
@@ -44,17 +43,27 @@ transcriber = pipeline(
 
 def apply_filters(input_path):
 
-    """
-    Light filtering for Sinhala speech.
-    Works with:
-    - wav
-    - flac
-    - mp3
-    """
+    # --------------------------------------------
+    # TEMP FOLDER
+    # --------------------------------------------
 
-    base_name = os.path.splitext(input_path)[0]
+    os.makedirs("temp", exist_ok=True)
 
-    filtered_path = f"{base_name}_filtered.wav"
+    # --------------------------------------------
+    # CREATE TEMP FILE NAME
+    # --------------------------------------------
+
+    filename = os.path.basename(input_path)
+
+    filename = filename.replace(
+        ".wav",
+        "_filtered.wav"
+    )
+
+    filtered_path = os.path.join(
+        "temp",
+        filename
+    )
 
     command = [
 
@@ -62,17 +71,21 @@ def apply_filters(input_path):
 
         "-y",
 
-        "-i", input_path,
+        "-i",
+        input_path,
 
-        # Light filtering
-        "-af", "highpass=f=100, lowpass=f=7000",
+        "-af",
 
-        # Whisper preferred format
-        "-ar", "16000",
+        "highpass=f=100,lowpass=f=7000",
 
-        "-ac", "1",
+        "-ar",
+        "16000",
+
+        "-ac",
+        "1",
 
         filtered_path
+
     ]
 
     try:
@@ -92,83 +105,64 @@ def apply_filters(input_path):
 
         return input_path
 
-
 # =========================================================
-# TEXT CLEANING
+# CLEAN TEXT
 # =========================================================
 
 def clean_text(text):
 
-    """
-    Minimal cleanup without damaging Sinhala words.
-    """
-
     text = str(text)
 
-    # Remove whisper tags
-    text = re.sub(r"<\|.*?\|>", "", text)
+    text = re.sub(
+        r"<\|.*?\|>",
+        "",
+        text
+    )
 
-    # Remove broken replacement characters
-    text = text.replace("�", "")
+    text = text.replace(
+        "�",
+        ""
+    )
 
-    # Remove extra spaces
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
 
-    # Remove excessive repetition
-    text = re.sub(r"(.)\1{5,}", r"\1", text)
+    text = re.sub(
+        r"(.)\1{5,}",
+        r"\1",
+        text
+    )
 
     return text.strip()
 
-
 # =========================================================
-# RULE-BASED CORRECTION
-# =========================================================
-
-def apply_rule_based_corrections(text):
-
-    words = text.split()
-
-    corrected_words = []
-
-    for word in words:
-
-        # Exact dictionary correction
-        if word in COMMON_CORRECTIONS:
-
-            corrected_words.append(
-                COMMON_CORRECTIONS[word]
-            )
-
-        else:
-
-            corrected_words.append(word)
-
-    corrected_text = " ".join(corrected_words)
-
-    return corrected_text
-
-
-# =========================================================
-# MAIN TRANSCRIPTION
+# MAIN TRANSCRIPTION FUNCTION
 # =========================================================
 
 def transcribe_audio(file_path):
 
     try:
 
+        # --------------------------------------------
+        # CHECK FILE
+        # --------------------------------------------
+
         if not os.path.exists(file_path):
 
             return ""
 
-        # -------------------------------------------------
-        # STEP 1 — FILTER AUDIO
-        # -------------------------------------------------
+        # --------------------------------------------
+        # APPLY FILTERS
+        # --------------------------------------------
 
         clean_file = apply_filters(file_path)
 
-        # -------------------------------------------------
-        # STEP 2 — TRANSCRIBE
-        # -------------------------------------------------
+        # --------------------------------------------
+        # TRANSCRIBE
+        # --------------------------------------------
 
         result = transcriber(
 
@@ -180,30 +174,39 @@ def transcribe_audio(file_path):
 
                 "task": "transcribe",
 
-                # deterministic decoding
                 "do_sample": False
+
             }
+
         )
 
         text = result["text"]
 
-        # -------------------------------------------------
-        # STEP 3 — CLEAN TEXT
-        # -------------------------------------------------
+        # --------------------------------------------
+        # CLEAN TEXT
+        # --------------------------------------------
 
         text = clean_text(text)
 
-        # -------------------------------------------------
-        # STEP 4 — APPLY CORRECTIONS
-        # -------------------------------------------------
+        # --------------------------------------------
+        # CORRECT TEXT
+        # --------------------------------------------
 
-        text = apply_rule_based_corrections(text)
+        text = correct_text(text)
 
-        # -------------------------------------------------
-        # STEP 5 — REMOVE TEMP FILE
-        # -------------------------------------------------
+        # --------------------------------------------
+        # DELETE TEMP FILE
+        # --------------------------------------------
 
-        if clean_file != file_path and os.path.exists(clean_file):
+        if (
+
+            clean_file != file_path
+
+            and
+
+            os.path.exists(clean_file)
+
+        ):
 
             os.remove(clean_file)
 
@@ -215,9 +218,8 @@ def transcribe_audio(file_path):
 
         return ""
 
-
 # =========================================================
-# CLI TESTING
+# CLI TEST
 # =========================================================
 
 if __name__ == "__main__":

@@ -1,19 +1,106 @@
-import pandas as pd
-from pydub import AudioSegment
+# =====================================================
+# dataset_writer.py
+# =====================================================
+
 import os
 
-def get_duration(file_path):
-    audio = AudioSegment.from_wav(file_path)
-    return len(audio) / 1000
+# =====================================================
+# PATHS
+# =====================================================
 
-def save_dataset(rows):
-    os.makedirs("dataset", exist_ok=True)
+DATASET_DIR = "dataset"
 
-    df = pd.DataFrame(rows)
+TRAIN_FILE = os.path.join(
+    DATASET_DIR,
+    "train.tsv"
+)
 
-    file_path = "dataset/train.tsv"
+# =====================================================
+# CREATE DATASET
+# =====================================================
 
-    if os.path.exists(file_path):
-        df.to_csv(file_path, sep="\t", index=False, mode='a', header=False)
-    else:
-        df.to_csv(file_path, sep="\t", index=False)
+def initialize_dataset():
+
+    os.makedirs(
+        DATASET_DIR,
+        exist_ok=True
+    )
+
+    if not os.path.exists(TRAIN_FILE):
+
+        with open(
+            TRAIN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            pass
+
+# =====================================================
+# WRITE DATASET
+# =====================================================
+
+def write_dataset(results):
+
+    initialize_dataset()
+
+    if len(results) == 0:
+
+        print("\nNo transcripts to save.")
+
+        return
+
+    with open(
+
+        TRAIN_FILE,
+
+        "a",
+
+        encoding="utf-8"
+
+    ) as f:
+
+        for item in results:
+
+            line = (
+
+                f"{item['audio_path']}\t"
+
+                f"{item['text']}\t"
+
+                f"{item['duration']}"
+
+                "\n"
+
+            )
+
+            f.write(line)
+
+    print()
+
+    print("=" * 60)
+    print(f"Saved {len(results)} records to train.tsv")
+    print("=" * 60)
+
+
+# =====================================================
+# TEST
+# =====================================================
+
+if __name__ == "__main__":
+
+    sample = [
+
+        {
+
+            "audio_path": "dataset/clips/chunk_99999.wav",
+
+            "text": "මෙය පරීක්ෂණයකි.",
+
+            "duration": 10.0
+
+        }
+
+    ]
+
+    write_dataset(sample)
