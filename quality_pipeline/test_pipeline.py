@@ -8,29 +8,28 @@ Run from the repo root:
 
 What it does:
 1. Loads sample_data/raw_docs.jsonl into Document objects
-2. Runs them through Stage 1 (Unicode normalization) + Stage 3a (exact-hash dedup)
-3. Promotes any still-PENDING documents to ACCEPT (placeholder until the full
-   Stage 3 quality scorer is built — non-rejected docs tentatively pass)
-4. Prints a summary to the terminal
-5. Writes a detailed Excel report to results/pipeline_run.xlsx
+2. Runs them through all four active stages:
+     Stage 1  — Unicode normalization
+     Stage 2  — Exact-hash deduplication
+     Stage 3a — Morphology-aware quality scoring (novelty 1)
+     Stage 3b — Cross-register semantic overlap detection (novelty 2)
+3. Promotes any still-PENDING documents to ACCEPT (placeholder Stage 4 router).
+4. Prints a per-stage summary to the terminal.
+5. Writes a detailed Excel report to results/pipeline_run.xlsx.
 
-Adding the dedup stage required exactly ONE line of code change in this file
-(adding it to the stages list). That's the payoff of the Stage abstraction —
-the orchestrator, schema, and loader didn't change at all.
+Adding a new stage is one line here — the orchestrator, schema, and loader
+don't change. That's the payoff of the Stage abstraction.
 """
 
 from collections import Counter
 from pathlib import Path
 
+from .io import JsonlLoader, XlsxWriter
+from .linguistic import UnicodeNormalizer
 from .pipeline import QualityPipeline
-from .schema import Verdict
-
-from .linguistic.normalizer import UnicodeNormalizer
-from .quality.deduplicator import ExactHashDeduplicator
-from .io.loader import JsonlLoader
-from .io.writer import XlsxWriter
+from .quality import CrossRegisterSemanticOverlap, ExactHashDeduplicator
 from .quality.morphology import MorphologyQualityScorer
-
+from .schema import Verdict
 
 
 def main() -> None:
@@ -45,26 +44,47 @@ def main() -> None:
         UnicodeNormalizer(),
         ExactHashDeduplicator(),
         MorphologyQualityScorer(),
+        CrossRegisterSemanticOverlap(),
     ])
 
+    print("Loading corpus...")
     loader = JsonlLoader(sample_file)
+    print("Running pipeline (first run downloads LaBSE ~470MB — please wait)...")
     docs = pipeline.run_batch(loader.load())
 
-    # Tentative final routing: anything not explicitly rejected is accepted.
-    # Placeholder until the full Stage 3 scorer produces graded verdicts.
+    # Tentative Stage 4 (router placeholder): anything still PENDING → ACCEPT.
     for doc in docs:
         if doc.verdict == Verdict.PENDING:
             doc.verdict = Verdict.ACCEPT
             doc.verdict_reasons.append("tentative_accept:no_rejection_signals")
 
+    # ---- Reporting ----
     verdict_counts = Counter(d.verdict.value for d in docs)
-    duplicates = sum(1 for d in docs if d.quality.get("is_duplicate"))
+    exact_dups = sum(1 for d in docs if d.quality.get("is_duplicate"))
     chars_removed = sum(d.linguistic.get("chars_removed", 0) for d in docs)
 
+    # Semantic-overlap counters — separate REJECT and REVIEW paths so the
+    # register-aware split shows up in the terminal summary.
+    sem_reject = sum(
+        1 for d in docs
+        if d.quality.get("semantic_overlap", {}).get("decision") == "reject_same_source"
+    )
+    sem_review = sum(
+        1 for d in docs
+        if d.quality.get("semantic_overlap", {}).get("decision") == "review_cross_register"
+    )
+    sem_embedded = sum(
+        1 for d in docs
+        if d.quality.get("semantic_overlap", {}).get("embedded")
+    )
+
     print(f"\nProcessed {len(docs)} documents.")
-    print(f"  Characters removed by normalization: {chars_removed}")
-    print(f"  Exact duplicates detected:           {duplicates}")
-    print(f"  Verdict breakdown:")
+    print(f"  Stage 1 (Unicode)     — characters removed:      {chars_removed}")
+    print(f"  Stage 2 (Exact dedup) — exact duplicates:        {exact_dups}")
+    print(f"  Stage 3b (Semantic)   — documents embedded:      {sem_embedded}")
+    print(f"                          same-source rejects:     {sem_reject}")
+    print(f"                          cross-register reviews:  {sem_review}")
+    print(f"  Final verdict breakdown:")
     for verdict, count in sorted(verdict_counts.items()):
         print(f"    {verdict:8s}: {count}")
 

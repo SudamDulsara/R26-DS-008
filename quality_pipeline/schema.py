@@ -80,3 +80,5 @@ class Document:
             f"Document(id={self.doc_id!r}, source={self.source.value}, "
             f"verdict={self.verdict.value}, text={preview!r}...)"
         )
+
+        
