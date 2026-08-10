@@ -34,7 +34,7 @@ def run_exact_dedup():
 
     cursor.execute(
         """
-        SELECT id, clean_text
+        SELECT id, source, clean_text
         FROM articles
         WHERE clean_status = ?
         ORDER BY id
@@ -46,12 +46,22 @@ def run_exact_dedup():
     seen_hashes: dict[str, int] = {}
     unique_count = 0
     duplicate_count = 0
+    unhashable_count = 0
+    skips_by_source = {}
 
     for row in articles:
         article_id = row["id"]
         clean_hash = compute_clean_hash(row["clean_text"])
 
         if not clean_hash:
+            unhashable_count += 1
+            source_skips = skips_by_source.setdefault(
+                row["source"] or "unknown",
+                {},
+            )
+            source_skips["unhashable_article"] = (
+                source_skips.get("unhashable_article", 0) + 1
+            )
             cursor.execute(
                 """
                 UPDATE articles
@@ -67,6 +77,13 @@ def run_exact_dedup():
 
         if clean_hash in seen_hashes:
             duplicate_count += 1
+            source_skips = skips_by_source.setdefault(
+                row["source"] or "unknown",
+                {},
+            )
+            source_skips["exact_duplicate"] = (
+                source_skips.get("exact_duplicate", 0) + 1
+            )
             cursor.execute(
                 """
                 UPDATE articles
@@ -107,4 +124,6 @@ def run_exact_dedup():
     return {
         "unique_articles": unique_count,
         "exact_duplicates": duplicate_count,
+        "unhashable_articles": unhashable_count,
+        "skips_by_source": skips_by_source,
     }

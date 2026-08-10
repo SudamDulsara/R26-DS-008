@@ -1,6 +1,8 @@
 __pycache__/
+.tmp/
 data/
 logs/
+outputs/
 
 .env
 .envrc
