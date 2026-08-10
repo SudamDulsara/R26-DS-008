@@ -305,7 +305,7 @@ def main(argv=None):
                     "--apply-gpt-candidate-review cannot be combined "
                     "with --force"
                 )
-            from news_pipeline.evaluation.unified_story_review import (
+            from news_pipeline.unification.candidate_review import (
                 apply_gpt_candidate_review,
             )
 

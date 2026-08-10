@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from news_pipeline.config import PipelineConfig
-from news_pipeline.evaluation.gpt_only_backfill import (
-    _read_json,
-    _sha256,
-    _write_json,
+from news_pipeline.artifact_io import (
+    read_json_object as _read_json,
+    sha256_file as _sha256,
+    write_json as _write_json,
 )
 from news_pipeline.storage.database import get_connection
 from news_pipeline.unification.gpt_contract import GPT_PROMPT_VERSION_V2_8
