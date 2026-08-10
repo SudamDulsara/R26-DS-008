@@ -87,6 +87,7 @@ def run_cleaner():
 
     passed = 0
     failed = 0
+    failures_by_source = {}
 
     try:
         for row in articles:
@@ -146,6 +147,10 @@ def run_cleaner():
                     config.purity_threshold * 100,
                 )
                 failed += 1
+                source_failures = failures_by_source.setdefault(source, {})
+                source_failures["low_sinhala_purity"] = (
+                    source_failures.get("low_sinhala_purity", 0) + 1
+                )
 
         connection.commit()
     finally:
@@ -165,6 +170,7 @@ def run_cleaner():
     return {
         "cleaned_articles": passed,
         "rejected_articles": failed,
+        "failures_by_source": failures_by_source,
     }
 
 

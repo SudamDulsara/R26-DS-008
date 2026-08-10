@@ -12,8 +12,16 @@ from news_pipeline.unification.contract import (
     validate_unified_story_record,
 )
 from news_pipeline.unification.evidence import build_sentence_evidence
+from news_pipeline.unification.generated_contract import (
+    build_generated_story_record,
+    generated_story_contract_metadata,
+)
 from news_pipeline.unification.near_duplicates import (
     group_near_duplicate_evidence,
+)
+from news_pipeline.unification.production import (
+    build_generation_identity,
+    load_cached_version,
 )
 from news_pipeline.unification.selector import select_extractive_story
 from news_pipeline.unification.titles import build_display_title
@@ -255,7 +263,50 @@ def _build_extractive_story(
     return select_extractive_story(evidence_groups), sentence_evidence
 
 
-def export_snapshot():
+def build_generated_story_rows(
+    *,
+    connection,
+    config,
+    cluster_rows: list[dict],
+    cluster_member_rows: list[dict],
+    article_records_by_id: dict[int, dict],
+    extractive_story_rows: list[dict],
+    gpt_shadow: bool = False,
+) -> list[dict]:
+    members_by_cluster = defaultdict(list)
+    for member in cluster_member_rows:
+        members_by_cluster[member["cluster_id"]].append(member)
+    extractive_by_story_id = {
+        story["story_id"]: story for story in extractive_story_rows
+    }
+
+    generated_rows = []
+    for cluster in cluster_rows:
+        version = None
+        try:
+            identity = build_generation_identity(
+                cluster=cluster,
+                members=members_by_cluster.get(cluster["id"], []),
+                article_records_by_id=article_records_by_id,
+                config=config,
+            )
+            if not gpt_shadow:
+                version = load_cached_version(
+                    connection,
+                    identity.request_fingerprint_sha256,
+                )
+        except (TypeError, ValueError):
+            version = None
+        generated_rows.append(
+            build_generated_story_record(
+                extractive_by_story_id[cluster["cluster_key"]],
+                version,
+            )
+        )
+    return generated_rows
+
+
+def export_snapshot(*, gpt_shadow: bool = False):
     config = load_config()
     config.snapshots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -427,6 +478,24 @@ def export_snapshot():
         cluster_member_rows,
         article_records_by_id,
     )
+    generated_story_rows = build_generated_story_rows(
+        connection=conn,
+        config=config,
+        cluster_rows=cluster_rows,
+        cluster_member_rows=cluster_member_rows,
+        article_records_by_id=article_records_by_id,
+        extractive_story_rows=unified_story_rows,
+        gpt_shadow=gpt_shadow,
+    )
+    generated_story_count = sum(
+        story["status"] == "generated" for story in generated_story_rows
+    )
+    generated_story_fallback_count = sum(
+        story["status"] == "fallback" for story in generated_story_rows
+    )
+    generated_story_unavailable_count = sum(
+        story["status"] == "unavailable" for story in generated_story_rows
+    )
     unified_stories_with_extractive_text = sum(
         bool(story["unified_text"]) for story in unified_story_rows
     )
@@ -466,6 +535,7 @@ def export_snapshot():
     clusters_path = snapshot_dir / "story_clusters.jsonl"
     cluster_members_path = snapshot_dir / "story_cluster_members.jsonl"
     unified_stories_path = snapshot_dir / "unified_stories.jsonl"
+    unified_stories_v3_path = snapshot_dir / "unified_stories_v3.jsonl"
     report_path = snapshot_dir / "report.json"
 
     _write_jsonl(fulltext_path, fulltext_rows)
@@ -473,12 +543,50 @@ def export_snapshot():
     _write_jsonl(clusters_path, cluster_rows)
     _write_jsonl(cluster_members_path, cluster_member_rows)
     _write_jsonl(unified_stories_path, unified_story_rows)
+    _write_jsonl(unified_stories_v3_path, generated_story_rows)
+    final_publication = None
+    if config.gpt_only_publication_enabled:
+        from news_pipeline.unification.final_publication import (
+            materialize_gpt_only_publication,
+        )
+
+        final_publication = materialize_gpt_only_publication(
+            output_dir=snapshot_dir,
+            config=config,
+        )
+    primary_unification_contract = (
+        "final_gpt_only_publication"
+        if final_publication is not None
+        else "unified_stories_v3"
+    )
+    primary_unification_path = (
+        final_publication["paths"]["final_unified_stories"]
+        if final_publication is not None
+        else str(unified_stories_v3_path)
+    )
 
     report = {
         "generated_at": generated_at,
         "snapshot_name": snapshot_name,
+        "gpt_shadow_mode": gpt_shadow,
+        "gpt_only_publication_enabled": (
+            config.gpt_only_publication_enabled
+        ),
+        "primary_unification_contract": primary_unification_contract,
         "contracts": {
             "unified_stories": unified_story_contract_metadata(),
+            "unified_stories_v3": generated_story_contract_metadata(),
+            "final_gpt_only_publication": (
+                {
+                    "publication_version": final_publication[
+                        "publication_version"
+                    ],
+                    "mode": final_publication["mode"],
+                    "prompt_version": final_publication["prompt_version"],
+                }
+                if final_publication is not None
+                else None
+            ),
         },
         "paths": {
             "fulltext": str(fulltext_path),
@@ -486,6 +594,13 @@ def export_snapshot():
             "story_clusters": str(clusters_path),
             "story_cluster_members": str(cluster_members_path),
             "unified_stories": str(unified_stories_path),
+            "unified_stories_v3": str(unified_stories_v3_path),
+            "final_gpt_only_publication": (
+                final_publication["paths"]
+                if final_publication is not None
+                else None
+            ),
+            "primary_unified_stories": primary_unification_path,
         },
         "counts": {
             "discovered_urls": total_urls,
@@ -494,6 +609,19 @@ def export_snapshot():
             "story_clusters": len(cluster_rows),
             "story_cluster_members": len(cluster_member_rows),
             "unified_stories": len(unified_story_rows),
+            "unified_stories_v3": len(generated_story_rows),
+            "unified_stories_v3_generated": generated_story_count,
+            "unified_stories_v3_fallback": (
+                generated_story_fallback_count
+            ),
+            "unified_stories_v3_unavailable": (
+                generated_story_unavailable_count
+            ),
+            "final_gpt_only_publication": (
+                final_publication["counts"]
+                if final_publication is not None
+                else None
+            ),
             "unified_stories_with_extractive_text": (
                 unified_stories_with_extractive_text
             ),
@@ -529,6 +657,12 @@ def export_snapshot():
     logger.info("Exported %s unique cleaned articles", len(fulltext_rows))
     logger.info("Exported %s story clusters", len(cluster_rows))
     logger.info("Exported %s unified stories", len(unified_story_rows))
+    logger.info(
+        "Exported %s V3 stories (%s GPT, %s fallback)",
+        len(generated_story_rows),
+        generated_story_count,
+        generated_story_fallback_count,
+    )
     logger.info("Snapshot directory: %s", snapshot_dir)
 
     return {
@@ -538,11 +672,24 @@ def export_snapshot():
         "clusters_path": str(clusters_path),
         "cluster_members_path": str(cluster_members_path),
         "unified_stories_path": str(unified_stories_path),
+        "unified_stories_v3_path": str(unified_stories_v3_path),
         "report_path": str(report_path),
         "unified_story_contract": unified_story_contract_metadata(),
+        "unified_story_v3_contract": generated_story_contract_metadata(),
+        "final_gpt_only_publication": final_publication,
+        "primary_unification_contract": primary_unification_contract,
+        "primary_unified_stories_path": primary_unification_path,
         "exported_unique_articles": len(fulltext_rows),
         "story_clusters": len(cluster_rows),
         "unified_stories": len(unified_story_rows),
+        "unified_stories_v3": len(generated_story_rows),
+        "unified_stories_v3_generated": generated_story_count,
+        "unified_stories_v3_fallback": (
+            generated_story_fallback_count
+        ),
+        "unified_stories_v3_unavailable": (
+            generated_story_unavailable_count
+        ),
         "unified_stories_with_extractive_text": (
             unified_stories_with_extractive_text
         ),

@@ -11,18 +11,20 @@ from news_pipeline.statuses import (
     DEDUPE_STATUS_EXACT_DUPLICATE,
     DEDUPE_STATUS_PENDING,
     DEDUPE_STATUS_UNIQUE,
+    URL_ERROR_LEGACY_RETRY_STATE,
     URL_STATUS_DISCOVERED,
     URL_STATUS_EXHAUSTED,
     URL_STATUS_EXTRACTED,
     URL_STATUS_FETCH_FAILED,
+    URL_STATUS_REJECTED,
 )
 
 
 sqlite3.register_adapter(datetime, lambda value: value.isoformat())
 
 
-def get_connection():
-    config = load_config()
+def get_connection(config=None):
+    config = config or load_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(config.db_path, timeout=30)
@@ -38,8 +40,66 @@ def _ensure_column(cursor, table_name: str, column_name: str, column_def: str):
         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
 
+def _backfill_pipeline_snapshot_state(cursor) -> None:
+    rows = cursor.execute(
+        """
+        SELECT id, stats_json, snapshot_path
+        FROM pipeline_runs
+        WHERE status = 'completed'
+        ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
+        """
+    ).fetchall()
+    snapshots = []
+    for row in rows:
+        snapshot_path = row["snapshot_path"]
+        if not snapshot_path:
+            try:
+                stats = json.loads(row["stats_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                stats = {}
+            export_stats = (
+                stats.get("export")
+                if isinstance(stats, dict)
+                else None
+            )
+            snapshot_path = (
+                export_stats.get("snapshot_dir")
+                if isinstance(export_stats, dict)
+                else None
+            )
+            if snapshot_path:
+                cursor.execute(
+                    """
+                    UPDATE pipeline_runs
+                    SET snapshot_path = ?
+                    WHERE id = ?
+                    """,
+                    (snapshot_path, row["id"]),
+                )
+        if snapshot_path:
+            snapshots.append((row["id"], snapshot_path))
+    has_latest = cursor.execute(
+        """
+        SELECT 1
+        FROM pipeline_runs
+        WHERE is_latest_success = 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if has_latest is None and snapshots:
+        cursor.execute(
+            """
+            UPDATE pipeline_runs
+            SET is_latest_success = 1
+            WHERE id = ?
+            """,
+            (snapshots[0][0],),
+        )
+
+
 def initialize_db():
-    conn = get_connection()
+    config = load_config()
+    conn = get_connection(config)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -97,7 +157,9 @@ def initialize_db():
             finished_at TEXT,
             status TEXT NOT NULL,
             stats_json TEXT,
-            note TEXT
+            note TEXT,
+            snapshot_path TEXT,
+            is_latest_success INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -140,6 +202,192 @@ def initialize_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clustering_article_state (
+            article_id INTEGER PRIMARY KEY,
+            input_fingerprint_sha256 TEXT,
+            clustering_status TEXT NOT NULL,
+            cluster_key TEXT,
+            processed_at TEXT NOT NULL,
+            FOREIGN KEY (article_id) REFERENCES articles(id),
+            FOREIGN KEY (cluster_key) REFERENCES story_clusters(cluster_key)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS story_cluster_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transition_batch_id TEXT NOT NULL,
+            transition_type TEXT NOT NULL,
+            old_cluster_key TEXT,
+            new_cluster_key TEXT,
+            overlap_article_count INTEGER NOT NULL,
+            old_article_ids_json TEXT NOT NULL,
+            new_article_ids_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (
+                transition_batch_id,
+                transition_type,
+                old_cluster_key,
+                new_cluster_key
+            )
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS unified_story_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_id INTEGER,
+            cluster_key TEXT NOT NULL,
+            source_fingerprint_sha256 TEXT NOT NULL,
+            input_fingerprint_sha256 TEXT NOT NULL,
+            request_fingerprint_sha256 TEXT NOT NULL UNIQUE,
+            model_name TEXT NOT NULL,
+            model_snapshot TEXT,
+            prompt_version TEXT NOT NULL,
+            input_schema_version TEXT NOT NULL,
+            output_schema_version TEXT NOT NULL,
+            resolved_schema_version TEXT,
+            reasoning_effort TEXT NOT NULL,
+            max_output_tokens INTEGER NOT NULL,
+            generation_status TEXT NOT NULL,
+            validation_status TEXT NOT NULL,
+            output_json TEXT,
+            resolved_output_json TEXT,
+            validation_json TEXT NOT NULL,
+            preflight_json TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            estimated_cost_usd TEXT,
+            response_id TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            fallback_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gpt_unification_review_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unified_story_version_id INTEGER NOT NULL UNIQUE,
+            cluster_id INTEGER,
+            story_id TEXT NOT NULL,
+            request_fingerprint_sha256 TEXT NOT NULL UNIQUE,
+            queue_status TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL DEFAULT '[]',
+            validation_status TEXT NOT NULL,
+            fallback_reason TEXT,
+            candidate_title TEXT,
+            candidate_story TEXT,
+            prompt_version TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            response_id TEXT,
+            detected_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            reviewed_at TEXT,
+            review_decision TEXT,
+            review_notes TEXT,
+            FOREIGN KEY (unified_story_version_id)
+                REFERENCES unified_story_versions(id) ON DELETE CASCADE,
+            FOREIGN KEY (cluster_id)
+                REFERENCES story_clusters(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS final_unified_stories (
+            story_id TEXT PRIMARY KEY,
+            cluster_id INTEGER NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            story TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            article_count INTEGER NOT NULL,
+            FOREIGN KEY (cluster_id) REFERENCES story_clusters(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS final_story_sources (
+            story_id TEXT NOT NULL,
+            article_id INTEGER NOT NULL,
+            publisher TEXT,
+            source_title TEXT,
+            url TEXT,
+            published_date TEXT,
+            similarity_score REAL,
+            is_representative INTEGER NOT NULL,
+            referenced_by_gpt INTEGER NOT NULL,
+            evidence_span_ids_json TEXT NOT NULL,
+            PRIMARY KEY (story_id, article_id),
+            FOREIGN KEY (story_id)
+                REFERENCES final_unified_stories(story_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (article_id) REFERENCES articles(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS final_story_claims (
+            story_id TEXT NOT NULL,
+            claim_index INTEGER NOT NULL,
+            claim_text TEXT NOT NULL,
+            source_article_ids_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            PRIMARY KEY (story_id, claim_index),
+            FOREIGN KEY (story_id)
+                REFERENCES final_unified_stories(story_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS final_story_conflicts (
+            story_id TEXT NOT NULL,
+            conflict_index INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            source_article_ids_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            PRIMARY KEY (story_id, conflict_index),
+            FOREIGN KEY (story_id)
+                REFERENCES final_unified_stories(story_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS final_story_publication_states (
+            story_id TEXT PRIMARY KEY,
+            cluster_id INTEGER NOT NULL UNIQUE,
+            publication_status TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            unified_story_version_id INTEGER,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (cluster_id) REFERENCES story_clusters(id),
+            FOREIGN KEY (unified_story_version_id)
+                REFERENCES unified_story_versions(id)
+        )
+        """
+    )
+
     _ensure_column(cursor, "discovered_urls", "rss_title", "rss_title TEXT")
     _ensure_column(cursor, "discovered_urls", "rss_published", "rss_published TEXT")
     _ensure_column(
@@ -155,6 +403,24 @@ def initialize_db():
         "fetch_attempts INTEGER DEFAULT 0",
     )
     _ensure_column(cursor, "discovered_urls", "last_error", "last_error TEXT")
+    _ensure_column(
+        cursor,
+        "discovered_urls",
+        "last_error_code",
+        "last_error_code TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "discovered_urls",
+        "last_http_status",
+        "last_http_status INTEGER",
+    )
+    _ensure_column(
+        cursor,
+        "discovered_urls",
+        "last_request_attempts",
+        "last_request_attempts INTEGER DEFAULT 0",
+    )
     _ensure_column(
         cursor,
         "discovered_urls",
@@ -208,6 +474,18 @@ def initialize_db():
     _ensure_column(cursor, "articles", "exported_at", "exported_at TEXT")
     _ensure_column(
         cursor,
+        "pipeline_runs",
+        "snapshot_path",
+        "snapshot_path TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "pipeline_runs",
+        "is_latest_success",
+        "is_latest_success INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        cursor,
         "story_clusters",
         "model_revision",
         "model_revision TEXT",
@@ -223,6 +501,36 @@ def initialize_db():
         "story_clusters",
         "cohesion_threshold",
         "cohesion_threshold REAL",
+    )
+    _ensure_column(
+        cursor,
+        "unified_story_versions",
+        "human_review_decision",
+        "human_review_decision TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "unified_story_versions",
+        "human_review_scores_json",
+        "human_review_scores_json TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "unified_story_versions",
+        "human_review_notes",
+        "human_review_notes TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "unified_story_versions",
+        "human_review_source_sha256",
+        "human_review_source_sha256 TEXT",
+    )
+    _ensure_column(
+        cursor,
+        "unified_story_versions",
+        "human_review_imported_at",
+        "human_review_imported_at TEXT",
     )
 
     cursor.execute(
@@ -261,6 +569,74 @@ def initialize_db():
         ON story_cluster_members(article_id)
         """
     )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_clustering_article_state_status
+        ON clustering_article_state(clustering_status, processed_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_clustering_article_state_cluster
+        ON clustering_article_state(cluster_key)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_story_cluster_transitions_old
+        ON story_cluster_transitions(old_cluster_key, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_story_cluster_transitions_new
+        ON story_cluster_transitions(new_cluster_key, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_unified_story_versions_cluster
+        ON unified_story_versions(cluster_key, updated_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_unified_story_versions_source
+        ON unified_story_versions(source_fingerprint_sha256)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_unified_story_versions_status
+        ON unified_story_versions(generation_status, validation_status)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_final_story_state_status
+        ON final_story_publication_states(publication_status, story_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_runs_latest_success
+        ON pipeline_runs(is_latest_success)
+        WHERE is_latest_success = 1
+        """
+    )
+    _backfill_pipeline_snapshot_state(cursor)
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gpt_review_queue_status
+        ON gpt_unification_review_queue(queue_status, updated_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gpt_review_queue_story
+        ON gpt_unification_review_queue(story_id, updated_at)
+        """
+    )
 
     cursor.execute(
         """
@@ -268,10 +644,8 @@ def initialize_db():
         SET status = CASE
             WHEN fetched = 1 AND url IN (SELECT url FROM articles) THEN ?
             WHEN fetched = 1 AND url NOT IN (SELECT url FROM articles) THEN ?
-            WHEN fetched = 0
-                 AND COALESCE(fetch_attempts, 0) > 0
-                 AND (status IS NULL OR status = '' OR status = ?) THEN ?
-            WHEN status IS NULL OR status = '' THEN ?
+            WHEN status IN (?, ?, ?, ?, ?) THEN status
+            WHEN COALESCE(fetch_attempts, 0) > 0 THEN ?
             ELSE ?
         END
         """,
@@ -280,8 +654,39 @@ def initialize_db():
             URL_STATUS_EXHAUSTED,
             URL_STATUS_DISCOVERED,
             URL_STATUS_FETCH_FAILED,
+            URL_STATUS_EXTRACTED,
+            URL_STATUS_REJECTED,
+            URL_STATUS_EXHAUSTED,
+            URL_STATUS_FETCH_FAILED,
             URL_STATUS_DISCOVERED,
-            URL_STATUS_DISCOVERED,
+        ),
+    )
+    cursor.execute(
+        """
+        UPDATE discovered_urls
+        SET status = ?,
+            fetch_attempts = CASE
+                WHEN COALESCE(fetch_attempts, 0) < ? THEN ?
+                ELSE fetch_attempts
+            END,
+            last_error_code = COALESCE(
+                NULLIF(last_error_code, ''),
+                ?
+            )
+        WHERE status = ?
+           OR (
+                status = ?
+                AND COALESCE(fetch_attempts, 0) >= ?
+           )
+        """,
+        (
+            URL_STATUS_EXHAUSTED,
+            config.max_retries,
+            config.max_retries,
+            URL_ERROR_LEGACY_RETRY_STATE,
+            URL_STATUS_EXHAUSTED,
+            URL_STATUS_FETCH_FAILED,
+            config.max_retries,
         ),
     )
 
@@ -344,6 +749,39 @@ def initialize_db():
         WHERE metadata_flags IS NULL OR metadata_flags = ''
         """
     )
+    cursor.execute(
+        """
+        INSERT INTO clustering_article_state (
+            article_id,
+            input_fingerprint_sha256,
+            clustering_status,
+            cluster_key,
+            processed_at
+        )
+        SELECT
+            articles.id,
+            NULL,
+            CASE
+                WHEN clusters.cluster_key IS NOT NULL
+                    THEN 'baseline_clustered'
+                ELSE 'baseline_unclustered'
+            END,
+            clusters.cluster_key,
+            CURRENT_TIMESTAMP
+        FROM articles
+        LEFT JOIN story_cluster_members AS members
+          ON members.article_id = articles.id
+        LEFT JOIN story_clusters AS clusters
+          ON clusters.id = members.cluster_id
+        WHERE articles.clean_status = ?
+          AND articles.dedupe_status = ?
+          AND articles.clean_text IS NOT NULL
+          AND TRIM(articles.clean_text) != ''
+          AND EXISTS (SELECT 1 FROM story_clusters)
+          AND NOT EXISTS (SELECT 1 FROM clustering_article_state)
+        """,
+        (CLEAN_STATUS_CLEANED, DEDUPE_STATUS_UNIQUE),
+    )
 
     conn.commit()
     conn.close()
@@ -374,10 +812,29 @@ def finish_pipeline_run(
 ):
     conn = get_connection()
     cursor = conn.cursor()
+    snapshot_path = None
+    export_stats = stats.get("export")
+    if status == "completed" and isinstance(export_stats, dict):
+        snapshot_path = export_stats.get("snapshot_dir")
+    if snapshot_path:
+        cursor.execute(
+            """
+            UPDATE pipeline_runs
+            SET is_latest_success = 0
+            WHERE is_latest_success = 1
+              AND id != ?
+            """,
+            (run_id,),
+        )
     cursor.execute(
         """
         UPDATE pipeline_runs
-        SET finished_at = ?, status = ?, stats_json = ?, note = ?
+        SET finished_at = ?,
+            status = ?,
+            stats_json = ?,
+            note = ?,
+            snapshot_path = ?,
+            is_latest_success = ?
         WHERE id = ?
         """,
         (
@@ -385,8 +842,27 @@ def finish_pipeline_run(
             status,
             json.dumps(stats, ensure_ascii=False),
             note,
+            snapshot_path,
+            int(bool(snapshot_path)),
             run_id,
         ),
     )
     conn.commit()
     conn.close()
+
+
+def get_latest_successful_snapshot() -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, started_at, finished_at, snapshot_path
+            FROM pipeline_runs
+            WHERE is_latest_success = 1
+              AND status = 'completed'
+              AND snapshot_path IS NOT NULL
+            """
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()

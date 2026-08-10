@@ -1,5 +1,6 @@
 from datetime import datetime
 import sqlite3
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from news_pipeline.config import load_config
 from news_pipeline.statuses import URL_STATUS_DISCOVERED
@@ -12,19 +13,60 @@ sqlite3.register_adapter(datetime, lambda value: value.isoformat())
 logger = get_logger()
 
 
-def discover_urls(source_name, rss_url, connection):
+def build_feed_page_urls(rss_url: str, feed_pages: int) -> list[str]:
+    if feed_pages < 1:
+        raise ValueError("feed_pages must be at least 1")
+    urls = [rss_url]
+    path = urlsplit(rss_url).path.rstrip("/").lower()
+    if feed_pages == 1 or not path.endswith("/feed"):
+        return urls
+    split = urlsplit(rss_url)
+    base_query = dict(parse_qsl(split.query, keep_blank_values=True))
+    for page in range(2, feed_pages + 1):
+        query = {**base_query, "paged": str(page)}
+        urls.append(
+            urlunsplit(
+                (
+                    split.scheme,
+                    split.netloc,
+                    split.path,
+                    urlencode(query),
+                    split.fragment,
+                )
+            )
+        )
+    return urls
+
+
+def discover_urls(
+    source_name,
+    rss_url,
+    connection,
+    log_label=None,
+    telemetry=None,
+):
+    def record_failure(reason):
+        if telemetry is None:
+            return
+        source_failures = telemetry.setdefault(source_name, {})
+        source_failures[reason] = source_failures.get(reason, 0) + 1
+
     try:
         import feedparser
     except ModuleNotFoundError as exc:
         logger.error("Missing dependency: %s", exc.name)
+        record_failure("missing_dependency")
         return 0
 
     logger.info("")
-    logger.info("[%s] Fetching RSS feed...", source_name)
+    label = log_label or source_name
+    logger.info("[%s] Fetching RSS feed...", label)
     feed = feedparser.parse(rss_url)
 
     if feed.bozo:
-        logger.warning("[%s] Feed may have issues - %s", source_name, feed.bozo_exception)
+        logger.warning("[%s] Feed may have issues - %s", label, feed.bozo_exception)
+        if not feed.entries:
+            record_failure("feed_parse_error")
 
     new_count = 0
     cursor = connection.cursor()
@@ -72,22 +114,37 @@ def discover_urls(source_name, rss_url, connection):
                 new_count += 1
 
         except sqlite3.Error as exc:
-            logger.error("[%s] DB error for %s: %s", source_name, url, exc)
+            logger.error("[%s] DB error for %s: %s", label, url, exc)
+            record_failure("database_error")
 
-    logger.info("[%s] Done - %s new URLs saved.", source_name, new_count)
+    logger.info("[%s] Done - %s new URLs saved.", label, new_count)
     return new_count
 
 
-def run_discovery():
+def run_discovery(feed_pages: int = 1):
     config = load_config()
     connection = get_connection()
 
     logger.info("=== URL Discovery Started ===")
     total = 0
+    failures_by_source = {}
 
     try:
         for source_name, rss_url in config.news_sources.items():
-            total += discover_urls(source_name, rss_url, connection)
+            feed_urls = build_feed_page_urls(rss_url, feed_pages)
+            for page_number, feed_url in enumerate(feed_urls, start=1):
+                log_label = (
+                    source_name
+                    if len(feed_urls) == 1
+                    else f"{source_name} feed page {page_number}"
+                )
+                total += discover_urls(
+                    source_name,
+                    feed_url,
+                    connection,
+                    log_label=log_label,
+                    telemetry=failures_by_source,
+                )
         connection.commit()
     finally:
         connection.close()
@@ -97,6 +154,8 @@ def run_discovery():
     return {
         "new_urls": total,
         "sources_checked": len(config.news_sources),
+        "feed_pages_requested": feed_pages,
+        "failures_by_source": failures_by_source,
     }
 
 
