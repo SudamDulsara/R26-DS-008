@@ -69,6 +69,7 @@ def build_pipeline_status(
     try:
         latest_run = _latest_run(connection)
         latest_success = _latest_success(connection)
+        current_publication_path = selected_config.data_dir / "current"
         status = {
             "status_version": PIPELINE_STATUS_VERSION,
             "generated_at": datetime.now().astimezone().isoformat(
@@ -93,9 +94,29 @@ def build_pipeline_status(
                     selected_config.gpt_only_publication_prompt_version
                 ),
                 "gpt_model": selected_config.gpt_model,
+                "autonomous_audit_enabled": (
+                    selected_config.gpt_autonomous_audit_enabled
+                ),
+                "autonomous_audit_model": (
+                    selected_config.gpt_audit_model
+                ),
+                "autonomous_complex_audit_model": (
+                    selected_config.gpt_audit_complex_model
+                ),
+                "gpt_max_clusters_per_run": (
+                    selected_config.gpt_max_clusters_per_run
+                ),
             },
             "latest_run": latest_run,
             "latest_successful_snapshot": latest_success,
+            "current_publication": {
+                "path": str(current_publication_path),
+                "exists": current_publication_path.is_dir(),
+                "manifest_exists": (
+                    current_publication_path
+                    / "final_publication_manifest.json"
+                ).is_file(),
+            },
             "counts": {
                 "discovered_urls": int(
                     connection.execute(
@@ -137,6 +158,16 @@ def build_pipeline_status(
                     "gpt_unification_review_queue",
                     "queue_status",
                 ),
+                "actionable_gpt_review_queue_items": int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM gpt_unification_review_queue
+                        WHERE queue_status = 'pending_review'
+                          AND review_decision IS NULL
+                        """
+                    ).fetchone()[0]
+                ),
                 "final_publication_statuses": _counts_by(
                     connection,
                     "final_story_publication_states",
@@ -145,6 +176,16 @@ def build_pipeline_status(
                 "final_unified_stories": int(
                     connection.execute(
                         "SELECT COUNT(*) FROM final_unified_stories"
+                    ).fetchone()[0]
+                ),
+                "evidence_safe_fallback_stories": int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM final_story_publication_states
+                        WHERE reason_codes_json LIKE
+                            '%\"evidence_safe_fallback\"%'
+                        """
                     ).fetchone()[0]
                 ),
             },
@@ -158,9 +199,14 @@ def build_pipeline_status(
         "pending_gpt_reviews": status["counts"][
             "final_publication_statuses"
         ].get("pending_review", 0),
-        "pending_review_queue_items": status["counts"][
-            "gpt_review_queue_statuses"
-        ].get("pending_review", 0),
+        "pending_review_queue_items": (
+            0
+            if selected_config.gpt_autonomous_audit_enabled
+            else status["counts"]["actionable_gpt_review_queue_items"]
+        ),
+        "autonomous_safe_fallbacks": status["counts"][
+            "evidence_safe_fallback_stories"
+        ],
         "unavailable_final_stories": status["counts"][
             "final_publication_statuses"
         ].get("unavailable", 0),
@@ -178,6 +224,7 @@ def build_pipeline_status(
 def format_pipeline_status(status: dict[str, Any]) -> str:
     latest = status.get("latest_run") or {}
     snapshot = status.get("latest_successful_snapshot") or {}
+    current = status.get("current_publication") or {}
     counts = status["counts"]
     attention = status["attention"]
     configuration = status["configuration"]
@@ -185,19 +232,24 @@ def format_pipeline_status(status: dict[str, Any]) -> str:
         "Pipeline status",
         f"  Latest run: {latest.get('status', 'none')} "
         f"(id={latest.get('id', 'none')})",
-        "  Latest successful snapshot: "
+        "  Current publication: "
+        f"{current.get('path', 'none')} "
+        f"(exists={str(bool(current.get('exists'))).lower()})",
+        "  Latest successful run output: "
         f"{snapshot.get('snapshot_path', 'none')}",
         f"  URLs: {counts['discovered_urls']} "
         f"{json.dumps(counts['url_statuses'], sort_keys=True)}",
         f"  Articles: {counts['articles']} "
         f"{json.dumps(counts['article_clean_statuses'], sort_keys=True)}",
         f"  Story clusters: {counts['story_clusters']}",
-        f"  Final GPT-only stories: {counts['final_unified_stories']} "
+        f"  Final stories: {counts['final_unified_stories']} "
         f"{json.dumps(counts['final_publication_statuses'], sort_keys=True)}",
         "  GPT generation enabled: "
         f"{str(configuration['gpt_generation_enabled']).lower()}",
         "  GPT-only publication enabled: "
         f"{str(configuration['gpt_only_publication_enabled']).lower()}",
+        "  Autonomous GPT audit enabled: "
+        f"{str(configuration['autonomous_audit_enabled']).lower()}",
         "  Primary unification contract: "
         f"{configuration['primary_unification_contract']}",
         "  Attention: "

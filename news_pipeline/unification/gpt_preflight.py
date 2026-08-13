@@ -16,10 +16,8 @@ from news_pipeline.unification.openai_adapter import (
 
 
 TOKENS_PER_MILLION = Decimal("1000000")
-GPT_PRICING_VERSION = "openai_standard_2026-07-23"
-GPT_PRICING_SOURCE_URL = (
-    "https://developers.openai.com/api/docs/models/compare"
-)
+GPT_PRICING_VERSION = "openai_model_pages_2026-08-13"
+GPT_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models"
 OFFLINE_INPUT_BOUND_VERSION = "utf8_request_bytes_plus_framing_v1"
 DEFAULT_PROVIDER_FRAMING_TOKEN_ALLOWANCE = 1024
 LONG_CONTEXT_INPUT_TOKEN_THRESHOLD = 272_000
@@ -93,13 +91,13 @@ MODEL_PRICING: Mapping[str, ModelPricing] = MappingProxyType(
     {
         "gpt-5.6-luna": ModelPricing(
             model="gpt-5.6-luna",
-            input_usd_per_million_tokens=Decimal("1.00"),
-            output_usd_per_million_tokens=Decimal("6.00"),
+            input_usd_per_million_tokens=Decimal("0.20"),
+            output_usd_per_million_tokens=Decimal("1.20"),
         ),
         "gpt-5.6-terra": ModelPricing(
             model="gpt-5.6-terra",
-            input_usd_per_million_tokens=Decimal("2.50"),
-            output_usd_per_million_tokens=Decimal("15.00"),
+            input_usd_per_million_tokens=Decimal("2.00"),
+            output_usd_per_million_tokens=Decimal("12.00"),
         ),
     }
 )

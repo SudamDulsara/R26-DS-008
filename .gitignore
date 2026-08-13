@@ -1,4 +1,8 @@
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .tmp/
 data/
 logs/
@@ -12,5 +16,8 @@ venv/
 ENV/
 
 news_pipeline/docs
-news_pipeline/tests
+news_pipeline/tests/*
+!news_pipeline/tests/__init__.py
+!news_pipeline/tests/test_autonomous_pipeline.py
 news_pipeline/evaluation
+news_pipeline/private/

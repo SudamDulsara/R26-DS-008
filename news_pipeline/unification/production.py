@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping, Optional, Sequence
@@ -14,6 +15,11 @@ from pydantic import ValidationError
 from news_pipeline.config import PipelineConfig, load_config
 from news_pipeline.storage.database import get_connection
 from news_pipeline.storage.logger import get_logger
+from news_pipeline.unification.autonomous_audit import (
+    AUTONOMOUS_AUDIT_VERSION,
+    build_autonomous_audit_request,
+    classify_audit_route,
+)
 from news_pipeline.unification.fact_validation import (
     validate_claim_projection,
     validate_numerical_conflict_coverage,
@@ -35,6 +41,7 @@ from news_pipeline.unification.gpt_contract import (
     GPT_PROMPT_VERSION_V2_9,
     GPT_PROMPT_VERSION_V2_10,
     GPT_RESOLVED_SCHEMA_VERSION_V2,
+    GPTCorrectionUnifiedStoryResponseV2,
     GPTUnifiedStoryInputV2,
     GPTUnifiedStoryResponseV2,
     GPTValidationIssue,
@@ -84,6 +91,35 @@ HUMAN_REVIEW_BLOCKING_DECISIONS = frozenset(
 HUMAN_REVIEW_OVERRIDE_DECISIONS = frozenset(
     {"accept", "minor_issue"}
 )
+REVIEWED_CORRECTION_TARGET = "v2_10_reviewed_correction_raw_candidate"
+REVIEWED_CORRECTION_FOLLOWUP_TARGET = (
+    "v2_10_reviewed_correction_followup_raw_candidate"
+)
+REVIEWED_CORRECTION_LINEAGE_TARGET = (
+    "v2_10_reviewed_correction_lineage_raw_candidate"
+)
+MAX_REVIEWED_CORRECTION_DEPTH = 16
+REVIEWED_CORRECTION_PROMPT_SAFETY_MODE = (
+    "review_requirements_devanagari_redaction_v1"
+)
+REVIEWED_CORRECTION_OUTPUT_CONSTRAINT_MODE = (
+    "provider_schema_no_devanagari_pattern_v1"
+)
+REVIEWED_CORRECTION_REDACTION_MARKER = "[removed Devanagari token]"
+HUMAN_REVIEW_ACCEPTABLE_WARNING_CODES = frozenset(
+    {
+        "truncated_evidence_span_id_repaired",
+        "unknown_evidence_span_id",
+    }
+)
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097f]+")
+REVIEWED_CORRECTION_OUTPUT_RULES = (
+    "The title, unified_story, claims, and conflict descriptions must not "
+    "contain Devanagari characters (Unicode U+0900-U+097F), including "
+    "defective tokens quoted in the requirements. Never copy or quote "
+    "those tokens into the output. Replace them with natural Sinhala "
+    "wording appropriate to the supported source context."
+)
 HUMAN_REVIEW_FACT_SHAPE_OVERRIDE_TARGETS = frozenset(
     {
         "rejected_gpt_candidate",
@@ -91,6 +127,11 @@ HUMAN_REVIEW_FACT_SHAPE_OVERRIDE_TARGETS = frozenset(
         "gpt_only_quarantine_candidate",
         "phase4_prompt_v2_8_gpt_only_candidate",
         "phase4_semantic_gate_holdout_candidate",
+        "v2_9_completion_raw_candidate",
+        "v2_10_reviewed_correction_raw_candidate",
+        "v2_10_reviewed_correction_followup_raw_candidate",
+        "v2_10_reviewed_correction_lineage_raw_candidate",
+        "v2_10_reviewed_remediation_raw_candidate",
     }
 )
 HUMAN_REVIEW_WARNING_OVERRIDE_TARGETS = frozenset(
@@ -99,6 +140,17 @@ HUMAN_REVIEW_WARNING_OVERRIDE_TARGETS = frozenset(
         "phase4_semantic_gate_holdout_candidate",
         "v2_9_completion_raw_candidate",
         "v2_10_prison_correction_raw_candidate",
+        "v2_10_reviewed_remediation_raw_candidate",
+    }
+)
+HUMAN_REVIEW_HARD_VALIDATOR_OVERRIDE_TARGETS = frozenset(
+    {
+        "gpt_only_quarantine_candidate",
+        "v2_9_completion_raw_candidate",
+        "v2_10_reviewed_correction_raw_candidate",
+        "v2_10_reviewed_correction_followup_raw_candidate",
+        "v2_10_reviewed_correction_lineage_raw_candidate",
+        "v2_10_reviewed_remediation_raw_candidate",
     }
 )
 GPT_PUBLICATION_STATUS_PUBLISHABLE = "publishable"
@@ -108,6 +160,17 @@ GPT_PUBLICATION_STATUS_UNAVAILABLE = "unavailable"
 GPT_REVIEW_QUEUE_STATUS_PENDING = "pending_review"
 GPT_REVIEW_QUEUE_STATUS_APPROVED = "approved"
 GPT_REVIEW_QUEUE_STATUS_REJECTED = "rejected"
+GPT_REVIEW_QUEUE_STATUS_SUPERSEDED = "superseded"
+
+
+def sanitize_reviewed_correction_requirements_for_prompt(
+    requirements: str,
+) -> str:
+    """Remove quoted Devanagari defects from provider-facing notes only."""
+    return _DEVANAGARI_RE.sub(
+        REVIEWED_CORRECTION_REDACTION_MARKER,
+        requirements,
+    )
 
 
 def human_review_blocks_version(
@@ -150,6 +213,7 @@ def human_review_overrides_fact_shape(
         in HUMAN_REVIEW_FACT_SHAPE_OVERRIDE_TARGETS
         and review.get("validator_assessment") == "false_positive"
         and review.get("unsupported_material_claim") == "no"
+        and not review.get("correction_required")
     )
 
 
@@ -167,6 +231,16 @@ def human_review_overrides_validator_warning(
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
+    issue_codes = _validation_issue_codes(version)
+    assessment_is_sufficient = (
+        review.get("validator_assessment") == "false_positive"
+        or (
+            decision == "accept"
+            and review.get("validator_assessment") == "unclear"
+            and bool(issue_codes)
+            and issue_codes <= HUMAN_REVIEW_ACCEPTABLE_WARNING_CODES
+        )
+    )
     return bool(
         version.get("generation_status") == GENERATION_STATUS_ACCEPTED
         and version.get("validation_status")
@@ -175,8 +249,33 @@ def human_review_overrides_validator_warning(
         and version.get("resolved_output_json")
         and review.get("review_target")
         in HUMAN_REVIEW_WARNING_OVERRIDE_TARGETS
+        and assessment_is_sufficient
+        and review.get("unsupported_material_claim") == "no"
+        and not review.get("correction_required")
+    )
+
+
+def human_review_overrides_hard_validator(
+    version: Optional[Mapping[str, Any]],
+) -> bool:
+    """Allow only an explicit audited false-positive validator review."""
+    if version is None:
+        return False
+    decision = str(version.get("human_review_decision") or "").strip()
+    if decision != "accept":
+        return False
+    review = _review_payload(version)
+    return bool(
+        version.get("generation_status") == GENERATION_STATUS_FALLBACK
+        and version.get("validation_status")
+        in {"provenance_failed", "claim_projection_failed"}
+        and version.get("response_id")
+        and version.get("resolved_output_json")
+        and review.get("review_target")
+        in HUMAN_REVIEW_HARD_VALIDATOR_OVERRIDE_TARGETS
         and review.get("validator_assessment") == "false_positive"
         and review.get("unsupported_material_claim") == "no"
+        and not review.get("correction_required")
     )
 
 
@@ -210,6 +309,7 @@ def _review_demotes_unaccounted_article_only(
         not in HUMAN_REVIEW_WARNING_OVERRIDE_TARGETS
         or review.get("validator_assessment") != "false_positive"
         or review.get("unsupported_material_claim") != "no"
+        or review.get("correction_required")
     ):
         return report
     return GPTValidationReport(
@@ -228,11 +328,20 @@ def version_is_deployable_gpt(
             (
                 version.get("generation_status")
                 == GENERATION_STATUS_ACCEPTED
-                and version.get("validation_status")
-                == VALIDATION_STATUS_ACCEPTED
+                and (
+                    version.get("validation_status")
+                    == VALIDATION_STATUS_ACCEPTED
+                    or (
+                        version.get("validation_status")
+                        == VALIDATION_STATUS_ACCEPTED_WITH_WARNINGS
+                        and version.get("autonomous_audit_status")
+                        == "accepted"
+                    )
+                )
             )
             or human_review_overrides_fact_shape(version)
             or human_review_overrides_validator_warning(version)
+            or human_review_overrides_hard_validator(version)
         )
     )
 
@@ -352,6 +461,7 @@ def gpt_publication_state(
                 if (
                     human_review_overrides_fact_shape(version)
                     or human_review_overrides_validator_warning(version)
+                    or human_review_overrides_hard_validator(version)
                 )
                 else None
             ),
@@ -418,13 +528,31 @@ def sync_gpt_unification_review_queue(
         (fingerprint,),
     ).fetchone()
     queue_status = state["review_queue_status"]
+    now = datetime.now().isoformat(timespec="seconds")
+    connection.execute(
+        """
+        UPDATE gpt_unification_review_queue
+        SET queue_status = ?,
+            updated_at = ?
+        WHERE story_id = ?
+          AND unified_story_version_id < ?
+          AND queue_status = ?
+          AND review_decision IS NULL
+        """,
+        (
+            GPT_REVIEW_QUEUE_STATUS_SUPERSEDED,
+            now,
+            str(version["cluster_key"]),
+            int(version["id"]),
+            GPT_REVIEW_QUEUE_STATUS_PENDING,
+        ),
+    )
     if queue_status is None:
         if existing is None:
             return None
         queue_status = GPT_REVIEW_QUEUE_STATUS_APPROVED
 
     title, story = _candidate_snapshot(version)
-    now = datetime.now().isoformat(timespec="seconds")
     detected_at = (
         str(existing["detected_at"])
         if existing is not None
@@ -519,6 +647,7 @@ def rebuild_gpt_unification_review_queue(
     if prompt_version is not None:
         query += " WHERE prompt_version = ?"
         parameters = (prompt_version,)
+    query += " ORDER BY id"
     for row in connection.execute(query, parameters):
         sync_gpt_unification_review_queue(connection, dict(row))
     connection.commit()
@@ -564,12 +693,246 @@ def _fingerprint(value: Any) -> str:
     ).hexdigest()
 
 
+def build_reviewed_correction_followup_requirements(
+    *,
+    original_requirements: str,
+    reviewed_candidate_decision: str,
+    reviewed_candidate_notes: str,
+) -> str:
+    """Build stable requirements for a reviewed correction follow-up."""
+    original = str(original_requirements or "").strip()
+    decision = str(reviewed_candidate_decision or "").strip()
+    notes = str(reviewed_candidate_notes or "").strip()
+    if not original or decision not in {"minor_issue", "major_issue"}:
+        raise ValueError("follow-up correction review is ineligible")
+    if not notes:
+        raise ValueError("follow-up correction notes are required")
+    return _canonical_json(
+        {
+            "original_correction_requirements": original,
+            "reviewed_candidate_decision": decision,
+            "reviewed_candidate_correction_requirements": notes,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class ReviewedCorrectionLineageStep:
+    depth: int
+    requirements: str
+    request_fingerprint_sha256: str
+    version_id: int
+    review_target: Optional[str]
+    review_decision: Optional[str]
+    review_source_sha256: Optional[str]
+    review_notes: Optional[str]
+
+
+@dataclass(frozen=True)
+class ReviewedCorrectionLineage:
+    status: str
+    steps: tuple[ReviewedCorrectionLineageStep, ...]
+    next_requirements: Optional[str]
+    next_depth: Optional[int]
+    next_request_fingerprint_sha256: Optional[str]
+    accepted_version: Optional[dict[str, Any]]
+
+
+def resolve_reviewed_correction_lineage(
+    connection: sqlite3.Connection,
+    *,
+    cluster: Mapping[str, Any],
+    members: list[Mapping[str, Any]],
+    article_records_by_id: Mapping[int, Mapping[str, Any]],
+    primary_version: Mapping[str, Any],
+    config: PipelineConfig,
+    allow_unreviewed_redacted_schema_migration: bool = False,
+) -> ReviewedCorrectionLineage:
+    """Resolve an exact-current, reviewed correction lineage."""
+    primary_review = _review_payload(primary_version)
+    requirements = str(primary_version.get("human_review_notes") or "").strip()
+    if (
+        str(primary_version.get("human_review_decision") or "").strip()
+        != "minor_issue"
+        or primary_review.get("review_target")
+        != "gpt_only_quarantine_candidate"
+        or primary_review.get("correction_required") is False
+        or not requirements
+        or not primary_version.get("human_review_source_sha256")
+    ):
+        return ReviewedCorrectionLineage(
+            status="ineligible_primary_review",
+            steps=(),
+            next_requirements=None,
+            next_depth=None,
+            next_request_fingerprint_sha256=None,
+            accepted_version=None,
+        )
+
+    correction_config = replace(
+        config,
+        gpt_prompt_version=GPT_PROMPT_VERSION_V2_10,
+        gpt_reasoning_effort="none",
+        gpt_max_output_tokens=8192,
+    )
+    steps: list[ReviewedCorrectionLineageStep] = []
+    seen_fingerprints: set[str] = set()
+    for depth in range(MAX_REVIEWED_CORRECTION_DEPTH):
+        candidate_identities = []
+        candidate_versions = []
+        for enforce_rules, redact_requirements, constrain_output in (
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (True, True, True),
+        ):
+            candidate_identity = build_generation_identity(
+                cluster=cluster,
+                members=members,
+                article_records_by_id=article_records_by_id,
+                config=correction_config,
+                correction_requirements=requirements,
+                enforce_correction_output_rules=enforce_rules,
+                redact_devanagari_from_correction_prompt=(
+                    redact_requirements
+                ),
+                enforce_correction_output_schema=constrain_output,
+            )
+            candidate_versions.append(load_cached_version(
+                connection,
+                candidate_identity.request_fingerprint_sha256,
+            ))
+            candidate_identities.append(candidate_identity)
+        if not candidate_identities:
+            raise RuntimeError("correction identity resolution failed")
+
+        constrained_version = candidate_versions[-1]
+        redacted_version = candidate_versions[-2]
+        if constrained_version is not None:
+            identity = candidate_identities[-1]
+            version = constrained_version
+        elif (
+            allow_unreviewed_redacted_schema_migration
+            and redacted_version is not None
+            and not redacted_version.get("human_review_source_sha256")
+        ):
+            return ReviewedCorrectionLineage(
+                status="ready_for_generation",
+                steps=tuple(steps),
+                next_requirements=requirements,
+                next_depth=depth,
+                next_request_fingerprint_sha256=(
+                    candidate_identities[-1].request_fingerprint_sha256
+                ),
+                accepted_version=None,
+            )
+        else:
+            existing_index = next(
+                (
+                    index
+                    for index in range(len(candidate_versions) - 2, -1, -1)
+                    if candidate_versions[index] is not None
+                ),
+                None,
+            )
+            if existing_index is None:
+                identity = candidate_identities[-1]
+                version = None
+            else:
+                identity = candidate_identities[existing_index]
+                version = candidate_versions[existing_index]
+        fingerprint = identity.request_fingerprint_sha256
+        if fingerprint in seen_fingerprints:
+            raise ValueError("reviewed correction lineage contains a cycle")
+        seen_fingerprints.add(fingerprint)
+        if version is None:
+            return ReviewedCorrectionLineage(
+                status="ready_for_generation",
+                steps=tuple(steps),
+                next_requirements=requirements,
+                next_depth=depth,
+                next_request_fingerprint_sha256=fingerprint,
+                accepted_version=None,
+            )
+
+        review = _review_payload(version)
+        target = str(review.get("review_target") or "").strip() or None
+        decision = (
+            str(version.get("human_review_decision") or "").strip() or None
+        )
+        notes = str(version.get("human_review_notes") or "").strip() or None
+        review_sha = (
+            str(version.get("human_review_source_sha256") or "").strip()
+            or None
+        )
+        steps.append(
+            ReviewedCorrectionLineageStep(
+                depth=depth,
+                requirements=requirements,
+                request_fingerprint_sha256=fingerprint,
+                version_id=int(version["id"]),
+                review_target=target,
+                review_decision=decision,
+                review_source_sha256=review_sha,
+                review_notes=notes,
+            )
+        )
+        legacy_target = (
+            REVIEWED_CORRECTION_TARGET
+            if depth == 0
+            else REVIEWED_CORRECTION_FOLLOWUP_TARGET
+        )
+        if not review_sha or target not in {
+            legacy_target,
+            REVIEWED_CORRECTION_LINEAGE_TARGET,
+        }:
+            return ReviewedCorrectionLineage(
+                status="awaiting_eligible_review",
+                steps=tuple(steps),
+                next_requirements=None,
+                next_depth=None,
+                next_request_fingerprint_sha256=None,
+                accepted_version=None,
+            )
+        if decision == "accept":
+            deployable = version_is_deployable_gpt(version)
+            return ReviewedCorrectionLineage(
+                status=(
+                    "accepted" if deployable else "accepted_review_not_deployable"
+                ),
+                steps=tuple(steps),
+                next_requirements=None,
+                next_depth=None,
+                next_request_fingerprint_sha256=None,
+                accepted_version=dict(version) if deployable else None,
+            )
+        if decision not in {"minor_issue", "major_issue"} or not notes:
+            return ReviewedCorrectionLineage(
+                status="review_does_not_request_correction",
+                steps=tuple(steps),
+                next_requirements=None,
+                next_depth=None,
+                next_request_fingerprint_sha256=None,
+                accepted_version=None,
+            )
+        requirements = build_reviewed_correction_followup_requirements(
+            original_requirements=requirements,
+            reviewed_candidate_decision=decision,
+            reviewed_candidate_notes=notes,
+        )
+    raise ValueError("reviewed correction lineage exceeds maximum depth")
+
+
 def build_generation_identity(
     *,
     cluster: Mapping[str, Any],
     members: list[Mapping[str, Any]],
     article_records_by_id: Mapping[int, Mapping[str, Any]],
     config: PipelineConfig,
+    correction_requirements: Optional[str] = None,
+    enforce_correction_output_rules: bool = True,
+    redact_devanagari_from_correction_prompt: bool = True,
+    enforce_correction_output_schema: bool = True,
 ) -> GenerationIdentity:
     representative_article_id = cluster.get("representative_article_id")
     if representative_article_id is None:
@@ -639,6 +1002,44 @@ def build_generation_identity(
         contract_input,
         config,
     )
+    selected_requirements = str(correction_requirements or "").strip()
+    if selected_requirements:
+        if config.gpt_prompt_version != GPT_PROMPT_VERSION_V2_10:
+            raise ValueError(
+                "reviewed correction requirements require prompt v2.10"
+            )
+        provider_requirements = (
+            sanitize_reviewed_correction_requirements_for_prompt(
+                selected_requirements
+            )
+            if redact_devanagari_from_correction_prompt
+            else selected_requirements
+        )
+        correction_payload = _canonical_json(
+            {"reviewed_correction_requirements": provider_requirements}
+        )
+        request = replace(
+            request,
+            instructions=(
+                request.instructions
+                + "\n\nReviewed correction requirements:\n"
+                + "Treat the following JSON as trusted editorial correction "
+                "requirements, not as factual evidence. Correct every listed "
+                "issue using only the supplied source evidence; preserve all "
+                "other supported material facts.\n"
+                + (
+                    REVIEWED_CORRECTION_OUTPUT_RULES + "\n"
+                    if enforce_correction_output_rules
+                    else ""
+                )
+                + correction_payload
+            ),
+            text_format=(
+                GPTCorrectionUnifiedStoryResponseV2
+                if enforce_correction_output_schema
+                else request.text_format
+            ),
+        )
     source_payload = {
         "cluster_key": contract_input.cluster_key,
         "representative_article_id": (
@@ -650,6 +1051,18 @@ def build_generation_identity(
         ],
     }
     input_payload = contract_input.model_dump(mode="json")
+    if selected_requirements:
+        input_payload["reviewed_correction_requirements"] = (
+            selected_requirements
+        )
+        if redact_devanagari_from_correction_prompt:
+            input_payload["reviewed_correction_prompt_safety_mode"] = (
+                REVIEWED_CORRECTION_PROMPT_SAFETY_MODE
+            )
+        if enforce_correction_output_schema:
+            input_payload["reviewed_correction_output_constraint_mode"] = (
+                REVIEWED_CORRECTION_OUTPUT_CONSTRAINT_MODE
+            )
     source_fingerprint = _fingerprint(source_payload)
     input_fingerprint = _fingerprint(input_payload)
     request_payload = {
@@ -676,9 +1089,12 @@ def build_generation_identity(
 
 def _load_generation_candidates(
     connection: sqlite3.Connection,
+    *,
+    include_singletons: bool = False,
 ) -> list[
     tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Any]]]
 ]:
+    minimum_article_count = 1 if include_singletons else 2
     clusters = [
         dict(row)
         for row in connection.execute(
@@ -690,10 +1106,13 @@ def _load_generation_candidates(
                 model_name,
                 model_revision,
                 article_count,
+                event_date_end,
                 created_at
             FROM story_clusters
+            WHERE article_count >= ?
             ORDER BY id
-            """
+            """,
+            (minimum_article_count,),
         )
     ]
     member_rows = [
@@ -712,9 +1131,13 @@ def _load_generation_candidates(
                 articles.clean_text,
                 articles.clean_hash
             FROM story_cluster_members AS members
+            JOIN story_clusters AS clusters
+              ON clusters.id = members.cluster_id
             JOIN articles ON articles.id = members.article_id
+            WHERE clusters.article_count >= ?
             ORDER BY members.cluster_id, members.article_id
-            """
+            """,
+            (minimum_article_count,),
         )
     ]
     members_by_cluster = defaultdict(list)
@@ -779,6 +1202,24 @@ def _select_generation_candidates(
     ]
 
 
+def _select_gpt_generation_candidates(
+    connection: sqlite3.Connection,
+    cluster_keys: Optional[Sequence[str]],
+) -> list[
+    tuple[dict[str, Any], list[dict[str, Any]], dict[int, dict[str, Any]]]
+]:
+    candidates = _load_generation_candidates(
+        connection,
+        include_singletons=cluster_keys is not None,
+    )
+    selected = _select_generation_candidates(candidates, cluster_keys)
+    return [
+        candidate
+        for candidate in selected
+        if int(candidate[0]["article_count"]) >= 2
+    ]
+
+
 def load_cached_version(
     connection: sqlite3.Connection,
     request_fingerprint_sha256: str,
@@ -821,6 +1262,23 @@ _VERSION_COLUMNS = (
     "response_id",
     "attempts",
     "fallback_reason",
+    "primary_model_name",
+    "primary_response_id",
+    "primary_output_json",
+    "primary_validation_json",
+    "primary_input_tokens",
+    "primary_output_tokens",
+    "primary_total_tokens",
+    "primary_estimated_cost_usd",
+    "autonomous_audit_status",
+    "autonomous_audit_model",
+    "autonomous_audit_response_id",
+    "autonomous_audit_route_json",
+    "autonomous_audit_input_tokens",
+    "autonomous_audit_output_tokens",
+    "autonomous_audit_total_tokens",
+    "autonomous_audit_estimated_cost_usd",
+    "autonomous_audit_created_at",
     "human_review_decision",
     "human_review_scores_json",
     "human_review_notes",
@@ -926,6 +1384,23 @@ def _base_version_values(
         "response_id": None,
         "attempts": 0,
         "fallback_reason": None,
+        "primary_model_name": None,
+        "primary_response_id": None,
+        "primary_output_json": None,
+        "primary_validation_json": None,
+        "primary_input_tokens": None,
+        "primary_output_tokens": None,
+        "primary_total_tokens": None,
+        "primary_estimated_cost_usd": None,
+        "autonomous_audit_status": None,
+        "autonomous_audit_model": None,
+        "autonomous_audit_response_id": None,
+        "autonomous_audit_route_json": None,
+        "autonomous_audit_input_tokens": None,
+        "autonomous_audit_output_tokens": None,
+        "autonomous_audit_total_tokens": None,
+        "autonomous_audit_estimated_cost_usd": None,
+        "autonomous_audit_created_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -975,6 +1450,98 @@ def _usage_metadata(
             else None
         ),
     }
+
+
+def _decimal_or_zero(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _combined_provider_values(
+    *,
+    primary: Mapping[str, Any],
+    audited: Mapping[str, Any],
+    route: Any,
+) -> dict[str, Any]:
+    values = dict(audited)
+    primary_input = int(primary.get("input_tokens") or 0)
+    primary_output = int(primary.get("output_tokens") or 0)
+    primary_total = int(primary.get("total_tokens") or 0)
+    audit_input = int(audited.get("input_tokens") or 0)
+    audit_output = int(audited.get("output_tokens") or 0)
+    audit_total = int(audited.get("total_tokens") or 0)
+    primary_cost = _decimal_or_zero(primary.get("estimated_cost_usd"))
+    audit_cost = _decimal_or_zero(audited.get("estimated_cost_usd"))
+    values.update(
+        {
+            "input_tokens": primary_input + audit_input,
+            "output_tokens": primary_output + audit_output,
+            "total_tokens": primary_total + audit_total,
+            "estimated_cost_usd": format(primary_cost + audit_cost, "f"),
+            "primary_model_name": primary.get("model_name"),
+            "primary_response_id": primary.get("response_id"),
+            "primary_output_json": primary.get("output_json"),
+            "primary_validation_json": primary.get("validation_json"),
+            "primary_input_tokens": primary.get("input_tokens"),
+            "primary_output_tokens": primary.get("output_tokens"),
+            "primary_total_tokens": primary.get("total_tokens"),
+            "primary_estimated_cost_usd": primary.get(
+                "estimated_cost_usd"
+            ),
+            "autonomous_audit_status": (
+                "accepted"
+                if audited.get("generation_status")
+                == GENERATION_STATUS_ACCEPTED
+                else "failed"
+            ),
+            "autonomous_audit_model": audited.get("model_name"),
+            "autonomous_audit_response_id": audited.get("response_id"),
+            "autonomous_audit_route_json": _canonical_json(
+                {
+                    "audit_version": AUTONOMOUS_AUDIT_VERSION,
+                    "complexity": route.complexity,
+                    "reasons": list(route.reasons),
+                    "model": route.model,
+                    "reasoning_effort": route.reasoning_effort,
+                }
+            ),
+            "autonomous_audit_input_tokens": audited.get("input_tokens"),
+            "autonomous_audit_output_tokens": audited.get("output_tokens"),
+            "autonomous_audit_total_tokens": audited.get("total_tokens"),
+            "autonomous_audit_estimated_cost_usd": audited.get(
+                "estimated_cost_usd"
+            ),
+            "autonomous_audit_created_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+        }
+    )
+    return values
+
+
+def _cached_candidate_requires_autonomous_audit(
+    cached: Optional[Mapping[str, Any]],
+    *,
+    config: PipelineConfig,
+) -> bool:
+    if not config.gpt_autonomous_audit_enabled or cached is None:
+        return False
+    if version_is_deployable_gpt(cached):
+        return False
+    return bool(
+        not cached.get("autonomous_audit_status")
+        and cached.get("response_id")
+        and cached.get("output_json")
+        and cached.get("resolved_output_json")
+        and cached.get("validation_status")
+        in {
+            "fact_shape_failed",
+            "claim_projection_failed",
+            VALIDATION_STATUS_ACCEPTED_WITH_WARNINGS,
+        }
+    )
 
 
 def _validation_payload(
@@ -1196,32 +1763,6 @@ def _interpret_generation(
         semantic_support,
         numerical_conflict,
     )
-    if not fact_shape.accepted:
-        return _fallback_values(
-            base,
-            reason="fact_shape_validation_failed",
-            validation_status="fact_shape_failed",
-            preflight=preflight,
-            response=response,
-            attempts=generation.attempts,
-            output=output_payload,
-            resolved_output=resolved_payload,
-            validation_json=validation_json,
-        )
-
-    if not claim_projection.accepted:
-        return _fallback_values(
-            base,
-            reason="claim_projection_validation_failed",
-            validation_status="claim_projection_failed",
-            preflight=preflight,
-            response=response,
-            attempts=generation.attempts,
-            output=output_payload,
-            resolved_output=resolved_payload,
-            validation_json=validation_json,
-        )
-
     values = _fallback_values(
         base,
         reason="",
@@ -1229,6 +1770,8 @@ def _interpret_generation(
             VALIDATION_STATUS_ACCEPTED_WITH_WARNINGS
             if (
                 provenance.warnings
+                or not fact_shape.accepted
+                or not claim_projection.accepted
                 or not semantic_support.accepted
                 or not numerical_conflict.accepted
             )
@@ -1346,30 +1889,6 @@ def _revalidate_cached_values(
             ),
         }
     )
-    if not fact_shape.accepted:
-        values.update(
-            {
-                "generation_status": GENERATION_STATUS_FALLBACK,
-                "validation_status": "fact_shape_failed",
-                "resolved_schema_version": None,
-                "fallback_reason": "fact_shape_validation_failed",
-            }
-        )
-        return values
-
-    if not claim_projection.accepted:
-        values.update(
-            {
-                "generation_status": GENERATION_STATUS_FALLBACK,
-                "validation_status": "claim_projection_failed",
-                "resolved_schema_version": None,
-                "fallback_reason": (
-                    "claim_projection_validation_failed"
-                ),
-            }
-        )
-        return values
-
     values.update(
         {
             "generation_status": GENERATION_STATUS_ACCEPTED,
@@ -1377,6 +1896,8 @@ def _revalidate_cached_values(
                 VALIDATION_STATUS_ACCEPTED_WITH_WARNINGS
                 if (
                     provenance.warnings
+                    or not fact_shape.accepted
+                    or not claim_projection.accepted
                     or not semantic_support.accepted
                     or not numerical_conflict.accepted
                 )
@@ -1397,8 +1918,8 @@ def revalidate_cached_unification(
     """Re-run local validators against persisted outputs without API calls."""
     config = config or load_config()
     connection = get_connection(config)
-    candidates = _select_generation_candidates(
-        _load_generation_candidates(connection),
+    candidates = _select_gpt_generation_candidates(
+        connection,
         cluster_keys,
     )
     stats = {
@@ -1412,6 +1933,11 @@ def revalidate_cached_unification(
         "missing_outputs": 0,
         "fallback_reasons": {},
         "generation_calls": 0,
+        "audit_calls": 0,
+        "provider_calls": 0,
+        "audit_accepted": 0,
+        "audit_failed": 0,
+        "audit_routes": {},
         "estimated_cost_usd": "0",
         "ongoing_generation_policy": None,
         "shadow_mode": config.gpt_shadow_mode,
@@ -1572,12 +2098,15 @@ def run_gpt_unification(
     generator: Any = None,
     preflight: Any = None,
     cluster_keys: Optional[Sequence[str]] = None,
+    correction_requirements_by_story: Optional[
+        Mapping[str, str]
+    ] = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     connection = get_connection(config)
     try:
-        candidates = _select_generation_candidates(
-            _load_generation_candidates(connection),
+        candidates = _select_gpt_generation_candidates(
+            connection,
             cluster_keys,
         )
     except Exception:
@@ -1591,6 +2120,11 @@ def run_gpt_unification(
         "cached_fallbacks": 0,
         "pending_review": 0,
         "generation_calls": 0,
+        "audit_calls": 0,
+        "provider_calls": 0,
+        "audit_accepted": 0,
+        "audit_failed": 0,
+        "audit_routes": {},
         "fallbacks": 0,
         "invalid_inputs": 0,
         "fallback_reasons": {},
@@ -1598,6 +2132,7 @@ def run_gpt_unification(
         "output_tokens": 0,
         "total_tokens": 0,
         "estimated_cost_usd": "0",
+        "ongoing_generation_policy": None,
     }
     if not candidates:
         connection.close()
@@ -1609,7 +2144,25 @@ def run_gpt_unification(
     total_cost = Decimal("0")
 
     prepared_candidates = []
-    provider_request_count = 0
+    selected_correction_requirements = {
+        str(key): str(value).strip()
+        for key, value in (correction_requirements_by_story or {}).items()
+    }
+    candidate_keys = {
+        str(candidate[0]["cluster_key"]) for candidate in candidates
+    }
+    if correction_requirements_by_story is not None and (
+        any(
+            not key or not value
+            for key, value in selected_correction_requirements.items()
+        )
+        or set(selected_correction_requirements) != candidate_keys
+    ):
+        connection.close()
+        raise ValueError(
+            "correction requirements must exactly cover selected stories"
+        )
+    provider_candidates = []
     for cluster, members, article_records in candidates:
         try:
             identity = build_generation_identity(
@@ -1617,10 +2170,15 @@ def run_gpt_unification(
                 members=members,
                 article_records_by_id=article_records,
                 config=config,
+                correction_requirements=(
+                    selected_correction_requirements.get(
+                        str(cluster["cluster_key"])
+                    )
+                ),
             )
         except (ValueError, ValidationError):
             prepared_candidates.append(
-                (cluster, members, article_records, None, None)
+                (cluster, members, article_records, None, None, True)
             )
             continue
 
@@ -1628,11 +2186,12 @@ def run_gpt_unification(
             connection,
             identity.request_fingerprint_sha256,
         )
-        prepared_candidates.append(
-            (cluster, members, article_records, identity, cached)
-        )
         reusable_without_provider = (
             not force
+            and not _cached_candidate_requires_autonomous_audit(
+                cached,
+                config=config,
+            )
             and (
                 version_is_deployable_gpt(cached)
                 or version_is_pending_validator_warning(cached)
@@ -1647,10 +2206,52 @@ def run_gpt_unification(
                 )
             )
         )
+        prepared = (
+            cluster,
+            members,
+            article_records,
+            identity,
+            cached,
+            reusable_without_provider,
+        )
+        prepared_candidates.append(prepared)
         if not reusable_without_provider:
-            provider_request_count += 1
+            provider_candidates.append(prepared)
+
+    provider_candidates.sort(
+        key=lambda candidate: (
+            str(candidate[0].get("event_date_end") or ""),
+            int(candidate[0]["article_count"]),
+            int(candidate[0]["id"]),
+        ),
+        reverse=True,
+    )
+    provider_request_backlog = len(provider_candidates)
+    provider_request_limit = provider_request_backlog
+    if config.gpt_only_publication_enabled:
+        provider_request_limit = min(
+            provider_request_backlog,
+            config.gpt_max_clusters_per_run,
+        )
+    selected_provider_keys = {
+        str(candidate[0]["cluster_key"])
+        for candidate in provider_candidates[:provider_request_limit]
+    }
+    prepared_candidates = [
+        candidate
+        for candidate in prepared_candidates
+        if (
+            candidate[5]
+            or str(candidate[0]["cluster_key"]) in selected_provider_keys
+        )
+    ]
+    provider_request_count = len(selected_provider_keys)
 
     stats["provider_request_candidates"] = provider_request_count
+    stats["provider_request_backlog"] = provider_request_backlog
+    stats["deferred_provider_candidates"] = (
+        provider_request_backlog - provider_request_count
+    )
 
     offline_reason = None
     if no_gpt:
@@ -1692,6 +2293,7 @@ def run_gpt_unification(
             article_records,
             identity,
             cached,
+            _reusable_without_provider,
         ) in prepared_candidates:
             if identity is None:
                 stats["invalid_inputs"] += 1
@@ -1714,6 +2316,10 @@ def run_gpt_unification(
             if (
                 not force
                 and version_is_pending_validator_warning(cached)
+                and not _cached_candidate_requires_autonomous_audit(
+                    cached,
+                    config=config,
+                )
             ):
                 stats["cache_hits"] += 1
                 stats["pending_review"] += 1
@@ -1726,6 +2332,10 @@ def run_gpt_unification(
                     or human_review_blocks_version(cached)
                 )
                 and cached.get("response_id")
+                and not _cached_candidate_requires_autonomous_audit(
+                    cached,
+                    config=config,
+                )
             ):
                 # A provider response was already paid for and reached a
                 # terminal local outcome. Reuse its safe V2 fallback unless
@@ -1739,7 +2349,21 @@ def run_gpt_unification(
                 cluster=cluster,
                 identity=identity,
             )
+            audit_only_cached = (
+                not force
+                and _cached_candidate_requires_autonomous_audit(
+                    cached,
+                    config=config,
+                )
+            )
             if offline_reason is not None:
+                if audit_only_cached:
+                    stats["cache_hits"] += 1
+                    stats["cached_fallbacks"] += 1
+                    record_fallback(
+                        f"autonomous_audit_{offline_reason}"
+                    )
+                    continue
                 _persist_version(
                     connection,
                     _fallback_values(
@@ -1750,87 +2374,278 @@ def run_gpt_unification(
                 record_fallback(offline_reason)
                 continue
 
+            gated_result = None
+            if not audit_only_cached:
+                try:
+                    gated_result = gated_generator.generate(identity.request)
+                except Exception as error:
+                    diagnostic_error = getattr(error, "last_error", error)
+                    body = getattr(diagnostic_error, "body", None)
+                    error_code = (
+                        body.get("code")
+                        if isinstance(body, Mapping)
+                        else None
+                    )
+                    error_param = (
+                        body.get("param")
+                        if isinstance(body, Mapping)
+                        else None
+                    )
+                    logger.warning(
+                        "GPT unification provider error for cluster %s: "
+                        "type=%s status=%s code=%s param=%s request_id=%s",
+                        cluster.get("cluster_key"),
+                        type(diagnostic_error).__name__,
+                        getattr(diagnostic_error, "status_code", None),
+                        error_code,
+                        error_param,
+                        getattr(diagnostic_error, "request_id", None),
+                    )
+                    _persist_version(
+                        connection,
+                        _fallback_values(
+                            base,
+                            reason="provider_error",
+                            validation_status="provider_error",
+                        ),
+                    )
+                    record_fallback("provider_error")
+                    continue
+
+                if gated_result.used_v2_fallback:
+                    reason = (
+                        f"preflight_{gated_result.preflight.reason.value}"
+                    )
+                    _persist_version(
+                        connection,
+                        _fallback_values(
+                            base,
+                            reason=reason,
+                            validation_status="preflight_fallback",
+                            preflight=gated_result.preflight,
+                        ),
+                    )
+                    record_fallback(reason)
+                    continue
+
+                stats["generation_calls"] += 1
+                stats["provider_calls"] += 1
+                primary_values = _interpret_generation(
+                    base=base,
+                    identity=identity,
+                    preflight=gated_result.preflight,
+                    generation=gated_result.generation,
+                )
+            else:
+                primary_values = dict(cached)
+
+            if not config.gpt_autonomous_audit_enabled:
+                persisted = _persist_version(connection, primary_values)
+                stats["input_tokens"] += int(
+                    primary_values.get("input_tokens") or 0
+                )
+                stats["output_tokens"] += int(
+                    primary_values.get("output_tokens") or 0
+                )
+                stats["total_tokens"] += int(
+                    primary_values.get("total_tokens") or 0
+                )
+                if version_is_deployable_gpt(persisted):
+                    stats["accepted"] += 1
+                elif version_is_pending_validator_warning(persisted):
+                    stats["pending_review"] += 1
+                else:
+                    record_fallback(effective_fallback_reason(persisted))
+                if primary_values.get("estimated_cost_usd") is not None:
+                    total_cost += _decimal_or_zero(
+                        primary_values["estimated_cost_usd"]
+                    )
+                continue
+
+            route = classify_audit_route(
+                cluster=cluster,
+                members=members,
+                config=config,
+            )
+            stats["audit_routes"][route.complexity] = (
+                stats["audit_routes"].get(route.complexity, 0) + 1
+            )
             try:
-                gated_result = gated_generator.generate(identity.request)
+                candidate_payload = json.loads(
+                    str(primary_values.get("output_json") or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                candidate_payload = {}
+            try:
+                validation_payload = json.loads(
+                    str(primary_values.get("validation_json") or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                validation_payload = {}
+            audit_request = build_autonomous_audit_request(
+                contract_input=identity.contract_input,
+                candidate=(
+                    candidate_payload
+                    if isinstance(candidate_payload, Mapping)
+                    else {}
+                ),
+                validation=(
+                    validation_payload
+                    if isinstance(validation_payload, Mapping)
+                    else {}
+                ),
+                route=route,
+                config=config,
+            )
+            try:
+                audit_result = gated_generator.generate(audit_request)
             except Exception as error:
                 diagnostic_error = getattr(error, "last_error", error)
-                body = getattr(diagnostic_error, "body", None)
-                error_code = (
-                    body.get("code")
-                    if isinstance(body, Mapping)
-                    else None
-                )
-                error_param = (
-                    body.get("param")
-                    if isinstance(body, Mapping)
-                    else None
-                )
                 logger.warning(
-                    "GPT unification provider error for cluster %s: "
-                    "type=%s status=%s code=%s param=%s request_id=%s",
+                    "GPT autonomous audit provider error for cluster %s: "
+                    "type=%s request_id=%s",
                     cluster.get("cluster_key"),
                     type(diagnostic_error).__name__,
-                    getattr(diagnostic_error, "status_code", None),
-                    error_code,
-                    error_param,
                     getattr(diagnostic_error, "request_id", None),
                 )
+                failed = dict(primary_values)
+                failed.update(
+                    {
+                        "generation_status": GENERATION_STATUS_FALLBACK,
+                        "validation_status": "autonomous_audit_failed",
+                        "fallback_reason": "autonomous_audit_provider_error",
+                        "autonomous_audit_status": "failed",
+                        "autonomous_audit_model": route.model,
+                        "autonomous_audit_route_json": _canonical_json(
+                            {
+                                "audit_version": AUTONOMOUS_AUDIT_VERSION,
+                                "complexity": route.complexity,
+                                "reasons": list(route.reasons),
+                                "model": route.model,
+                                "reasoning_effort": route.reasoning_effort,
+                            }
+                        ),
+                    }
+                )
                 _persist_version(
                     connection,
-                    _fallback_values(
-                        base,
-                        reason="provider_error",
-                        validation_status="provider_error",
-                    ),
+                    failed,
+                    allow_status_demotion=audit_only_cached,
                 )
-                record_fallback("provider_error")
+                if not audit_only_cached:
+                    stats["input_tokens"] += int(
+                        primary_values.get("input_tokens") or 0
+                    )
+                    stats["output_tokens"] += int(
+                        primary_values.get("output_tokens") or 0
+                    )
+                    stats["total_tokens"] += int(
+                        primary_values.get("total_tokens") or 0
+                    )
+                    total_cost += _decimal_or_zero(
+                        primary_values.get("estimated_cost_usd")
+                    )
+                stats["audit_failed"] += 1
+                record_fallback("autonomous_audit_provider_error")
                 continue
 
-            if gated_result.used_v2_fallback:
-                reason = f"preflight_{gated_result.preflight.reason.value}"
+            if audit_result.used_v2_fallback:
+                failed = dict(primary_values)
+                failed.update(
+                    {
+                        "generation_status": GENERATION_STATUS_FALLBACK,
+                        "validation_status": "autonomous_audit_preflight",
+                        "fallback_reason": (
+                            "autonomous_audit_preflight_"
+                            + audit_result.preflight.reason.value
+                        ),
+                        "autonomous_audit_status": "failed",
+                        "autonomous_audit_model": route.model,
+                    }
+                )
                 _persist_version(
                     connection,
-                    _fallback_values(
-                        base,
-                        reason=reason,
-                        validation_status="preflight_fallback",
-                        preflight=gated_result.preflight,
-                    ),
+                    failed,
+                    allow_status_demotion=audit_only_cached,
                 )
-                record_fallback(reason)
+                if not audit_only_cached:
+                    stats["input_tokens"] += int(
+                        primary_values.get("input_tokens") or 0
+                    )
+                    stats["output_tokens"] += int(
+                        primary_values.get("output_tokens") or 0
+                    )
+                    stats["total_tokens"] += int(
+                        primary_values.get("total_tokens") or 0
+                    )
+                    total_cost += _decimal_or_zero(
+                        primary_values.get("estimated_cost_usd")
+                    )
+                stats["audit_failed"] += 1
+                record_fallback(str(failed["fallback_reason"]))
                 continue
 
-            stats["generation_calls"] += 1
-            values = _interpret_generation(
-                base=base,
+            stats["audit_calls"] += 1
+            stats["provider_calls"] += 1
+            audit_base = dict(base)
+            audit_base.update(
+                {
+                    "model_name": route.model,
+                    "reasoning_effort": route.reasoning_effort,
+                    "max_output_tokens": config.gpt_audit_max_output_tokens,
+                }
+            )
+            audited_values = _interpret_generation(
+                base=audit_base,
                 identity=identity,
-                preflight=gated_result.preflight,
-                generation=gated_result.generation,
+                preflight=audit_result.preflight,
+                generation=audit_result.generation,
             )
-            persisted = _persist_version(connection, values)
-            stats["input_tokens"] += int(values.get("input_tokens") or 0)
+            values = _combined_provider_values(
+                primary=primary_values,
+                audited=audited_values,
+                route=route,
+            )
+            persisted = _persist_version(
+                connection,
+                values,
+                allow_status_demotion=audit_only_cached,
+            )
+            usage_values = audited_values if audit_only_cached else values
+            stats["input_tokens"] += int(
+                usage_values.get("input_tokens") or 0
+            )
             stats["output_tokens"] += int(
-                values.get("output_tokens") or 0
+                usage_values.get("output_tokens") or 0
             )
-            stats["total_tokens"] += int(values.get("total_tokens") or 0)
+            stats["total_tokens"] += int(
+                usage_values.get("total_tokens") or 0
+            )
             if version_is_deployable_gpt(persisted):
                 stats["accepted"] += 1
+                stats["audit_accepted"] += 1
             elif version_is_pending_validator_warning(persisted):
                 stats["pending_review"] += 1
             else:
+                stats["audit_failed"] += 1
                 record_fallback(effective_fallback_reason(persisted))
-            if values.get("estimated_cost_usd") is not None:
-                total_cost += Decimal(str(values["estimated_cost_usd"]))
+            if usage_values.get("estimated_cost_usd") is not None:
+                total_cost += _decimal_or_zero(
+                    usage_values["estimated_cost_usd"]
+                )
     finally:
         connection.close()
 
     stats["estimated_cost_usd"] = format(total_cost, "f")
     logger.info(
         "GPT unification: %s accepted (%s cache hits), %s pending review, "
-        "%s fallbacks",
+        "%s fallbacks, %s primary calls, %s audit calls, %s deferred",
         stats["accepted"],
         stats["cache_hits"],
         stats["pending_review"],
         stats["fallbacks"],
+        stats["generation_calls"],
+        stats["audit_calls"],
+        stats["deferred_provider_candidates"],
     )
     return stats

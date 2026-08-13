@@ -139,6 +139,7 @@ def run_event_clustering(
         article_id: _article_state_fingerprint(article, contract)
         for article_id, article in article_by_id.items()
     }
+    singleton_clusters_backfilled = 0
 
     logger.info("=== Incremental Same-Event Clustering Started ===")
     logger.info("Eligible unique cleaned articles: %s", len(articles))
@@ -171,6 +172,7 @@ def run_event_clustering(
             "affected_articles": 0,
             "candidate_pairs": 0,
             "linked_pairs": 0,
+            "bridge_pairs_removed": 0,
             "story_clusters": story_clusters,
             "clustered_articles": clustered_articles,
             "clusters_replaced": 0,
@@ -179,7 +181,11 @@ def run_event_clustering(
             "representative_changed_components": 0,
             "representative_split_components": 0,
             "representative_unclustered_articles": 0,
+            "singleton_articles": 0,
             "cohesion_fallback_members": 0,
+            "singleton_clusters_backfilled": (
+                singleton_clusters_backfilled
+            ),
             "stable_cluster_keys_reused": 0,
             "baseline_initialized": baseline_initialized,
             "incremental_noop": incremental_noop,
@@ -194,6 +200,7 @@ def run_event_clustering(
             "cohesion_threshold": cohesion_cutoff,
         }
 
+    initialized_from_existing_clusters = False
     if not states and clusters_by_key:
         _persist_clustering_states(
             cursor,
@@ -212,17 +219,12 @@ def run_event_clustering(
             status_override=CLUSTERING_STATUS_INELIGIBLE,
         )
         conn.commit()
-        result = base_stats(
-            baseline_initialized=True,
-            incremental_noop=True,
-        )
-        conn.close()
+        states = _load_clustering_states(cursor)
+        initialized_from_existing_clusters = True
         logger.info(
-            "Initialized incremental state from %s existing clusters; "
-            "embedding calls: 0",
+            "Initialized incremental state from %s existing clusters",
             len(clusters_by_key),
         )
-        return result
 
     baseline_state_ids = {
         article_id
@@ -236,7 +238,9 @@ def run_event_clustering(
             }
         )
     }
-    baseline_initialized = bool(baseline_state_ids)
+    baseline_initialized = bool(
+        baseline_state_ids or initialized_from_existing_clusters
+    )
     if baseline_state_ids:
         _persist_clustering_states(
             cursor,
@@ -246,6 +250,56 @@ def run_event_clustering(
         )
         conn.commit()
         states = _load_clustering_states(cursor)
+
+    stable_unclustered_ids = {
+        article_id
+        for article_id in eligible_article_ids
+        if (
+            article_id not in current_cluster_key_by_article
+            and article_id in states
+            and states[article_id]["input_fingerprint_sha256"]
+            == fingerprints[article_id]
+            and states[article_id]["clustering_status"]
+            in {
+                CLUSTERING_STATUS_UNCLUSTERED,
+                CLUSTERING_STATUS_BASELINE_UNCLUSTERED,
+            }
+        )
+    }
+    if stable_unclustered_ids:
+        singleton_clusters = _singleton_story_clusters(
+            stable_unclustered_ids
+        )
+        _persist_clusters(
+            cursor=cursor,
+            clusters=singleton_clusters,
+            article_by_id=article_by_id,
+            model_name=selected_model,
+            model_revision=selected_revision,
+            text_variant="single_source_passthrough",
+            similarity_threshold=threshold,
+            representative_threshold=representative_cutoff,
+            cohesion_threshold=cohesion_cutoff,
+            existing_cluster_keys=existing_cluster_keys,
+        )
+        conn.commit()
+        existing_cluster_keys = _load_existing_cluster_keys(cursor)
+        clusters_by_key, current_cluster_key_by_article = (
+            _load_current_cluster_memberships(cursor)
+        )
+        _persist_clustering_states(
+            cursor,
+            article_ids=stable_unclustered_ids,
+            fingerprints=fingerprints,
+            cluster_key_by_article=current_cluster_key_by_article,
+        )
+        conn.commit()
+        states = _load_clustering_states(cursor)
+        singleton_clusters_backfilled = len(stable_unclustered_ids)
+        logger.info(
+            "Backfilled %s single-source story groups without embeddings",
+            singleton_clusters_backfilled,
+        )
 
     changed_article_ids = {
         article_id
@@ -338,6 +392,14 @@ def run_event_clustering(
             for pair in scored_pairs
             if pair.similarity_score >= threshold
         ]
+        linked_pairs, bridge_pairs_removed = _prevent_bridge_merges(
+            linked_pairs=linked_pairs,
+            changed_article_ids=changed_article_ids,
+            clusters_by_key=clusters_by_key,
+            cluster_key_by_article=current_cluster_key_by_article,
+            embeddings=embeddings,
+            representative_threshold=representative_cutoff,
+        )
         build_result = _build_story_clusters(
             affected_articles,
             linked_pairs,
@@ -346,6 +408,19 @@ def run_event_clustering(
             representative_threshold=representative_cutoff,
             cohesion_threshold=cohesion_cutoff,
         )
+    elif affected_articles:
+        bridge_pairs_removed = 0
+        build_result = _build_story_clusters(
+            affected_articles,
+            [],
+            embeddings={},
+            min_articles=config.cluster_min_articles,
+            representative_threshold=representative_cutoff,
+            cohesion_threshold=cohesion_cutoff,
+        )
+
+    else:
+        bridge_pairs_removed = 0
 
     resolved_model_name = (
         embedder.model_name if embedder is not None else selected_model
@@ -418,6 +493,16 @@ def run_event_clustering(
     logger.info("Affected articles embedded: %s", len(affected_articles))
     logger.info("Candidate pairs in affected window: %s", len(candidates))
     logger.info("Linked pairs over threshold: %s", len(linked_pairs))
+    if build_result.unclustered_articles:
+        logger.info(
+            "Articles routed to publishable singleton stories: %s",
+            build_result.unclustered_articles,
+        )
+    if bridge_pairs_removed:
+        logger.info(
+            "Bridge links removed to protect existing story boundaries: %s",
+            bridge_pairs_removed,
+        )
     logger.info(
         "Replaced %s clusters and preserved %s unrelated clusters",
         len(affected_cluster_ids),
@@ -431,6 +516,7 @@ def run_event_clustering(
         "affected_articles": len(affected_article_ids),
         "candidate_pairs": len(candidates),
         "linked_pairs": len(linked_pairs),
+        "bridge_pairs_removed": bridge_pairs_removed,
         "story_clusters": story_clusters,
         "clustered_articles": clustered_articles,
         "clusters_replaced": len(affected_cluster_ids),
@@ -445,9 +531,11 @@ def run_event_clustering(
         "representative_unclustered_articles": (
             build_result.unclustered_articles
         ),
+        "singleton_articles": build_result.unclustered_articles,
         "cohesion_fallback_members": (
             build_result.cohesion_fallback_members
         ),
+        "singleton_clusters_backfilled": singleton_clusters_backfilled,
         "stable_cluster_keys_reused": stable_cluster_keys_reused,
         "baseline_initialized": baseline_initialized,
         "incremental_noop": False,
@@ -538,6 +626,7 @@ def _load_current_cluster_memberships(cursor):
         SELECT
             clusters.id AS cluster_id,
             clusters.cluster_key,
+            clusters.representative_article_id,
             members.article_id
         FROM story_clusters AS clusters
         JOIN story_cluster_members AS members
@@ -550,6 +639,11 @@ def _load_current_cluster_memberships(cursor):
             cluster_key,
             {
                 "id": int(row["cluster_id"]),
+                "representative_article_id": (
+                    int(row["representative_article_id"])
+                    if row["representative_article_id"] is not None
+                    else int(row["article_id"])
+                ),
                 "article_ids": set(),
             },
         )
@@ -557,6 +651,76 @@ def _load_current_cluster_memberships(cursor):
         cluster["article_ids"].add(article_id)
         cluster_key_by_article[article_id] = cluster_key
     return clusters_by_key, cluster_key_by_article
+
+
+def _prevent_bridge_merges(
+    *,
+    linked_pairs: list[ScoredPair],
+    changed_article_ids: set[int],
+    clusters_by_key: dict[str, dict],
+    cluster_key_by_article: dict[int, str],
+    embeddings: dict[int, list[float]],
+    representative_threshold: float,
+) -> tuple[list[ScoredPair], int]:
+    """Stop one new broad article from collapsing unrelated old stories."""
+    removed: set[tuple[int, int]] = set()
+    for changed_id in sorted(changed_article_ids):
+        links_by_old_cluster: dict[str, list[ScoredPair]] = defaultdict(list)
+        for pair in linked_pairs:
+            if changed_id not in {pair.left_id, pair.right_id}:
+                continue
+            neighbor_id = (
+                pair.right_id if pair.left_id == changed_id else pair.left_id
+            )
+            old_key = cluster_key_by_article.get(neighbor_id)
+            if old_key is not None:
+                links_by_old_cluster[old_key].append(pair)
+        if len(links_by_old_cluster) < 2:
+            continue
+
+        representatives = [
+            int(clusters_by_key[key]["representative_article_id"])
+            for key in sorted(links_by_old_cluster)
+        ]
+        representatives_are_compatible = all(
+            cosine_similarity(
+                embeddings.get(left_id, []),
+                embeddings.get(right_id, []),
+            )
+            >= representative_threshold
+            for index, left_id in enumerate(representatives)
+            for right_id in representatives[index + 1 :]
+        )
+        if representatives_are_compatible:
+            continue
+
+        strongest_key = max(
+            links_by_old_cluster,
+            key=lambda key: (
+                max(
+                    pair.similarity_score
+                    for pair in links_by_old_cluster[key]
+                ),
+                key,
+            ),
+        )
+        for key, pairs in links_by_old_cluster.items():
+            if key == strongest_key:
+                continue
+            removed.update(
+                (min(pair.left_id, pair.right_id), max(pair.left_id, pair.right_id))
+                for pair in pairs
+            )
+
+    if not removed:
+        return linked_pairs, 0
+    retained = [
+        pair
+        for pair in linked_pairs
+        if (min(pair.left_id, pair.right_id), max(pair.left_id, pair.right_id))
+        not in removed
+    ]
+    return retained, len(linked_pairs) - len(retained)
 
 
 def _select_affected_article_ids(
@@ -889,7 +1053,17 @@ def _build_story_clusters(
     cohesion_threshold: float,
 ) -> ClusterBuildResult:
     if not linked_pairs:
-        return ClusterBuildResult([], 0, 0, 0, 0, 0)
+        singleton_clusters = _singleton_story_clusters(
+            article.id for article in articles
+        )
+        return ClusterBuildResult(
+            singleton_clusters,
+            0,
+            0,
+            0,
+            len(singleton_clusters),
+            0,
+        )
 
     article_ids = [article.id for article in articles]
     article_by_id = {article.id: article for article in articles}
@@ -907,9 +1081,7 @@ def _build_story_clusters(
     changed_components = 0
     split_components = 0
     cohesion_fallback_members = 0
-    initial_component_article_ids = set()
     for component in initial_components:
-        initial_component_article_ids.update(component)
         component_clusters, component_fallback_members = (
             _partition_component_by_representative(
                 component,
@@ -936,16 +1108,30 @@ def _build_story_clusters(
     clustered_article_ids = {
         article_id for cluster in clusters for article_id in cluster.article_ids
     }
+    singleton_article_ids = set(article_ids) - clustered_article_ids
+    clusters.extend(_singleton_story_clusters(singleton_article_ids))
     return ClusterBuildResult(
         clusters=sorted(clusters, key=lambda cluster: cluster.article_ids),
         initial_components=len(initial_components),
         changed_components=changed_components,
         split_components=split_components,
         unclustered_articles=len(
-            initial_component_article_ids - clustered_article_ids
+            singleton_article_ids
         ),
         cohesion_fallback_members=cohesion_fallback_members,
     )
+
+
+def _singleton_story_clusters(article_ids) -> list[StoryCluster]:
+    return [
+        StoryCluster(
+            article_ids=[article_id],
+            representative_article_id=article_id,
+            confidence=1.0,
+            member_scores={article_id: 1.0},
+        )
+        for article_id in sorted(article_ids)
+    ]
 
 
 def _connected_components(

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Optional
+
+from news_pipeline.unification.fact_normalization import (
+    ISO_DATE_PATTERN,
+    normalize_number as _normalize_number,
+    normalize_text as _normalize_text,
+    numeric_literals,
+    sinhala_decimal_values,
+    sinhala_entity_aliases,
+    sinhala_number_word_values,
+    time_values,
+)
 
 from news_pipeline.unification.gpt_contract import (
     GPT_PROMPT_VERSION_V2_7,
@@ -15,15 +25,12 @@ from news_pipeline.unification.gpt_contract import (
 )
 
 
-NUMBER_PATTERN = re.compile(
-    r"(?:[0-9\u0DE6-\u0DEF]+(?:[,.][0-9\u0DE6-\u0DEF]+)*"
-    r"|\.[0-9\u0DE6-\u0DEF]+)"
-)
 LATIN_NAME_PATTERN = re.compile(
     r"\b(?:[A-Z][A-Za-z.'’-]{1,})(?:\s+[A-Z][A-Za-z.'’-]{1,})+\b"
     r"|\b[A-Z]{2,}\b"
 )
 SINHALA_TOKEN_PATTERN = re.compile(r"[\u0D80-\u0DFF]+")
+DEVANAGARI_TOKEN_PATTERN = re.compile(r"[\u0900-\u097F]+")
 WORD_TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 
 CLAIM_PROJECTION_MIN_COVERAGE = 0.70
@@ -119,28 +126,23 @@ MONTH_TOKEN_NUMBERS = {
     token: month
     for month, tokens in enumerate(
         (
-            ("january", "ජනවාරි"),
-            ("february", "පෙබරවාරි"),
-            ("march", "මාර්තු"),
-            ("april", "අප්‍රේල්"),
+            ("january", "ජනවාරි", "ජන"),
+            ("february", "පෙබරවාරි", "පෙබ"),
+            ("march", "මාර්තු", "මාර්"),
+            ("april", "අප්‍රේල්", "අප්‍රේ"),
             ("may", "මැයි"),
             ("june", "ජූනි"),
             ("july", "ජූලි", "ජුලි"),
-            ("august", "අගෝස්තු"),
-            ("september", "සැප්තැම්බර්"),
-            ("october", "ඔක්තෝබර්"),
-            ("november", "නොවැම්බර්"),
-            ("december", "දෙසැම්බර්"),
+            ("august", "අගෝස්තු", "අගෝ"),
+            ("september", "සැප්තැම්බර්", "සැප්"),
+            ("october", "ඔක්තෝබර්", "ඔක්"),
+            ("november", "නොවැම්බර්", "නොවැ"),
+            ("december", "දෙසැම්බර්", "දෙසැ"),
         ),
         start=1,
     )
     for token in tokens
 }
-ISO_DATE_PATTERN = re.compile(
-    r"(?<!\d)(?:19|20)\d{2}[-/.](0?[1-9]|1[0-2])[-/.]"
-    r"(?:0?[1-9]|[12]\d|3[01])(?!\d)"
-)
-
 SINHALA_ENTITY_MARKERS = {
     "මහතා",
     "මහත්මිය",
@@ -341,15 +343,6 @@ class NumericalConflictCoverageValidationReport:
         }
 
 
-def _normalize_text(value: str) -> str:
-    value = unicodedata.normalize("NFC", value).casefold()
-    # Sinhala publishers inconsistently retain the ZWJ/ZWNJ in conjuncts
-    # such as "ප්‍ර" versus "ප්ර". The distinction is typographic, not
-    # factual, so fact comparison must ignore it.
-    value = value.replace("\u200c", "").replace("\u200d", "")
-    return re.sub(r"\s+", " ", value).strip()
-
-
 def _projection_tokens(value: str) -> set[str]:
     normalized = _normalize_text(value)
     return {
@@ -432,43 +425,8 @@ def validate_claim_projection(
     )
 
 
-def _normalize_number(value: str) -> str:
-    digits = []
-    for character in value:
-        if character == ",":
-            continue
-        if character == ".":
-            digits.append(character)
-            continue
-        try:
-            digits.append(str(unicodedata.digit(character)))
-        except (TypeError, ValueError):
-            digits.append(character)
-    normalized = "".join(digits)
-    if "." in normalized:
-        whole, fraction = normalized.split(".", 1)
-        return (
-            f"{whole.lstrip('0') or '0'}."
-            f"{fraction.rstrip('0') or '0'}"
-        )
-    return normalized.lstrip("0") or "0"
-
-
 def _numbers(value: str) -> set[str]:
-    numbers = {
-        _normalize_number(match.group(0))
-        for match in NUMBER_PATTERN.finditer(value)
-    }
-    # NUMBER_PATTERN deliberately preserves decimal quantities such as 2.5,
-    # but a dotted calendar date is also captured as one composite token.
-    # Expose its year/month/day components just as the existing hyphenated
-    # date form does, so "2026.07.18" can ground "July 18".
-    for match in ISO_DATE_PATTERN.finditer(value):
-        numbers.update(
-            _normalize_number(component)
-            for component in re.split(r"[-/.]", match.group(0))
-        )
-    return numbers
+    return numeric_literals(value)
 
 
 def _person_counts(value: str) -> tuple[int, ...]:
@@ -750,8 +708,20 @@ def _unsupported_values(
 ) -> Iterable[tuple[str, str]]:
     evidence_normalized = _normalize_text(evidence_text)
 
-    evidence_numbers = _numbers(evidence_text)
-    for number in sorted(_numbers(generated_text) - evidence_numbers):
+    for token in sorted(set(DEVANAGARI_TOKEN_PATTERN.findall(generated_text))):
+        yield "unexpected_devanagari_token", token
+
+    evidence_numbers = (
+        _numbers(evidence_text)
+        | sinhala_decimal_values(evidence_text)
+        | sinhala_number_word_values(evidence_text)
+    )
+    generated_times = time_values(generated_text)
+    evidence_time_identities = set(time_values(evidence_text).values())
+    unsupported_numbers = _numbers(generated_text) - evidence_numbers
+    for number in sorted(unsupported_numbers):
+        if generated_times.get(number) in evidence_time_identities:
+            continue
         yield "unsupported_number", number
 
     evidence_months = set(_months(evidence_text).values())
@@ -763,8 +733,17 @@ def _unsupported_values(
         if name not in evidence_normalized:
             yield "unsupported_named_entity", name
 
+    evidence_sinhala_tokens = {
+        _normalize_text(token)
+        for token in SINHALA_TOKEN_PATTERN.findall(evidence_text)
+    }
     for name in sorted(_sinhala_entity_names(generated_text)):
-        if name not in evidence_normalized:
+        aliases = sinhala_entity_aliases(name)
+        if not any(
+            alias in evidence_normalized
+            or alias in evidence_sinhala_tokens
+            for alias in aliases
+        ):
             yield "unsupported_named_entity", name
 
 

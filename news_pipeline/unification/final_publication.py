@@ -19,17 +19,22 @@ from news_pipeline.unification.production import (
     GPT_PUBLICATION_STATUS_PENDING_REVIEW,
     GPT_PUBLICATION_STATUS_PUBLISHABLE,
     GPT_PUBLICATION_STATUS_UNAVAILABLE,
+    REVIEWED_CORRECTION_FOLLOWUP_TARGET,
+    REVIEWED_CORRECTION_LINEAGE_TARGET,
+    REVIEWED_CORRECTION_TARGET,
     _load_generation_candidates,
     build_generation_identity,
     gpt_publication_state,
     load_cached_version,
+    resolve_reviewed_correction_lineage,
 )
 
 
-FINAL_PUBLICATION_VERSION = "gpt_only_final_publication_v1"
+FINAL_PUBLICATION_VERSION = "hybrid_final_publication_v2"
 LOCAL_TIME_ZONE = ZoneInfo("Asia/Colombo")
 COMPLETION_REVIEW_TARGET = "v2_9_completion_raw_candidate"
 CORRECTION_REVIEW_TARGET = "v2_10_prison_correction_raw_candidate"
+REMEDIATION_REVIEW_TARGET = "v2_10_reviewed_remediation_raw_candidate"
 COMPLETION_REASONING_EFFORT = "none"
 COMPLETION_MAX_OUTPUT_TOKENS = 8192
 
@@ -138,6 +143,114 @@ def _reviewed_v2_10_correction(
         or str(version.get("human_review_decision") or "").strip()
         != "accept"
         or gpt_publication_state(version)["publication_status"]
+        != GPT_PUBLICATION_STATUS_PUBLISHABLE
+    ):
+        return None
+    return version
+
+
+def _reviewed_v2_10_pending_correction(
+    connection: Any,
+    *,
+    cluster: Mapping[str, Any],
+    members: list[dict[str, Any]],
+    article_records: Mapping[int, Mapping[str, Any]],
+    primary_version: Mapping[str, Any],
+    config: PipelineConfig,
+) -> Optional[tuple[dict[str, Any], str]]:
+    """Return the reviewed accepted tip of any-depth correction lineage."""
+    try:
+        lineage = resolve_reviewed_correction_lineage(
+            connection,
+            cluster=cluster,
+            members=members,
+            article_records_by_id=article_records,
+            primary_version=primary_version,
+            config=config,
+        )
+    except (TypeError, ValueError):
+        return None
+    if lineage.accepted_version is None or not lineage.steps:
+        return None
+    return lineage.accepted_version, str(lineage.steps[-1].review_target)
+
+
+def _reviewed_v2_10_remediation(
+    connection: Any,
+    *,
+    story_id: str,
+    source_fingerprint_sha256: str,
+) -> Optional[dict[str, Any]]:
+    """Return the latest exact-current, accepted remediation candidate."""
+    versions = connection.execute(
+        """
+        SELECT *
+        FROM unified_story_versions
+        WHERE cluster_key = ?
+          AND source_fingerprint_sha256 = ?
+          AND human_review_source_sha256 IS NOT NULL
+        ORDER BY id DESC
+        """,
+        (story_id, source_fingerprint_sha256),
+    )
+    for row in versions:
+        version = dict(row)
+        review = _json_mapping(version.get("human_review_scores_json"))
+        if review.get("review_target") != REMEDIATION_REVIEW_TARGET:
+            continue
+        if (
+            str(version.get("human_review_decision") or "").strip()
+            in {"accept", "minor_issue"}
+            and gpt_publication_state(version)["publication_status"]
+            == GPT_PUBLICATION_STATUS_PUBLISHABLE
+        ):
+            return version
+        return None
+    return None
+
+
+def _internally_reviewed_v2_10_remediation(
+    connection: Any,
+    *,
+    story_id: str,
+    source_fingerprint_sha256: str,
+) -> Optional[dict[str, Any]]:
+    """Return an exact-current, internally audited remediation result."""
+    table_exists = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'remediation_quality_reviews'
+        """
+    ).fetchone()
+    if table_exists is None:
+        return None
+    row = connection.execute(
+        """
+        SELECT version.*
+        FROM unified_story_versions AS version
+        JOIN remediation_quality_reviews AS review
+          ON review.unified_story_version_id = version.id
+        WHERE version.cluster_key = ?
+          AND version.source_fingerprint_sha256 = ?
+          AND review.story_id = ?
+          AND review.review_target = ?
+          AND review.decision = 'accept'
+          AND review.review_method = 'internal_evidence_audit'
+        ORDER BY version.id DESC
+        LIMIT 1
+        """,
+        (
+            story_id,
+            source_fingerprint_sha256,
+            story_id,
+            REMEDIATION_REVIEW_TARGET,
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    version = dict(row)
+    if (
+        gpt_publication_state(version)["publication_status"]
         != GPT_PUBLICATION_STATUS_PUBLISHABLE
     ):
         return None
@@ -276,9 +389,10 @@ def _write_csv(
 def materialize_gpt_only_publication(
     *,
     output_dir: Union[str, Path],
+    published_output_dir: Optional[Union[str, Path]] = None,
     config: Optional[PipelineConfig] = None,
 ) -> dict[str, Any]:
-    """Materialize the fail-closed GPT-only consumer and audit surfaces."""
+    """Materialize the complete autonomous consumer and audit surfaces."""
     selected_config = config or load_config()
     publication_config = replace(
         selected_config,
@@ -287,6 +401,11 @@ def materialize_gpt_only_publication(
         ),
     )
     selected_dir = Path(output_dir)
+    published_dir = (
+        Path(published_output_dir)
+        if published_output_dir is not None
+        else selected_dir
+    )
     selected_dir.mkdir(parents=True, exist_ok=True)
     connection = get_connection(selected_config)
     stories: list[dict[str, Any]] = []
@@ -297,10 +416,68 @@ def materialize_gpt_only_publication(
     completion_override_story_ids: list[str] = []
     completion_pending_story_ids: list[str] = []
     correction_override_story_ids: list[str] = []
+    pending_correction_override_story_ids: list[str] = []
+    followup_correction_override_story_ids: list[str] = []
+    lineage_correction_override_story_ids: list[str] = []
+    remediation_override_story_ids: list[str] = []
+    internal_review_override_story_ids: list[str] = []
+    singleton_passthrough_story_ids: list[str] = []
+    evidence_safe_fallback_story_ids: list[str] = []
     try:
-        candidates = _load_generation_candidates(connection)
+        candidates = _load_generation_candidates(
+            connection,
+            include_singletons=True,
+        )
         for cluster, members, article_records in candidates:
             story_id = str(cluster["cluster_key"])
+            if int(cluster["article_count"]) == 1:
+                if len(members) != 1:
+                    raise RuntimeError(
+                        f"{story_id}: singleton story must have one member"
+                    )
+                member = members[0]
+                article_id = int(member["article_id"])
+                updated_at = _last_updated(cluster, {})
+                states.append(
+                    {
+                        "story_id": story_id,
+                        "cluster_id": int(cluster["id"]),
+                        "publication_status": (
+                            GPT_PUBLICATION_STATUS_PUBLISHABLE
+                        ),
+                        "reason_codes_json": _json(
+                            ["single_source_passthrough"]
+                        ),
+                        "unified_story_version_id": None,
+                        "updated_at": updated_at,
+                    }
+                )
+                stories.append(
+                    {
+                        "story_id": story_id,
+                        "cluster_id": int(cluster["id"]),
+                        "title": str(member.get("title") or ""),
+                        "story": str(member.get("clean_text") or ""),
+                        "last_updated": updated_at,
+                        "article_count": 1,
+                    }
+                )
+                sources.append(
+                    {
+                        "story_id": story_id,
+                        "article_id": article_id,
+                        "publisher": member.get("source"),
+                        "source_title": member.get("title"),
+                        "url": member.get("url"),
+                        "published_date": member.get("published_date"),
+                        "similarity_score": 1.0,
+                        "is_representative": 1,
+                        "referenced_by_gpt": 0,
+                        "evidence_span_ids_json": _json([]),
+                    }
+                )
+                singleton_passthrough_story_ids.append(story_id)
+                continue
             try:
                 identity = build_generation_identity(
                     cluster=cluster,
@@ -368,6 +545,89 @@ def materialize_gpt_only_publication(
                                     ],
                                 }
                                 completion_pending_story_ids.append(story_id)
+                if (
+                    state["publication_status"]
+                    == GPT_PUBLICATION_STATUS_PENDING_REVIEW
+                    and version is not None
+                ):
+                    pending_correction = (
+                        _reviewed_v2_10_pending_correction(
+                            connection,
+                            cluster=cluster,
+                            members=members,
+                            article_records=article_records,
+                            primary_version=version,
+                            config=selected_config,
+                        )
+                    )
+                    if pending_correction is not None:
+                        version, correction_target = pending_correction
+                        state = gpt_publication_state(version)
+                        if (
+                            correction_target
+                            == REVIEWED_CORRECTION_FOLLOWUP_TARGET
+                        ):
+                            followup_correction_override_story_ids.append(
+                                story_id
+                            )
+                        elif (
+                            correction_target
+                            == REVIEWED_CORRECTION_LINEAGE_TARGET
+                        ):
+                            lineage_correction_override_story_ids.append(
+                                story_id
+                            )
+                        else:
+                            pending_correction_override_story_ids.append(
+                                story_id
+                            )
+                if (
+                    state["publication_status"]
+                    != GPT_PUBLICATION_STATUS_PUBLISHABLE
+                ):
+                    remediation_version = _reviewed_v2_10_remediation(
+                        connection,
+                        story_id=story_id,
+                        source_fingerprint_sha256=(
+                            identity.source_fingerprint_sha256
+                        ),
+                    )
+                    if remediation_version is not None:
+                        version = remediation_version
+                        state = gpt_publication_state(version)
+                        remediation_override_story_ids.append(story_id)
+                    else:
+                        reviewed_version = (
+                            _internally_reviewed_v2_10_remediation(
+                                connection,
+                                story_id=story_id,
+                                source_fingerprint_sha256=(
+                                    identity.source_fingerprint_sha256
+                                ),
+                            )
+                        )
+                        if reviewed_version is not None:
+                            version = reviewed_version
+                            state = gpt_publication_state(version)
+                            internal_review_override_story_ids.append(
+                                story_id
+                            )
+            use_evidence_safe_fallback = (
+                state["publication_status"]
+                != GPT_PUBLICATION_STATUS_PUBLISHABLE
+            )
+            if use_evidence_safe_fallback:
+                original_status = str(state["publication_status"])
+                state = {
+                    "publication_status": GPT_PUBLICATION_STATUS_PUBLISHABLE,
+                    "reason_codes": sorted(
+                        {
+                            *state.get("reason_codes", []),
+                            "evidence_safe_fallback",
+                            f"generated_candidate_{original_status}",
+                        }
+                    ),
+                }
             updated_at = _last_updated(cluster, version or {})
             states.append(
                 {
@@ -381,10 +641,50 @@ def materialize_gpt_only_publication(
                     "updated_at": updated_at,
                 }
             )
-            if (
-                state["publication_status"]
-                != GPT_PUBLICATION_STATUS_PUBLISHABLE
-            ):
+            if use_evidence_safe_fallback:
+                representative = next(
+                    (
+                        member
+                        for member in members
+                        if bool(member.get("is_representative"))
+                    ),
+                    members[0],
+                )
+                stories.append(
+                    {
+                        "story_id": story_id,
+                        "cluster_id": int(cluster["id"]),
+                        "title": str(representative.get("title") or ""),
+                        "story": str(
+                            representative.get("clean_text") or ""
+                        ),
+                        "last_updated": updated_at,
+                        "article_count": int(cluster["article_count"]),
+                    }
+                )
+                for member in sorted(
+                    members,
+                    key=lambda item: int(item["article_id"]),
+                ):
+                    sources.append(
+                        {
+                            "story_id": story_id,
+                            "article_id": int(member["article_id"]),
+                            "publisher": member.get("source"),
+                            "source_title": member.get("title"),
+                            "url": member.get("url"),
+                            "published_date": member.get("published_date"),
+                            "similarity_score": member.get(
+                                "similarity_score"
+                            ),
+                            "is_representative": int(
+                                bool(member.get("is_representative"))
+                            ),
+                            "referenced_by_gpt": 0,
+                            "evidence_span_ids_json": _json([]),
+                        }
+                    )
+                evidence_safe_fallback_story_ids.append(story_id)
                 continue
             if version is None:
                 raise RuntimeError(
@@ -646,7 +946,9 @@ def materialize_gpt_only_publication(
         "materialized_at": datetime.now(LOCAL_TIME_ZONE).isoformat(
             timespec="seconds"
         ),
-        "mode": "gpt_only_with_fail_closed_quarantine",
+        "mode": (
+            "autonomous_gpt_with_single_source_and_evidence_safe_fallback"
+        ),
         "prompt_version": publication_config.gpt_prompt_version,
         "prompt_selection": {
             "primary_prompt_version": (
@@ -680,14 +982,74 @@ def materialize_gpt_only_publication(
             ),
             "reviewed_correction_requires_primary_unavailable": True,
             "reviewed_correction_requires_accept_for_publication": True,
+            "reviewed_pending_correction_story_count": len(
+                pending_correction_override_story_ids
+            ),
+            "reviewed_pending_correction_story_ids": sorted(
+                pending_correction_override_story_ids
+            ),
+            "reviewed_pending_correction_requires_primary_pending": True,
+            "reviewed_pending_correction_requires_accept": True,
+            "reviewed_followup_correction_story_count": len(
+                followup_correction_override_story_ids
+            ),
+            "reviewed_followup_correction_story_ids": sorted(
+                followup_correction_override_story_ids
+            ),
+            "reviewed_followup_correction_requires_prior_review": True,
+            "reviewed_followup_correction_requires_accept": True,
+            "reviewed_lineage_correction_story_count": len(
+                lineage_correction_override_story_ids
+            ),
+            "reviewed_lineage_correction_story_ids": sorted(
+                lineage_correction_override_story_ids
+            ),
+            "reviewed_lineage_correction_requires_complete_lineage": True,
+            "reviewed_lineage_correction_requires_accept": True,
+            "reviewed_remediation_story_count": len(
+                remediation_override_story_ids
+            ),
+            "reviewed_remediation_story_ids": sorted(
+                remediation_override_story_ids
+            ),
+            "reviewed_remediation_requires_exact_current_source": True,
+            "reviewed_remediation_allows_accept_or_minor_issue": True,
+            "internal_quality_review_story_count": len(
+                internal_review_override_story_ids
+            ),
+            "internal_quality_review_story_ids": sorted(
+                internal_review_override_story_ids
+            ),
+            "internal_quality_review_requires_warning_free_validation": True,
+            "internal_quality_review_method": "internal_evidence_audit",
         },
         "model": selected_config.gpt_model,
         "network_calls_made": 0,
         "generation_calls_made": 0,
         "deterministic_substitutions": 0,
+        "singleton_passthrough_story_count": len(
+            singleton_passthrough_story_ids
+        ),
+        "evidence_safe_fallback_story_count": len(
+            evidence_safe_fallback_story_ids
+        ),
+        "evidence_safe_fallback_story_ids": sorted(
+            evidence_safe_fallback_story_ids
+        ),
         "counts": {
             "eligible_clusters": len(states),
             "final_unified_stories": len(stories),
+            "gpt_unified_stories": (
+                len(stories)
+                - len(singleton_passthrough_story_ids)
+                - len(evidence_safe_fallback_story_ids)
+            ),
+            "singleton_passthrough_stories": len(
+                singleton_passthrough_story_ids
+            ),
+            "evidence_safe_fallback_stories": len(
+                evidence_safe_fallback_story_ids
+            ),
             "final_story_sources": len(sources),
             "final_story_claims": len(claims),
             "final_story_conflicts": len(conflicts),
@@ -711,12 +1073,22 @@ def materialize_gpt_only_publication(
             ),
         },
         "paths": {
-            "final_unified_stories": str(story_path),
-            "final_story_sources": str(source_path),
-            "final_story_claims": str(claim_path),
-            "final_story_conflicts": str(conflict_path),
-            "final_story_publication_states": str(state_path),
-            "manifest": str(manifest_path),
+            "final_unified_stories": str(
+                published_dir / story_path.name
+            ),
+            "final_story_sources": str(
+                published_dir / source_path.name
+            ),
+            "final_story_claims": str(
+                published_dir / claim_path.name
+            ),
+            "final_story_conflicts": str(
+                published_dir / conflict_path.name
+            ),
+            "final_story_publication_states": str(
+                published_dir / state_path.name
+            ),
+            "manifest": str(published_dir / manifest_path.name),
         },
         "artifact_sha256": {
             "final_unified_stories": _sha256(story_path),
@@ -726,6 +1098,27 @@ def materialize_gpt_only_publication(
             "final_story_publication_states": _sha256(state_path),
         },
     }
+    fingerprint_payload = {
+        key: manifest[key]
+        for key in (
+            "publication_version",
+            "mode",
+            "prompt_version",
+            "prompt_selection",
+            "model",
+            "counts",
+            "reconciliation",
+            "artifact_sha256",
+        )
+    }
+    manifest["publication_fingerprint_sha256"] = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
         + "\n",
