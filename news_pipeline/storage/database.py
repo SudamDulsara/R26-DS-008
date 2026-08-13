@@ -268,6 +268,23 @@ def initialize_db():
             response_id TEXT,
             attempts INTEGER NOT NULL DEFAULT 0,
             fallback_reason TEXT,
+            primary_model_name TEXT,
+            primary_response_id TEXT,
+            primary_output_json TEXT,
+            primary_validation_json TEXT,
+            primary_input_tokens INTEGER,
+            primary_output_tokens INTEGER,
+            primary_total_tokens INTEGER,
+            primary_estimated_cost_usd TEXT,
+            autonomous_audit_status TEXT,
+            autonomous_audit_model TEXT,
+            autonomous_audit_response_id TEXT,
+            autonomous_audit_route_json TEXT,
+            autonomous_audit_input_tokens INTEGER,
+            autonomous_audit_output_tokens INTEGER,
+            autonomous_audit_total_tokens INTEGER,
+            autonomous_audit_estimated_cost_usd TEXT,
+            autonomous_audit_created_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -532,6 +549,55 @@ def initialize_db():
         "human_review_imported_at",
         "human_review_imported_at TEXT",
     )
+    for column_name, column_def in (
+        ("primary_model_name", "primary_model_name TEXT"),
+        ("primary_response_id", "primary_response_id TEXT"),
+        ("primary_output_json", "primary_output_json TEXT"),
+        ("primary_validation_json", "primary_validation_json TEXT"),
+        ("primary_input_tokens", "primary_input_tokens INTEGER"),
+        ("primary_output_tokens", "primary_output_tokens INTEGER"),
+        ("primary_total_tokens", "primary_total_tokens INTEGER"),
+        (
+            "primary_estimated_cost_usd",
+            "primary_estimated_cost_usd TEXT",
+        ),
+        ("autonomous_audit_status", "autonomous_audit_status TEXT"),
+        ("autonomous_audit_model", "autonomous_audit_model TEXT"),
+        (
+            "autonomous_audit_response_id",
+            "autonomous_audit_response_id TEXT",
+        ),
+        (
+            "autonomous_audit_route_json",
+            "autonomous_audit_route_json TEXT",
+        ),
+        (
+            "autonomous_audit_input_tokens",
+            "autonomous_audit_input_tokens INTEGER",
+        ),
+        (
+            "autonomous_audit_output_tokens",
+            "autonomous_audit_output_tokens INTEGER",
+        ),
+        (
+            "autonomous_audit_total_tokens",
+            "autonomous_audit_total_tokens INTEGER",
+        ),
+        (
+            "autonomous_audit_estimated_cost_usd",
+            "autonomous_audit_estimated_cost_usd TEXT",
+        ),
+        (
+            "autonomous_audit_created_at",
+            "autonomous_audit_created_at TEXT",
+        ),
+    ):
+        _ensure_column(
+            cursor,
+            "unified_story_versions",
+            column_name,
+            column_def,
+        )
 
     cursor.execute(
         """
@@ -702,12 +768,25 @@ def initialize_db():
             WHEN clean_status IS NULL OR clean_status = '' THEN ?
             ELSE clean_status
         END
+        WHERE NOT EXISTS (SELECT 1 FROM pipeline_runs LIMIT 1)
+          AND (
+                clean_status IS NULL
+                OR clean_status = ''
+                OR (
+                    clean_status = ?
+                    AND (
+                        (clean_text IS NOT NULL AND TRIM(clean_text) != '')
+                        OR sinhala_purity IS NOT NULL
+                    )
+                )
+          )
         """,
         (
             CLEAN_STATUS_PENDING,
             CLEAN_STATUS_CLEANED,
             CLEAN_STATUS_PENDING,
             CLEAN_STATUS_REJECTED,
+            CLEAN_STATUS_PENDING,
             CLEAN_STATUS_PENDING,
         ),
     )
@@ -725,12 +804,29 @@ def initialize_db():
             WHEN dedupe_status IS NULL OR dedupe_status = '' THEN ?
             ELSE dedupe_status
         END
+        WHERE NOT EXISTS (SELECT 1 FROM pipeline_runs LIMIT 1)
+          AND (
+                dedupe_status IS NULL
+                OR dedupe_status = ''
+                OR (
+                    dedupe_status = ?
+                    AND (
+                        is_duplicate = 1
+                        OR (
+                            clean_text IS NOT NULL
+                            AND TRIM(clean_text) != ''
+                            AND COALESCE(is_duplicate, 0) = 0
+                        )
+                    )
+                )
+          )
         """,
         (
             DEDUPE_STATUS_PENDING,
             DEDUPE_STATUS_EXACT_DUPLICATE,
             DEDUPE_STATUS_PENDING,
             DEDUPE_STATUS_UNIQUE,
+            DEDUPE_STATUS_PENDING,
             DEDUPE_STATUS_PENDING,
         ),
     )
@@ -739,14 +835,16 @@ def initialize_db():
         """
         UPDATE articles
         SET quality_flags = '[]'
-        WHERE quality_flags IS NULL OR quality_flags = ''
+        WHERE NOT EXISTS (SELECT 1 FROM pipeline_runs LIMIT 1)
+          AND (quality_flags IS NULL OR quality_flags = '')
         """
     )
     cursor.execute(
         """
         UPDATE articles
         SET metadata_flags = '[]'
-        WHERE metadata_flags IS NULL OR metadata_flags = ''
+        WHERE NOT EXISTS (SELECT 1 FROM pipeline_runs LIMIT 1)
+          AND (metadata_flags IS NULL OR metadata_flags = '')
         """
     )
     cursor.execute(

@@ -759,6 +759,44 @@ class GPTUnifiedStoryResponseV2(StrictContractModel):
     used_only_supplied_sources: Literal[True]
 
 
+NO_DEVANAGARI_OUTPUT_PATTERN = r"^[^\u0900-\u097F]*$"
+
+
+class GPTCorrectionClaimV2(StrictContractModel):
+    claim_text: str = Field(
+        min_length=1,
+        pattern=NO_DEVANAGARI_OUTPUT_PATTERN,
+    )
+    evidence_span_ids: list[str] = Field(min_length=1)
+
+
+class GPTCorrectionConflictOrUncertaintyV2(StrictContractModel):
+    description: str = Field(
+        min_length=1,
+        pattern=NO_DEVANAGARI_OUTPUT_PATTERN,
+    )
+    evidence_span_ids: list[str] = Field(min_length=1)
+
+
+class GPTCorrectionUnifiedStoryResponseV2(StrictContractModel):
+    """Correction-only schema that structurally excludes Devanagari."""
+
+    schema_version: Literal["unified_story_schema_v2"]
+    display_title: str = Field(
+        min_length=1,
+        pattern=NO_DEVANAGARI_OUTPUT_PATTERN,
+    )
+    unified_story: str = Field(
+        min_length=1,
+        pattern=NO_DEVANAGARI_OUTPUT_PATTERN,
+    )
+    claims: list[GPTCorrectionClaimV2] = Field(min_length=1)
+    conflicts_or_uncertainties: list[
+        GPTCorrectionConflictOrUncertaintyV2
+    ]
+    used_only_supplied_sources: Literal[True]
+
+
 class GPTResolvedSourceEvidenceV2(StrictContractModel):
     evidence_span_id: str = Field(min_length=1)
     article_id: int = Field(gt=0)

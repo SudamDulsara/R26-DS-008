@@ -125,9 +125,10 @@ def _stage_counts(
             "input": inputs,
             "output": _integer(result.get("story_clusters")),
             "skipped": max(inputs - affected, 0),
-            "failed": _integer(
-                result.get("representative_unclustered_articles")
-            ),
+            # Articles that do not join a multi-source component are now
+            # deliberately materialized as singleton stories. They are a
+            # successful routing outcome, not clustering failures.
+            "failed": 0,
         }
     if stage_name == "unification":
         return {
@@ -180,6 +181,8 @@ class PipelineRunMetrics:
             "stages": {},
             "gpt_usage": {
                 "generation_calls": 0,
+                "audit_calls": 0,
+                "provider_calls": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
@@ -249,6 +252,12 @@ class PipelineRunMetrics:
             self.data["gpt_usage"] = {
                 "generation_calls": _integer(
                     normalized.get("generation_calls")
+                ),
+                "audit_calls": _integer(
+                    normalized.get("audit_calls")
+                ),
+                "provider_calls": _integer(
+                    normalized.get("provider_calls")
                 ),
                 "input_tokens": _integer(
                     normalized.get("input_tokens")
@@ -357,6 +366,8 @@ def write_pipeline_health_report(
             "## GPT usage for this run",
             "",
             f"- Generation calls: `{gpt.get('generation_calls', 0)}`",
+            f"- Audit calls: `{gpt.get('audit_calls', 0)}`",
+            f"- Total provider calls: `{gpt.get('provider_calls', 0)}`",
             f"- Input tokens: `{gpt.get('input_tokens', 0)}`",
             f"- Output tokens: `{gpt.get('output_tokens', 0)}`",
             f"- Total tokens: `{gpt.get('total_tokens', 0)}`",

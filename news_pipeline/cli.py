@@ -121,7 +121,7 @@ def build_parser():
     unify_parser.add_argument(
         "--no-gpt",
         action="store_true",
-        help="Run offline and use cached GPT or reviewed extractive fallback",
+        help="Run offline using cached GPT or evidence-safe source fallback",
     )
     unify_parser.add_argument(
         "--force",
@@ -144,48 +144,9 @@ def build_parser():
             "client or making requests"
         ),
     )
-    unify_parser.add_argument(
-        "--apply-review",
-        metavar="REVIEWED_CSV",
-        help=(
-            "Audit and apply completed human-review decisions without "
-            "making API calls"
-        ),
-    )
-    unify_parser.add_argument(
-        "--apply-gpt-candidate-review",
-        metavar="REVIEWED_CSV",
-        help=(
-            "Audit and apply a mixed raw-GPT candidate review without "
-            "making API calls"
-        ),
-    )
-    unify_parser.add_argument(
-        "--reference-review",
-        metavar="REFERENCE_CSV",
-        help=(
-            "Original unedited review CSV required with --apply-review"
-        ),
-    )
-
     export_parser = subparsers.add_parser(
         "export",
         help="Export a versioned dataset snapshot",
-    )
-    export_parser.add_argument(
-        "--gpt-only-evaluation",
-        action="store_true",
-        help=(
-            "Export a source-complete raw GPT candidate review package "
-            "without deterministic fallbacks or API calls"
-        ),
-    )
-    export_parser.add_argument(
-        "--output-dir",
-        help=(
-            "Destination for --gpt-only-evaluation; defaults to a "
-            "timestamped review directory"
-        ),
     )
 
     run_parser = subparsers.add_parser(
@@ -278,57 +239,12 @@ def main(argv=None):
                 args.revalidate_only,
                 args.cache_only,
                 args.no_gpt,
-                args.apply_review,
-                args.apply_gpt_candidate_review,
             )
         )
         if selected_safe_modes > 1:
             parser.error(
-                "--revalidate-only, --cache-only, --no-gpt, and "
-                "--apply-review, and --apply-gpt-candidate-review "
+                "--revalidate-only, --cache-only, and --no-gpt "
                 "cannot be combined"
-            )
-        if args.reference_review and not (
-            args.apply_review or args.apply_gpt_candidate_review
-        ):
-            parser.error(
-                "--reference-review requires a review-application option"
-            )
-        if args.apply_gpt_candidate_review:
-            if not args.reference_review:
-                parser.error(
-                    "--apply-gpt-candidate-review requires "
-                    "--reference-review"
-                )
-            if args.force:
-                parser.error(
-                    "--apply-gpt-candidate-review cannot be combined "
-                    "with --force"
-                )
-            from news_pipeline.unification.candidate_review import (
-                apply_gpt_candidate_review,
-            )
-
-            return apply_gpt_candidate_review(
-                args.apply_gpt_candidate_review,
-                args.reference_review,
-            )
-        if args.apply_review:
-            if not args.reference_review:
-                parser.error(
-                    "--apply-review requires --reference-review"
-                )
-            if args.force:
-                parser.error(
-                    "--apply-review cannot be combined with --force"
-                )
-            from news_pipeline.unification.human_review import (
-                apply_unification_review,
-            )
-
-            return apply_unification_review(
-                args.apply_review,
-                args.reference_review,
             )
         if args.cache_only:
             if args.force:
@@ -347,18 +263,6 @@ def main(argv=None):
             force=args.force,
         )
     if args.command == "export":
-        if args.output_dir and not args.gpt_only_evaluation:
-            parser.error(
-                "--output-dir requires --gpt-only-evaluation"
-            )
-        if args.gpt_only_evaluation:
-            from news_pipeline.unification.gpt_only_evaluation import (
-                export_gpt_only_evaluation,
-            )
-
-            return export_gpt_only_evaluation(
-                output_dir=args.output_dir,
-            )
         from news_pipeline.dataset.exporter import export_snapshot
 
         return export_snapshot()

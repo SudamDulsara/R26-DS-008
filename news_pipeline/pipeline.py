@@ -1,11 +1,12 @@
 from dataclasses import replace
-from pathlib import Path
 
 from news_pipeline.cleaner.sinhala_cleaner import run_cleaner
 from news_pipeline.clustering.event_clusterer import run_event_clustering
 from news_pipeline.config import load_config
 from news_pipeline.crawler.rss_crawler import run_discovery
-from news_pipeline.dataset.exporter import export_snapshot
+from news_pipeline.dataset.current_exporter import (
+    export_current_publication,
+)
 from news_pipeline.deduplicator.exact_deduper import run_exact_dedup
 from news_pipeline.extractor.article_extractor import extract_articles
 from news_pipeline.observability import (
@@ -87,10 +88,7 @@ def _run_pipeline_locked(*, config, no_gpt: bool = False):
         changed_story_keys = stats["clustering"].get(
             "changed_story_keys"
         )
-        if (
-            changed_story_keys
-            and not config.gpt_only_publication_enabled
-        ):
+        if changed_story_keys is not None:
             unification_kwargs["cluster_keys"] = changed_story_keys
         stats["unification"] = metrics.run(
             "unification",
@@ -99,13 +97,11 @@ def _run_pipeline_locked(*, config, no_gpt: bool = False):
         )
 
         logger.info("")
-        _log_step(logger, "STEP 7: Export - Versioned Snapshot")
+        _log_step(logger, "STEP 7: Publish - Current GPT-only Bundle")
         stats["export"] = metrics.run(
             "export",
-            export_snapshot,
-            gpt_shadow=bool(
-                stats["unification"].get("shadow_mode", False)
-            ),
+            export_current_publication,
+            config=config,
         )
 
         stats["run_metrics"] = metrics.finish("completed")
@@ -114,7 +110,7 @@ def _run_pipeline_locked(*, config, no_gpt: bool = False):
             stats["run_health"] = write_pipeline_health_report(
                 run_id=run_id,
                 stats=stats,
-                output_dir=Path(snapshot_dir),
+                output_dir=config.logs_dir / "health",
             )
         finish_pipeline_run(run_id, "completed", stats)
         logger.info("")

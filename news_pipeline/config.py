@@ -21,6 +21,15 @@ DEFAULT_GPT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_GPT_TIMEOUT_SECONDS = 120.0
 DEFAULT_GPT_MAX_COST_PER_STORY_USD = 0.25
 DEFAULT_GPT_MAX_COST_PER_RUN_USD = 1.0
+DEFAULT_GPT_MAX_COST_PER_DAY_USD = 2.0
+DEFAULT_GPT_MAX_COST_PER_MONTH_USD = 20.0
+DEFAULT_GPT_MAX_CLUSTERS_PER_RUN = 25
+DEFAULT_GPT_AUTONOMOUS_AUDIT_ENABLED = True
+DEFAULT_GPT_AUDIT_MODEL = "gpt-5.6-luna"
+DEFAULT_GPT_AUDIT_COMPLEX_MODEL = "gpt-5.6-terra"
+DEFAULT_GPT_AUDIT_REASONING_EFFORT = "low"
+DEFAULT_GPT_AUDIT_COMPLEX_REASONING_EFFORT = "medium"
+DEFAULT_GPT_AUDIT_MAX_OUTPUT_TOKENS = 8192
 
 
 DEFAULT_NEWS_SOURCES = {
@@ -72,6 +81,15 @@ class PipelineConfig:
     gpt_timeout_seconds: float
     gpt_max_cost_per_story_usd: float
     gpt_max_cost_per_run_usd: float
+    gpt_max_cost_per_day_usd: float
+    gpt_max_cost_per_month_usd: float
+    gpt_max_clusters_per_run: int
+    gpt_autonomous_audit_enabled: bool
+    gpt_audit_model: str
+    gpt_audit_complex_model: str
+    gpt_audit_reasoning_effort: str
+    gpt_audit_complex_reasoning_effort: str
+    gpt_audit_max_output_tokens: int
     openai_api_key: Optional[str] = field(repr=False)
     news_sources: dict[str, str]
 
@@ -337,7 +355,7 @@ def load_config(
         cluster_allow_same_source_pairs=_bool_from_env(
             environment,
             "NEWS_PIPELINE_CLUSTER_ALLOW_SAME_SOURCE_PAIRS",
-            False,
+            True,
         ),
         gpt_enabled=_bool_from_env(
             environment,
@@ -416,6 +434,59 @@ def load_config(
             environment,
             "NEWS_PIPELINE_GPT_MAX_COST_PER_RUN_USD",
             DEFAULT_GPT_MAX_COST_PER_RUN_USD,
+        ),
+        gpt_max_cost_per_day_usd=_nonnegative_float_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_MAX_COST_PER_DAY_USD",
+            DEFAULT_GPT_MAX_COST_PER_DAY_USD,
+        ),
+        gpt_max_cost_per_month_usd=_nonnegative_float_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_MAX_COST_PER_MONTH_USD",
+            DEFAULT_GPT_MAX_COST_PER_MONTH_USD,
+        ),
+        gpt_max_clusters_per_run=_positive_int_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_MAX_CLUSTERS_PER_RUN",
+            DEFAULT_GPT_MAX_CLUSTERS_PER_RUN,
+        ),
+        gpt_autonomous_audit_enabled=_bool_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_AUTONOMOUS_AUDIT_ENABLED",
+            DEFAULT_GPT_AUTONOMOUS_AUDIT_ENABLED,
+        ),
+        gpt_audit_model=(
+            _optional_string_from_env(
+                environment,
+                "NEWS_PIPELINE_GPT_AUDIT_MODEL",
+                DEFAULT_GPT_AUDIT_MODEL,
+            )
+            or DEFAULT_GPT_AUDIT_MODEL
+        ),
+        gpt_audit_complex_model=(
+            _optional_string_from_env(
+                environment,
+                "NEWS_PIPELINE_GPT_AUDIT_COMPLEX_MODEL",
+                DEFAULT_GPT_AUDIT_COMPLEX_MODEL,
+            )
+            or DEFAULT_GPT_AUDIT_COMPLEX_MODEL
+        ),
+        gpt_audit_reasoning_effort=_choice_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_AUDIT_REASONING_EFFORT",
+            DEFAULT_GPT_AUDIT_REASONING_EFFORT,
+            GPT_REASONING_EFFORTS,
+        ),
+        gpt_audit_complex_reasoning_effort=_choice_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_AUDIT_COMPLEX_REASONING_EFFORT",
+            DEFAULT_GPT_AUDIT_COMPLEX_REASONING_EFFORT,
+            GPT_REASONING_EFFORTS,
+        ),
+        gpt_audit_max_output_tokens=_positive_int_from_env(
+            environment,
+            "NEWS_PIPELINE_GPT_AUDIT_MAX_OUTPUT_TOKENS",
+            DEFAULT_GPT_AUDIT_MAX_OUTPUT_TOKENS,
         ),
         openai_api_key=_optional_string_from_env(
             environment,
