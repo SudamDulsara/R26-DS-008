@@ -130,6 +130,7 @@ def search_channel_videos():
 # =====================================================
 
 def get_video_details(video_id):
+
     request = youtube.videos().list(
         part="snippet,contentDetails,status",
         id=video_id
@@ -137,22 +138,56 @@ def get_video_details(video_id):
 
     response = request.execute()
 
+    # -------------------------------------------------
+    # DEBUG OUTPUT
+    # -------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("YOUTUBE API RESPONSE")
+    print("=" * 70)
+    print(response)
+
     if len(response.get("items", [])) == 0:
+        print("No video found.")
         return None
 
     item = response["items"][0]
 
-    duration = int(
-        isodate.parse_duration(
-            item["contentDetails"]["duration"]
-        ).total_seconds()
-    )
+    print("\nVIDEO ITEM:")
+    print(item)
+
+    # -------------------------------------------------
+    # SAFETY CHECKS
+    # -------------------------------------------------
+
+    if "contentDetails" not in item:
+        print("ERROR: contentDetails missing")
+        return None
+
+    if "duration" not in item["contentDetails"]:
+        print("ERROR: duration missing")
+        print(item["contentDetails"])
+        return None
+
+    # -------------------------------------------------
+    # GET DURATION
+    # -------------------------------------------------
+
+    try:
+        duration = int(
+            isodate.parse_duration(
+                item["contentDetails"]["duration"]
+            ).total_seconds()
+        )
+    except Exception as e:
+        print(f"Error parsing duration: {e}")
+        return None
 
     return {
         "video_id": video_id,
-        "title": item["snippet"]["title"],
-        "channel": item["snippet"]["channelTitle"],
-        "channel_id": item["snippet"]["channelId"],
+        "title": item["snippet"].get("title", ""),
+        "channel": item["snippet"].get("channelTitle", ""),
+        "channel_id": item["snippet"].get("channelId", ""),
         "language": item["snippet"].get(
             "defaultLanguage",
             ""
@@ -160,7 +195,6 @@ def get_video_details(video_id):
         "duration": duration,
         "url": f"https://www.youtube.com/watch?v={video_id}"
     }
-
 # =====================================================
 # TITLE FILTER
 # =====================================================

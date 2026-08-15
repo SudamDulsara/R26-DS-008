@@ -88,7 +88,7 @@ def main():
     # TRANSCRIBE
     # -------------------------------------------------
 
-    results = transcribe_dataset(chunks)
+    results = transcribe_dataset(chunks,video)
 
     if len(results) == 0:
 

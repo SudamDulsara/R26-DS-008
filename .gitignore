@@ -15,7 +15,7 @@ env/
 ENV/
 
 # =====================================================
-# Environment Variables
+# Environment Variables / Secrets
 # =====================================================
 
 .env
@@ -30,31 +30,42 @@ ENV/
 .idea/
 
 # =====================================================
-# Credentials (NEVER COMMIT)
+# Credentials
 # =====================================================
 
 credentials/
 
 # =====================================================
-# Database
+# audio-text-project_1 - Local Database / Data
 # =====================================================
 
-data/videos.db
+audio-text-project_1/data/
 
 # =====================================================
-# Generated Dataset Files
+# audio-text-project_1 - Generated / Local Dataset
 # =====================================================
 
-dataset/clips/
-dataset/train.tsv
-dataset/pipeline_state.txt
+audio-text-project_1/dataset/clips/
+audio-text-project_1/dataset/*.tsv
+audio-text-project_1/dataset/pipeline_state.txt
+audio-text-project_1/dataset/finetune/
 
 # =====================================================
-# Temporary Files
+# audio-text-project_1 - Fine-tuned Models
 # =====================================================
 
-temp/
-downloads/
+audio-text-project_1/models/
+
+# =====================================================
+# audio-text-project_1 - Temporary / Downloaded Files
+# =====================================================
+
+audio-text-project_1/temp/
+audio-text-project_1/downloads/
+
+# =====================================================
+# Audio / Video Files
+# =====================================================
 
 *.wav
 *.mp3
@@ -78,3 +89,8 @@ logs/
 Thumbs.db
 desktop.ini
 
+# =====================================================
+# Local Development / Testing
+# =====================================================
+
+audio-text-project_1/check_database.py

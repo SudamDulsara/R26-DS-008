@@ -307,10 +307,8 @@ def save_clip(
 # =====================================================
 
 def update_clip_transcript(
-
     clip_name,
     transcript
-
 ):
 
     conn = get_connection()
@@ -322,10 +320,7 @@ def update_clip_transcript(
 
         UPDATE clips
 
-        SET
-
-            transcript=?,
-            verified=1
+        SET transcript=?
 
         WHERE clip_name=?
 
@@ -340,7 +335,6 @@ def update_clip_transcript(
 
     conn.commit()
     conn.close()
-
 
 # =====================================================
 # SAVE CLIP DRIVE FILE ID

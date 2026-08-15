@@ -23,7 +23,13 @@ device = 0 if torch.cuda.is_available() else -1
 # MODEL
 # =========================================================
 
-model_id = "Lingalingeswaran/whisper-small-sinhala"
+model_id = os.path.join(
+    "models",
+    "final_whisper_sinhala_v1"
+)
+
+print("Using fine-tuned Whisper V1:")
+print(os.path.abspath(model_id))
 
 # =========================================================
 # LOAD MODEL
@@ -170,7 +176,7 @@ def transcribe_audio(file_path):
 
             generate_kwargs={
 
-                "language": "sinhalese",
+                "language": "si",
 
                 "task": "transcribe",
 
