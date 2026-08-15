@@ -1,0 +1,23 @@
+URL_STATUS_DISCOVERED = "discovered"
+URL_STATUS_FETCH_FAILED = "fetch_failed"
+URL_STATUS_EXTRACTED = "extracted"
+URL_STATUS_REJECTED = "rejected"
+URL_STATUS_EXHAUSTED = "exhausted"
+
+URL_ERROR_NETWORK = "network_error"
+URL_ERROR_HTTP_RETRYABLE = "http_retryable"
+URL_ERROR_HTTP_TERMINAL = "http_terminal"
+URL_ERROR_MISSING_DEPENDENCY = "missing_dependency"
+URL_ERROR_UNEXPECTED = "unexpected_error"
+URL_ERROR_EMPTY_EXTRACTION = "empty_extraction"
+URL_ERROR_INVALID_EXTRACTION_JSON = "invalid_extraction_json"
+URL_ERROR_ARTICLE_TOO_SHORT = "article_too_short"
+URL_ERROR_LEGACY_RETRY_STATE = "legacy_retry_state_normalized"
+
+CLEAN_STATUS_PENDING = "pending"
+CLEAN_STATUS_CLEANED = "cleaned"
+CLEAN_STATUS_REJECTED = "rejected"
+
+DEDUPE_STATUS_PENDING = "pending"
+DEDUPE_STATUS_UNIQUE = "unique"
+DEDUPE_STATUS_EXACT_DUPLICATE = "exact_duplicate"

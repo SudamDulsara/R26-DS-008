@@ -4,6 +4,10 @@
 
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tmp/
 
 # =====================================================
 # Virtual Environments
@@ -36,13 +40,13 @@ ENV/
 credentials/
 
 # =====================================================
-# audio-text-project_1 - Local Database / Data
+# Local Database / Data
 # =====================================================
 
 audio-text-project_1/data/
 
 # =====================================================
-# audio-text-project_1 - Generated / Local Dataset
+# Generated / Local Dataset Files
 # =====================================================
 
 audio-text-project_1/dataset/clips/
@@ -51,21 +55,17 @@ audio-text-project_1/dataset/pipeline_state.txt
 audio-text-project_1/dataset/finetune/
 
 # =====================================================
-# audio-text-project_1 - Fine-tuned Models
+# Fine-tuned Models
 # =====================================================
 
 audio-text-project_1/models/
 
 # =====================================================
-# audio-text-project_1 - Temporary / Downloaded Files
+# Temporary / Downloaded Files
 # =====================================================
 
 audio-text-project_1/temp/
 audio-text-project_1/downloads/
-
-# =====================================================
-# Audio / Video Files
-# =====================================================
 
 *.wav
 *.mp3
@@ -94,3 +94,14 @@ desktop.ini
 # =====================================================
 
 audio-text-project_1/check_database.py
+
+# =====================================================
+# News Pipeline
+# =====================================================
+
+news_pipeline/docs
+news_pipeline/tests/*
+!news_pipeline/tests/__init__.py
+!news_pipeline/tests/test_autonomous_pipeline.py
+news_pipeline/evaluation
+news_pipeline/private/

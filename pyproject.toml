@@ -1,12 +1,31 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "news-pipeline"
 version = "0.1.0"
+description = "Sinhala news dataset generation pipeline"
 requires-python = ">=3.9"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "cloudscraper>=1.2.71",
+    "dateparser>=1.4.0",
+    "feedparser>=6.0.12",
+    "numpy>=1.26.0",
+    "openai>=2.47.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.1",
+    "requests>=2.33.1",
+    "sentence-transformers>=3.0.0",
+    "trafilatura>=2.0.0",
+    "truststore>=0.10.4",
+]
+
+[project.scripts]
+news-pipeline = "news_pipeline.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["news_pipeline*"]
+exclude = ["news_pipeline.tests*", "news_pipeline.evaluation*"]
