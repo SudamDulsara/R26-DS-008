@@ -376,14 +376,15 @@ print(f"original page size: {_sample.size} -> after shrink: {shrink(_sample).siz
 # for activations. The base weights stay frozen and quantised; only small
 # adapter matrices train, which is what makes this fit at all.
 #
-# compute dtype is float16, not bfloat16: the T4 is a Turing card and has no
-# bf16 support. Note this is NOT the fp16 trap that destroyed the ByT5 run --
-# that was specific to T5-family models, which are pretrained in bfloat16 and
-# whose activations overflow fp16's exponent range. This model's decoder is
-# Qwen3-based and trains in fp16 routinely.
+# On precision, and a correction: an earlier version of this comment argued
+# that fp16 was safe here because the decoder is Qwen3-based, unlike the
+# T5-family models whose bfloat16 activations overflowed fp16 and destroyed a
+# ByT5 run. That reasoning was wrong -- it accounted for only half the model.
+# The other half is a Pixtral vision encoder, which is Mistral-family and has
+# exactly the bfloat16 heritage the argument was meant to rule out.
 #
-# Watch the loss anyway. If it goes to nan in the first hundred steps, fp16 is
-# the first suspect and the only fix on a T4 is fp32, at roughly half speed.
+# The first smoke test duly returned validation loss nan. See PRECISION in
+# section 2, the NO_QUANT list below, and the forward-pass check in section 6.
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
