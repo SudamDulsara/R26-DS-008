@@ -136,10 +136,26 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 #: under the same conditions as everything else you report.
 TESSERACT_BASELINE = 0.1079
 
-#: Longest page transcription seen in the 202 test pages is ~4,300 bytes;
-#: pages average ~39 lines of ~105 bytes. 2048 tokens clears that with room,
-#: and attention cost grows with the square of this number.
+#: How many tokens the model may GENERATE when reading a page.
+#: Longest page transcription in the 202 test pages is ~4,300 bytes; pages
+#: average ~39 lines of ~105 bytes. 2048 clears that with room to spare.
+#:
+#: This is a cap on the reply only. It is NOT the sequence length -- see
+#: MAX_SEQ_TOKENS below. Confusing the two is what broke the first run.
 MAX_TARGET_TOKENS = 2048
+
+#: Ceiling on the WHOLE sequence: image tokens + prompt + page text.
+#:
+#: A page image is not free. At MAX_IMAGE_EDGE=1536 one page becomes ~2,145
+#: image tokens before a single character of text is counted, so a typical
+#: training example is ~3,400 tokens long.
+#:
+#: Pages estimated to exceed this are SKIPPED and counted, never truncated.
+#: Truncating would cut into the image tokens and desynchronise them from the
+#: text -- which is precisely how the first attempt failed. It would also
+#: violate this project's own rule: never truncate silently, skip or flag and
+#: log every occurrence.
+MAX_SEQ_TOKENS = 4096
 
 #: Cap on the longer image edge, in pixels.
 #:
@@ -387,13 +403,16 @@ def collate(batch):
         images.append(image)
         fulls.append(full_text)
 
+    # No truncation, deliberately. The image expands into thousands of
+    # placeholder tokens that must stay in exact correspondence with the
+    # pixel data; cutting the sequence cuts into them and the processor
+    # rejects the batch. Over-long pages are removed up front instead --
+    # see the length scan below.
     enc = processor(
         images=images,
         text=fulls,
         return_tensors="pt",
         padding=True,
-        truncation=True,
-        max_length=MAX_TARGET_TOKENS,
     )
 
     labels = enc["input_ids"].clone()
@@ -420,10 +439,75 @@ def collate(batch):
 # silently learn nothing.
 _probe = collate([train_ds[0]])
 _kept = (_probe["labels"] != -100).sum().item()
-print(f"probe example: {_probe['input_ids'].shape[1]} tokens, "
-      f"{_kept} of them supervised")
+_total = _probe["input_ids"].shape[1]
+print(f"probe example: {_total} tokens, {_kept} of them supervised "
+      f"({_total - _kept} are image + prompt)")
 if _kept == 0:
     sys.exit("Prompt masking removed every label. Fix build_texts() before training.")
+
+
+# ── How long is a page, in tokens? ──────────────────────────────────
+#
+# The vision encoder cuts the page into patches and merges neighbours, so the
+# token count is the patch grid: ceil(w / stride) * ceil(h / stride), where
+# stride = patch_size * spatial_merge_size. At 1536px that came to 2,145 for
+# a single page -- more than the entire budget the first attempt allowed.
+#
+# The arithmetic is checked against the processor's actual output below rather
+# than trusted, because a wrong stride would silently mis-filter the corpus.
+
+def _cfg(obj, *names, default=None):
+    for n in names:
+        v = getattr(obj, n, None)
+        if isinstance(v, int):
+            return v
+    return default
+
+
+_patch = _cfg(getattr(model.config, "vision_config", object()), "patch_size", default=14)
+_merge = _cfg(model.config, "spatial_merge_size", default=2)
+_stride = _patch * _merge
+print(f"vision: patch {_patch} x merge {_merge} -> {_stride}px per image token")
+
+
+def estimate_image_tokens(image) -> int:
+    w, h = shrink(image).size
+    return -(-w // _stride) * -(-h // _stride)      # ceil division, both axes
+
+
+_est = estimate_image_tokens(train_ds[0]["image"])
+_actual_prompt = _total - _kept
+print(f"image-token estimate {_est} vs measured prompt {_actual_prompt} "
+      f"(difference is chat-template overhead)")
+if abs(_est - _actual_prompt) > 100:
+    print("  WARNING: estimate is far off. The length filter below may be wrong;"
+          " check patch/merge sizes before trusting the skip count.")
+
+
+def estimate_total_tokens(ex) -> int:
+    text_tokens = len(processor.tokenizer(normalize(ex["text"]))["input_ids"])
+    return estimate_image_tokens(ex["image"]) + text_tokens + 32   # +template
+
+
+def drop_overlong(ds, name):
+    """Remove pages that would exceed MAX_SEQ_TOKENS. Never truncate them."""
+    lengths = [estimate_total_tokens(ds[i]) for i in range(len(ds))]
+    keep = [i for i, n in enumerate(lengths) if n <= MAX_SEQ_TOKENS]
+    dropped = len(ds) - len(keep)
+    print(f"{name}: {len(ds)} pages, tokens min {min(lengths)} "
+          f"median {int(np.median(lengths))} max {max(lengths)}")
+    if dropped:
+        over = [n for n in lengths if n > MAX_SEQ_TOKENS]
+        print(f"  SKIPPED {dropped} page(s) over {MAX_SEQ_TOKENS} tokens "
+              f"(longest {max(over)}) -- not truncated, removed")
+    return ds.select(keep)
+
+
+print("\nscanning page lengths ...")
+train_ds = drop_overlong(train_ds, "train")
+eval_ds = drop_overlong(eval_ds, "eval")
+# The test split is NEVER filtered. Dropping hard pages from the held-out set
+# would flatter the final CER against a baseline measured on all 202.
 
 
 # ══════════════════════════════════════════════════════════════
