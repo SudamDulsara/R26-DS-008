@@ -93,6 +93,7 @@ except ImportError:
 
 import gc
 import json
+import math
 import os
 import random
 import unicodedata
@@ -555,6 +556,18 @@ eval_ds = drop_overlong(eval_ds, "eval")
 #  7. Train
 # ══════════════════════════════════════════════════════════════
 
+# Convert the warmup fraction into an explicit step count.
+#
+# transformers 5.x deprecates warmup_ratio ("will be removed in v5.2"), and a
+# silently ignored argument here would mean no warmup at all -- the opposite
+# of the ByT5 problem but just as invisible. Computing it keeps the intent
+# (5% of the run) while passing the argument that is actually supported.
+_steps_per_epoch = math.ceil(len(train_ds) / (BATCH_SIZE * GRAD_ACCUM))
+_total_steps = _steps_per_epoch * EPOCHS
+WARMUP_STEPS = max(5, round(_total_steps * WARMUP_RATIO))
+print(f"\nschedule: {_total_steps} optimiser steps over {EPOCHS} epoch(s), "
+      f"{WARMUP_STEPS} of them warmup ({100 * WARMUP_STEPS / _total_steps:.0f}%)")
+
 args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
@@ -562,7 +575,7 @@ args = TrainingArguments(
     gradient_accumulation_steps=GRAD_ACCUM,
     learning_rate=LEARNING_RATE,
     num_train_epochs=EPOCHS,
-    warmup_ratio=WARMUP_RATIO,
+    warmup_steps=WARMUP_STEPS,
 
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
