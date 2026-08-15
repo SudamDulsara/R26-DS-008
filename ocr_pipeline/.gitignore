@@ -52,6 +52,10 @@ data/eval/
 # Downloaded gazette PDFs (re-fetchable by build_gazette_pairs.py)
 data/gazette_pdfs/
 
+# acts-1010 page images + transcriptions (~872 MB, CC-BY-4.0, re-downloadable
+# from HuggingFace: avishadilhara/sinhala-ocr-lk-acts-1010)
+data/acts1010/
+
 # SQLite database of saved pipeline runs (export to CSV for submission)
 *.db
 *.sqlite

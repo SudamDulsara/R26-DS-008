@@ -7,10 +7,6 @@
 #
 #   python -m venv venv
 #   venv\Scripts\python.exe -m pip install -r requirements.txt
-#
-# Note: use `venv\Scripts\python.exe -m pip`, not `venv\Scripts\pip.exe` —
-# the bundled pip.exe still resolves to an older venv path and reports the
-# wrong package list.
 
 # ── Application ────────────────────────────────────────────────
 streamlit==1.57.0
