@@ -81,6 +81,28 @@ _ensure("jiwer")
 _ensure("peft")
 _ensure("bitsandbytes")
 
+# Kaggle ships torchao 0.10.0. peft probes for it when building a LoRA layer
+# and RAISES ImportError if the version is below 0.16 rather than simply
+# reporting it as unavailable, which kills PeftModel.from_pretrained().
+# Nothing here uses torchao, so remove it rather than chase a version.
+#
+# Checked through package metadata, not by importing it: importing would put
+# it in sys.modules and peft might still find it after the uninstall.
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    _tv = _pkg_version("torchao")
+    if tuple(int(x) for x in _tv.split(".")[:2]) < (0, 16):
+        print(f"removing incompatible torchao {_tv} (peft raises on it) ...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"],
+            check=False,
+        )
+except PackageNotFoundError:
+    pass
+except Exception as _e:          # version string in an unexpected shape
+    print(f"torchao version check skipped: {_e}")
+
 # Check the model class exists before doing anything expensive.
 try:
     from transformers import LightOnOcrForConditionalGeneration  # noqa: F401
@@ -208,6 +230,25 @@ GRAD_ACCUM = 8          # effective batch of 8
 LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
 EPOCHS = 3
 SEED = 42
+
+#: "fp16" or "fp32". Set PRECISION=fp32 in the environment to switch.
+#:
+#: The first smoke test returned validation loss `nan` in fp16. The comment
+#: here previously claimed fp16 was safe because the decoder is Qwen3-based;
+#: that was wrong, because the OTHER half of this model is a Pixtral vision
+#: encoder -- Mistral-family, trained in bfloat16, and prone to exactly the
+#: fp16 overflow that destroyed the ByT5 run.
+#:
+#: Two changes below target that directly: the vision encoder is no longer
+#: quantised to 4 bits, and a forward pass is checked for a finite loss before
+#: any training starts. If the check still reports nan, set PRECISION=fp32 --
+#: roughly half the speed, but the T4 is Turing and has no bf16 to fall back
+#: on, so fp32 is the only remaining option.
+PRECISION = os.environ.get("PRECISION", "fp16")
+if PRECISION not in ("fp16", "fp32"):
+    sys.exit(f"PRECISION must be fp16 or fp32, got {PRECISION!r}")
+DTYPE = torch.float32 if PRECISION == "fp32" else torch.float16
+print(f"precision: {PRECISION}")
 
 #: 5% of the run, not 41% of it.
 #:
@@ -346,39 +387,81 @@ print(f"original page size: {_sample.size} -> after shrink: {shrink(_sample).siz
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
+#: Parts that must NOT be quantised to 4 bits.
+#:
+#: The model is two towers (verified by inspecting its module tree):
+#:     model.vision_encoder     PixtralVisionModel, 24 layers
+#:     model.vision_projection  LightOnOcrMultiModalProjector
+#:     model.language_model     Qwen3Model
+#:
+#: Crushing a vision encoder to 4 bits is the usual cause of nan in VLM QLoRA,
+#: and it is also self-defeating here: reading Sinhala diacritics is precisely
+#: a fine visual discrimination task. The encoder is a quarter of the model,
+#: so leaving it in fp16 costs a few hundred MB and buys both stability and
+#: accuracy. lm_head is left alone for the usual reason -- quantising the
+#: output projection degrades generation quality out of proportion to its size.
+NO_QUANT = ["vision_encoder", "vision_projection", "lm_head"]
+
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_compute_dtype=DTYPE,
+    llm_int8_skip_modules=NO_QUANT,
 )
 
 model = LightOnOcrForConditionalGeneration.from_pretrained(
     MODEL_NAME,
     quantization_config=quant_config,
-    dtype=torch.float16,
+    dtype=DTYPE,
     device_map={"": 0},
 )
 
 model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 model.config.use_cache = False       # incompatible with gradient checkpointing
 
-# Adapt the text decoder, not the vision encoder. The encoder already reads
-# printed glyphs well -- it was trained on documents. What it has never had to
-# do is emit Sinhala, and that is the decoder's job. Adapting only the decoder
-# also roughly halves the trainable parameters.
+# Adapt the text decoder, not the vision encoder.
+#
+# This must be a REGEX, not a list of bare names. Both towers use the same
+# leaf names -- q_proj, gate_proj and the rest appear in the Pixtral encoder
+# as well as in Qwen3 -- and peft matches a plain list by name suffix. The
+# earlier list-of-names version therefore attached LoRA to the vision encoder
+# too, silently doing the opposite of what this comment claimed.
+#
+# Anchoring on `language_model` restricts adaptation to the decoder, which is
+# where the real gap is: the encoder was trained to read documents and can
+# already see the glyphs, but nothing in this model has ever had to EMIT
+# Sinhala.
+#
+# If accuracy disappoints, adding the projector (linear_1, linear_2,
+# merging_layer) is the next lever to try -- it is the bridge between what the
+# encoder sees and what the decoder says.
+LORA_TARGETS = (
+    r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+)
+
 lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
+    target_modules=LORA_TARGETS,
 )
 
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
+
+# Verify the regex hit the decoder and nothing else. A silent miss here would
+# either train nothing or train the wrong tower.
+_adapted = [n for n, _ in model.named_modules() if n.endswith("lora_A.default")]
+_vision_hits = [n for n in _adapted if "vision" in n]
+print(f"LoRA attached to {len(_adapted)} modules; "
+      f"{len(_vision_hits)} of them in the vision encoder")
+if not _adapted:
+    sys.exit("LoRA matched nothing. Check LORA_TARGETS against the module names.")
+if _vision_hits:
+    print("  WARNING: vision modules were adapted; the regex is too loose.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -474,6 +557,29 @@ print(f"probe example: {_total} tokens, {_kept} of them supervised "
       f"({_total - _kept} are image + prompt)")
 if _kept == 0:
     sys.exit("Prompt masking removed every label. Fix build_texts() before training.")
+
+# Does a forward pass actually produce a finite loss?
+#
+# The first smoke test reported validation loss `nan` and only found out after
+# training. This asks the same question in two seconds, before anything is
+# committed. A nan here means the numbers are overflowing in the forward pass,
+# not that training diverged -- and on a Turing card the answer is fp32.
+with torch.no_grad():
+    _out = model(**{k: v.to(model.device) for k, v in _probe.items()})
+_probe_loss = float(_out.loss)
+print(f"probe forward loss: {_probe_loss:.4f}")
+del _out
+gc.collect()
+torch.cuda.empty_cache()
+
+if not math.isfinite(_probe_loss):
+    sys.exit(
+        f"\nForward pass produced {_probe_loss} in {PRECISION}.\n"
+        "The activations are overflowing before training even begins.\n"
+        "Re-run with PRECISION=fp32 in the first cell:\n"
+        "    os.environ['PRECISION'] = 'fp32'\n"
+        "It is roughly half the speed, but the T4 has no bf16 to fall back on."
+    )
 
 
 # ── How long is a page, in tokens? ──────────────────────────────────
@@ -587,7 +693,7 @@ args = TrainingArguments(
     metric_for_best_model="eval_loss",
     greater_is_better=False,
 
-    fp16=True,
+    fp16=(PRECISION == "fp16"),
     bf16=False,          # T4 is Turing; no bf16 support exists on this card
 
     logging_steps=5,     # ~265 steps total, so log often
@@ -640,7 +746,7 @@ torch.cuda.empty_cache()
 
 print("\nmerging adapter into fp16 weights for evaluation ...")
 _base = LightOnOcrForConditionalGeneration.from_pretrained(
-    MODEL_NAME, dtype=torch.float16, device_map={"": 0},
+    MODEL_NAME, dtype=DTYPE, device_map={"": 0},
 )
 infer_model = PeftModel.from_pretrained(_base, OUTPUT_DIR).merge_and_unload()
 infer_model.eval()
