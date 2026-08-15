@@ -91,6 +91,7 @@ except ImportError:
     print("\n*** If the kernel restarts now, simply run this cell again. ***\n")
     from transformers import LightOnOcrForConditionalGeneration  # noqa: F401
 
+import gc
 import json
 import os
 import random
@@ -111,7 +112,12 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from jiwer import cer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    PeftModel,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from PIL import Image
 from transformers import (
     AutoProcessor,
@@ -136,26 +142,49 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 #: under the same conditions as everything else you report.
 TESSERACT_BASELINE = 0.1079
 
-#: How many tokens the model may GENERATE when reading a page.
-#: Longest page transcription in the 202 test pages is ~4,300 bytes; pages
-#: average ~39 lines of ~105 bytes. 2048 clears that with room to spare.
+#: THE KEY MEASUREMENT BEHIND THE TWO LIMITS BELOW
 #:
-#: This is a cap on the reply only. It is NOT the sequence length -- see
-#: MAX_SEQ_TOKENS below. Confusing the two is what broke the first run.
-MAX_TARGET_TOKENS = 2048
+#: This tokenizer costs 1.41 tokens per Sinhala character -- close to
+#: byte-level, because Qwen3's vocabulary has little Sinhala in it. Measured
+#: over the 202 test pages with the real tokenizer:
+#:
+#:     characters per page   mean 1,609   max 3,198
+#:     TOKENS per page       mean 2,265   median 2,131   p95 3,534   max 4,446
+#:
+#: Both limits were first set from a guess of ~1,200 tokens a page. That guess
+#: was wrong by a factor of two and it broke both of them.
+
+#: How many tokens the model may GENERATE when reading a page.
+#:
+#: Must clear the longest page outright. At 2048 -- the first value here --
+#: about half of all pages would have stopped mid-sentence, and their CER
+#: would have measured the cap rather than the model. 4608 clears the longest
+#: page seen (4,446) with margin.
+#:
+#: Raising it costs nothing on normal pages: generation stops at the
+#: end-of-sequence token, not at the cap.
+MAX_TARGET_TOKENS = 4608
 
 #: Ceiling on the WHOLE sequence: image tokens + prompt + page text.
 #:
-#: A page image is not free. At MAX_IMAGE_EDGE=1536 one page becomes ~2,145
-#: image tokens before a single character of text is counted, so a typical
-#: training example is ~3,400 tokens long.
+#: A page image is not free. At MAX_IMAGE_EDGE=1536 one page becomes 2,145
+#: image tokens before a single character is counted, so a typical training
+#: example is ~4,300 tokens.
 #:
-#: Pages estimated to exceed this are SKIPPED and counted, never truncated.
-#: Truncating would cut into the image tokens and desynchronise them from the
-#: text -- which is precisely how the first attempt failed. It would also
-#: violate this project's own rule: never truncate silently, skip or flag and
-#: log every occurrence.
-MAX_SEQ_TOKENS = 4096
+#: Measured share of pages that would be dropped, by cap:
+#:
+#:     image edge 1024 (962 img tokens):   4096 -> 12%    6144 -> 0%
+#:     image edge 1536 (2145 img tokens):  4096 -> 70%    6144 -> 2%
+#:     image edge 2048 (3848 img tokens):  4096 -> 100%   6144 -> 39%
+#:
+#: 4096 was the first value here and would have silently trained on 30% of
+#: the corpus. 6144 keeps 98% of it.
+#:
+#: Pages over this are SKIPPED and counted, never truncated. Truncating cuts
+#: into the image tokens and desynchronises them from the text -- which is
+#: exactly how the first run died -- and it would violate this project's own
+#: rule: never truncate silently, skip or flag and log every occurrence.
+MAX_SEQ_TOKENS = 6144
 
 #: Cap on the longer image edge, in pixels.
 #:
@@ -470,8 +499,20 @@ _stride = _patch * _merge
 print(f"vision: patch {_patch} x merge {_merge} -> {_stride}px per image token")
 
 
+def shrunk_size(image):
+    """The size shrink() would produce, without doing the resize."""
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= MAX_IMAGE_EDGE:
+        return w, h
+    scale = MAX_IMAGE_EDGE / longest
+    return int(w * scale), int(h * scale)
+
+
 def estimate_image_tokens(image) -> int:
-    w, h = shrink(image).size
+    # Arithmetic only. Calling shrink() here would run a full LANCZOS resize
+    # on all 808 pages purely to read two numbers off the result.
+    w, h = shrunk_size(image)
     return -(-w // _stride) * -(-h // _stride)      # ceil division, both axes
 
 
@@ -570,8 +611,29 @@ print(f"\nAdapter saved to {OUTPUT_DIR}/ -- download this folder.")
 
 EVAL_LIMIT = int(os.environ.get("EVAL_LIMIT", "0"))
 
-model.eval()
-model.config.use_cache = True
+# Swap the quantised training model for merged fp16 weights before measuring.
+#
+# Each page needs ~2,265 generated tokens, and 4-bit inference through
+# bitsandbytes is slow -- it trades speed for the memory that made training
+# possible at all. Over 202 pages that difference is hours, not minutes.
+#
+# Folding the adapter into plain fp16 weights gives the same model
+# mathematically, at roughly twice the speed. A 1B model in fp16 is ~2 GB and
+# fits comfortably now that the optimiser state is gone.
+
+del trainer, model
+gc.collect()
+torch.cuda.empty_cache()
+
+print("\nmerging adapter into fp16 weights for evaluation ...")
+_base = LightOnOcrForConditionalGeneration.from_pretrained(
+    MODEL_NAME, dtype=torch.float16, device_map={"": 0},
+)
+infer_model = PeftModel.from_pretrained(_base, OUTPUT_DIR).merge_and_unload()
+infer_model.eval()
+infer_model.config.use_cache = True
+print(f"eval model on {infer_model.device}, "
+      f"{torch.cuda.memory_allocated() / 1e9:.1f} GB allocated")
 
 
 @torch.no_grad()
@@ -582,9 +644,9 @@ def read_page(image):
     )
     inputs = processor(
         images=[shrink(image)], text=[prompt_text], return_tensors="pt"
-    ).to(model.device)
+    ).to(infer_model.device)
 
-    out = model.generate(
+    out = infer_model.generate(
         **inputs,
         max_new_tokens=MAX_TARGET_TOKENS,
         do_sample=False,            # greedy: reading a page is not creative
