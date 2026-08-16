@@ -29,3 +29,6 @@ news-pipeline = "news_pipeline.cli:main"
 where = ["."]
 include = ["news_pipeline*"]
 exclude = ["news_pipeline.tests*", "news_pipeline.evaluation*"]
+
+[tool.setuptools.package-data]
+news_pipeline = ["pipeline_config.json"]

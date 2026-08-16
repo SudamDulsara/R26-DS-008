@@ -25,10 +25,10 @@ def build_parser():
     discover_parser.add_argument(
         "--feed-pages",
         type=int,
-        default=1,
+        default=None,
         help=(
-            "WordPress feed pages to inspect per source (default: 1); "
-            "non-WordPress feeds remain single-page"
+            "Optional WordPress feed-page ceiling; by default discovery "
+            "uses the configured adaptive checkpoint limit"
         ),
     )
     extract_parser = subparsers.add_parser(

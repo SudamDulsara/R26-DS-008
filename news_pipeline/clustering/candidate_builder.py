@@ -20,6 +20,7 @@ def build_candidate_pairs(
     min_lexical_overlap: float,
 ) -> list[CandidatePair]:
     candidates: list[CandidatePair] = []
+    lexical_filter_enabled = min_lexical_overlap > 0.0
     sorted_articles = sorted(
         articles,
         key=lambda article: article.event_time or datetime.max,
@@ -34,9 +35,14 @@ def build_candidate_pairs(
             if not allow_same_source_pairs and left.source == right.source:
                 continue
 
-            overlap = lexical_overlap(left.similarity_text, right.similarity_text)
-            if overlap < min_lexical_overlap:
-                continue
+            overlap = 0.0
+            if lexical_filter_enabled:
+                overlap = lexical_overlap(
+                    left.similarity_text,
+                    right.similarity_text,
+                )
+                if overlap < min_lexical_overlap:
+                    continue
 
             candidates.append(
                 CandidatePair(

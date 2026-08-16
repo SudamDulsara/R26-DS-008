@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 
 RUN_METRICS_VERSION = "pipeline_run_metrics_v1"
-RUN_HEALTH_REPORT_VERSION = "pipeline_run_health_v1"
+RUN_HEALTH_REPORT_VERSION = "pipeline_run_health_v3"
 
 
 def _now() -> str:
@@ -100,10 +100,11 @@ def _stage_counts(
     if stage_name == "cleaning":
         output = _integer(result.get("cleaned_articles"))
         failed = _integer(result.get("rejected_articles"))
+        skipped = _integer(result.get("unsupported_media_articles"))
         return {
-            "input": output + failed,
+            "input": output + failed + skipped,
             "output": output,
-            "skipped": 0,
+            "skipped": skipped,
             "failed": failed,
         }
     if stage_name == "deduplication":
@@ -131,13 +132,19 @@ def _stage_counts(
             "failed": 0,
         }
     if stage_name == "unification":
+        budget_deferred = _integer(result.get("budget_deferred"))
         return {
             "input": _integer(result.get("clusters_seen")),
             "output": _integer(result.get("accepted")),
-            "skipped": _integer(result.get("cache_hits")),
-            "failed": (
-                _integer(result.get("fallbacks"))
-                + _integer(result.get("invalid_inputs"))
+            "skipped": (
+                _integer(result.get("cache_hits")) + budget_deferred
+            ),
+            # Budget deferrals are safe, retryable outcomes rather than bad
+            # provider results. Invalid inputs are already included in the
+            # current-run fallback count and must not be double-counted.
+            "failed": max(
+                _integer(result.get("fallbacks")) - budget_deferred,
+                0,
             ),
         }
     if stage_name == "export":
@@ -300,6 +307,28 @@ def write_pipeline_health_report(
     if not isinstance(metrics, Mapping):
         raise ValueError("run metrics are required for a health report")
     output_dir.mkdir(parents=True, exist_ok=True)
+    export = stats.get("export")
+    export = export if isinstance(export, Mapping) else {}
+    final = export.get("final_gpt_only_publication")
+    final = final if isinstance(final, Mapping) else {}
+    publication_counts = final.get("counts")
+    publication_counts = (
+        publication_counts
+        if isinstance(publication_counts, Mapping)
+        else {}
+    )
+    publication_reconciliation = final.get("reconciliation")
+    publication_reconciliation = (
+        publication_reconciliation
+        if isinstance(publication_reconciliation, Mapping)
+        else {}
+    )
+    unification = stats.get("unification")
+    unification = unification if isinstance(unification, Mapping) else {}
+    clustering = stats.get("clustering")
+    clustering = clustering if isinstance(clustering, Mapping) else {}
+    extraction = stats.get("extraction")
+    extraction = extraction if isinstance(extraction, Mapping) else {}
     payload = {
         "report_version": RUN_HEALTH_REPORT_VERSION,
         "run_id": int(run_id),
@@ -310,10 +339,150 @@ def write_pipeline_health_report(
         "failed_stage": metrics.get("failed_stage"),
         "gpt_usage": metrics.get("gpt_usage"),
         "stages": metrics.get("stages"),
+        "clustering_embedding_cache": {
+            "enabled": bool(clustering.get("embedding_cache_enabled", True)),
+            "hits": _integer(clustering.get("embedding_cache_hits")),
+            "misses": _integer(clustering.get("embedding_cache_misses")),
+            "encoded_vectors": _integer(
+                clustering.get("embedding_encoded_vectors")
+            ),
+            "lookup_seconds": float(
+                clustering.get("embedding_cache_lookup_seconds") or 0.0
+            ),
+            "model_load_seconds": float(
+                clustering.get("embedding_model_load_seconds") or 0.0
+            ),
+            "encoding_seconds": float(
+                clustering.get("embedding_encoding_seconds") or 0.0
+            ),
+            "write_seconds": float(
+                clustering.get("embedding_cache_write_seconds") or 0.0
+            ),
+            "total_seconds": float(
+                clustering.get("embedding_total_seconds") or 0.0
+            ),
+            "model_name": clustering.get("model_name"),
+            "model_revision": clustering.get("model_revision"),
+        },
+        "extraction_outcomes": {
+            "fresh": {
+                "urls_attempted": _integer(
+                    extraction.get("fresh_urls_attempted")
+                ),
+                "extracted_articles": _integer(
+                    extraction.get("fresh_extracted_articles")
+                ),
+                "fetch_failures": _integer(
+                    extraction.get("fresh_fetch_failures")
+                ),
+                "rejected_articles": _integer(
+                    extraction.get("fresh_rejected_articles")
+                ),
+                "failures_by_source": dict(
+                    extraction.get("fresh_failures_by_source", {})
+                ),
+            },
+            "historical_retries": {
+                "urls_attempted": _integer(
+                    extraction.get("historical_retry_urls_attempted")
+                ),
+                "extracted_articles": _integer(
+                    extraction.get("historical_retry_extracted_articles")
+                ),
+                "fetch_failures": _integer(
+                    extraction.get("historical_retry_fetch_failures")
+                ),
+                "rejected_articles": _integer(
+                    extraction.get("historical_retry_rejected_articles")
+                ),
+                "failures_by_source": dict(
+                    extraction.get(
+                        "historical_retry_failures_by_source",
+                        {},
+                    )
+                ),
+            },
+        },
+        "unification_outcomes": {
+            "current_run_fallbacks": _integer(
+                unification.get("fallbacks")
+            ),
+            "current_run_fallback_reasons": dict(
+                unification.get("fallback_reasons", {})
+            ),
+            "budget_deferred": _integer(
+                unification.get("budget_deferred")
+            ),
+            "provider_failed": _integer(
+                unification.get("provider_failed")
+            ),
+            "audit_provider_failed": _integer(
+                unification.get("audit_provider_failed")
+            ),
+            "audit_rejected": _integer(
+                unification.get("audit_rejected")
+            ),
+            "cached_historical_fallbacks": _integer(
+                unification.get("cached_fallbacks")
+            ),
+            "cached_historical_fallback_reasons": dict(
+                unification.get("cached_fallback_reasons", {})
+            ),
+            "audit_budget_safe_routes": _integer(
+                unification.get("audit_budget_safe_routes")
+            ),
+            "audit_policy_mode": str(
+                unification.get("audit_policy_mode") or "all"
+            ),
+            "audit_policy_effective_mode": str(
+                unification.get("audit_policy_effective_mode") or "all"
+            ),
+            "audit_circuit_breaker": dict(
+                unification.get("audit_circuit_breaker", {})
+            ),
+            "audit_risk_tiers": dict(
+                unification.get("audit_risk_tiers", {})
+            ),
+            "audit_policy_would_skip": _integer(
+                unification.get("audit_policy_would_skip")
+            ),
+            "audit_policy_sampled": _integer(
+                unification.get("audit_policy_sampled")
+            ),
+            "audits_skipped_low_risk": _integer(
+                unification.get("audits_skipped_low_risk")
+            ),
+            "shadow_avoidable_audit_calls": _integer(
+                unification.get("shadow_avoidable_audit_calls")
+            ),
+            "shadow_avoidable_audit_cost_usd": _decimal_string(
+                unification.get("shadow_avoidable_audit_cost_usd")
+            ),
+            "audit_change_levels": dict(
+                unification.get("audit_change_levels", {})
+            ),
+            "audit_change_levels_by_risk": dict(
+                unification.get("audit_change_levels_by_risk", {})
+            ),
+            "semantic_partitions_applied": _integer(
+                unification.get("semantic_partitions_applied")
+            ),
+            "semantic_partition_groups": _integer(
+                unification.get("semantic_partition_groups")
+            ),
+            "semantic_partition_multi_groups": _integer(
+                unification.get("semantic_partition_multi_groups")
+            ),
+            "semantic_partition_singletons": _integer(
+                unification.get("semantic_partition_singletons")
+            ),
+        },
+        "publication": {
+            "counts": dict(publication_counts),
+            "reconciliation": dict(publication_reconciliation),
+        },
         "snapshot_dir": (
-            stats.get("export", {}).get("snapshot_dir")
-            if isinstance(stats.get("export"), Mapping)
-            else None
+            export.get("snapshot_dir")
         ),
     }
     json_path = output_dir / "run_health.json"
@@ -360,8 +529,50 @@ def write_pipeline_health_report(
             )
     gpt = payload["gpt_usage"]
     gpt = gpt if isinstance(gpt, Mapping) else {}
+    embedding_cache = payload["clustering_embedding_cache"]
+    extraction_outcomes = payload["extraction_outcomes"]
+    fresh_extraction = extraction_outcomes["fresh"]
+    historical_extraction = extraction_outcomes["historical_retries"]
+    outcomes = payload["unification_outcomes"]
+    publication = payload["publication"]
+    publication_counts = publication["counts"]
+    reconciliation = publication["reconciliation"]
+    reconciliation_ok = bool(reconciliation) and all(
+        bool(value) for value in reconciliation.values()
+    )
     lines.extend(
         [
+            "",
+            "## Extraction outcomes",
+            "",
+            f"- Fresh URLs attempted: `{fresh_extraction['urls_attempted']}`",
+            f"- Fresh articles extracted: "
+            f"`{fresh_extraction['extracted_articles']}`",
+            f"- Fresh fetch failures: `{fresh_extraction['fetch_failures']}`",
+            f"- Fresh terminal rejections: "
+            f"`{fresh_extraction['rejected_articles']}`",
+            f"- Historical retry URLs attempted: "
+            f"`{historical_extraction['urls_attempted']}`",
+            f"- Historical retries recovered: "
+            f"`{historical_extraction['extracted_articles']}`",
+            f"- Historical retry failures: "
+            f"`{historical_extraction['fetch_failures']}`",
+            f"- Historical retry terminal rejections: "
+            f"`{historical_extraction['rejected_articles']}`",
+            "",
+            "## Clustering embedding cache",
+            "",
+            f"- Enabled: `{str(embedding_cache['enabled']).lower()}`",
+            f"- Cache hits: `{embedding_cache['hits']}`",
+            f"- Cache misses: `{embedding_cache['misses']}`",
+            f"- Encoded vectors: `{embedding_cache['encoded_vectors']}`",
+            f"- Cache lookup seconds: `{embedding_cache['lookup_seconds']}`",
+            f"- Model load seconds: `{embedding_cache['model_load_seconds']}`",
+            f"- Encoding seconds: `{embedding_cache['encoding_seconds']}`",
+            f"- Cache write seconds: `{embedding_cache['write_seconds']}`",
+            f"- Total embedding seconds: `{embedding_cache['total_seconds']}`",
+            f"- Model snapshot: `{embedding_cache['model_name']}@"
+            f"{embedding_cache['model_revision']}`",
             "",
             "## GPT usage for this run",
             "",
@@ -373,6 +584,68 @@ def write_pipeline_health_report(
             f"- Total tokens: `{gpt.get('total_tokens', 0)}`",
             f"- Estimated cost USD: "
             f"`{gpt.get('estimated_cost_usd', '0')}`",
+            "",
+            "## Unification outcomes for this run",
+            "",
+            f"- New fallback decisions: "
+            f"`{outcomes.get('current_run_fallbacks', 0)}`",
+            f"- Safely deferred by budget: "
+            f"`{outcomes.get('budget_deferred', 0)}`",
+            f"- Primary provider failures: "
+            f"`{outcomes.get('provider_failed', 0)}`",
+            f"- Audit provider failures: "
+            f"`{outcomes.get('audit_provider_failed', 0)}`",
+            f"- Audit model rejections: "
+            f"`{outcomes.get('audit_rejected', 0)}`",
+            f"- Historical cached fallback states encountered: "
+            f"`{outcomes.get('cached_historical_fallbacks', 0)}`",
+            f"- Budget-safe Luna audit routes: "
+            f"`{outcomes.get('audit_budget_safe_routes', 0)}`",
+            f"- Audit policy mode: "
+            f"`{outcomes.get('audit_policy_mode', 'all')}`",
+            f"- Effective audit policy mode: "
+            f"`{outcomes.get('audit_policy_effective_mode', 'all')}`",
+            f"- Audit circuit breaker: "
+            f"`{json.dumps(outcomes.get('audit_circuit_breaker', {}), sort_keys=True)}`",
+            f"- Audit risk tiers: "
+            f"`{json.dumps(outcomes.get('audit_risk_tiers', {}), sort_keys=True)}`",
+            f"- Candidates the risk policy would skip: "
+            f"`{outcomes.get('audit_policy_would_skip', 0)}`",
+            f"- Stable low-risk quality samples: "
+            f"`{outcomes.get('audit_policy_sampled', 0)}`",
+            f"- Audits actually skipped as low risk: "
+            f"`{outcomes.get('audits_skipped_low_risk', 0)}`",
+            f"- Shadow audits potentially avoidable: "
+            f"`{outcomes.get('shadow_avoidable_audit_calls', 0)}`",
+            f"- Shadow avoidable audit cost USD: "
+            f"`{outcomes.get('shadow_avoidable_audit_cost_usd', '0')}`",
+            f"- Model-reported audit change levels: "
+            f"`{json.dumps(outcomes.get('audit_change_levels', {}), sort_keys=True)}`",
+            f"- Embedding clusters semantically partitioned: "
+            f"`{outcomes.get('semantic_partitions_applied', 0)}`",
+            f"- Resulting same-event groups: "
+            f"`{outcomes.get('semantic_partition_groups', 0)}` "
+            f"(`{outcomes.get('semantic_partition_multi_groups', 0)}` "
+            f"multi-article, "
+            f"`{outcomes.get('semantic_partition_singletons', 0)}` "
+            f"necessary singleton)",
+            "",
+            "## Current publication outcomes",
+            "",
+            f"- Published stories: "
+            f"`{publication_counts.get('final_unified_stories', 0)}`",
+            f"- GPT-unified stories: "
+            f"`{publication_counts.get('gpt_unified_stories', 0)}`",
+            f"- Singleton passthrough stories: "
+            f"`{publication_counts.get('singleton_passthrough_stories', 0)}`",
+            f"- Evidence-safe fallback stories: "
+            f"`{publication_counts.get('evidence_safe_fallback_stories', 0)}`",
+            f"- Published source articles: "
+            f"`{publication_counts.get('final_story_sources', 0)}`",
+            f"- Explicit nonpublishable states: "
+            f"`{publication_counts.get('explicit_nonpublishable_states', 0)}`",
+            f"- Publication reconciliation passed: "
+            f"`{str(reconciliation_ok).lower()}`",
             "",
         ]
     )

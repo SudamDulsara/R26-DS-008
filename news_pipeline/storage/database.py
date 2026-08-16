@@ -97,6 +97,40 @@ def _backfill_pipeline_snapshot_state(cursor) -> None:
         )
 
 
+def _backfill_semantic_pair_constraints(connection) -> None:
+    from news_pipeline.clustering.semantic_constraints import (
+        persist_different_event_constraints,
+    )
+
+    rows = connection.execute(
+        """
+        SELECT cluster_key, output_json, autonomous_audit_route_json,
+               updated_at
+        FROM unified_story_versions
+        WHERE fallback_reason = 'semantic_partition_applied'
+          AND output_json IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            output = json.loads(str(row["output_json"]))
+            route = json.loads(
+                str(row["autonomous_audit_route_json"] or "{}")
+            )
+            groups = output["article_groups"]
+            if output.get("cluster_coherence") != "partition_required":
+                continue
+            persist_different_event_constraints(
+                connection,
+                groups=groups,
+                audit_version=str(route.get("audit_version") or "unknown"),
+                source_cluster_key=str(row["cluster_key"]),
+                created_at=str(row["updated_at"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+
 def initialize_db():
     config = load_config()
     conn = get_connection(config)
@@ -166,6 +200,19 @@ def initialize_db():
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS source_discovery_checkpoints (
+            source TEXT PRIMARY KEY,
+            covered_through TEXT NOT NULL,
+            last_success_at TEXT NOT NULL,
+            coverage_status TEXT NOT NULL,
+            boundary_url TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS story_clusters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cluster_key TEXT UNIQUE NOT NULL,
@@ -218,6 +265,25 @@ def initialize_db():
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS clustering_embedding_cache (
+            input_fingerprint_sha256 TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            model_revision TEXT NOT NULL,
+            dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+            vector_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (
+                input_fingerprint_sha256,
+                model_name,
+                model_revision
+            )
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS story_cluster_transitions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transition_batch_id TEXT NOT NULL,
@@ -234,6 +300,25 @@ def initialize_db():
                 old_cluster_key,
                 new_cluster_key
             )
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS semantic_pair_constraints (
+            left_article_id INTEGER NOT NULL,
+            right_article_id INTEGER NOT NULL,
+            left_content_sha256 TEXT NOT NULL,
+            right_content_sha256 TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision = 'different_event'),
+            audit_version TEXT NOT NULL,
+            source_cluster_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (left_article_id, right_article_id),
+            CHECK (left_article_id < right_article_id),
+            FOREIGN KEY (left_article_id) REFERENCES articles(id),
+            FOREIGN KEY (right_article_id) REFERENCES articles(id)
         )
         """
     )
@@ -445,6 +530,18 @@ def initialize_db():
         "last_attempted_at TEXT",
     )
     _ensure_column(cursor, "discovered_urls", "fetched_at", "fetched_at TEXT")
+    _ensure_column(
+        cursor,
+        "discovered_urls",
+        "discovery_method",
+        "discovery_method TEXT DEFAULT 'rss'",
+    )
+    _ensure_column(
+        cursor,
+        "discovered_urls",
+        "rss_summary",
+        "rss_summary TEXT",
+    )
 
     _ensure_column(cursor, "articles", "raw_html", "raw_html TEXT")
     _ensure_column(cursor, "articles", "title_source", "title_source TEXT")
@@ -489,6 +586,12 @@ def initialize_db():
     )
     _ensure_column(cursor, "articles", "cleaned_at", "cleaned_at TEXT")
     _ensure_column(cursor, "articles", "exported_at", "exported_at TEXT")
+    _ensure_column(
+        cursor,
+        "articles",
+        "extraction_method",
+        "extraction_method TEXT",
+    )
     _ensure_column(
         cursor,
         "pipeline_runs",
@@ -607,6 +710,12 @@ def initialize_db():
     )
     cursor.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_discovered_urls_source_published
+        ON discovered_urls(source, rss_published)
+        """
+    )
+    cursor.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_articles_clean_status
         ON articles(clean_status)
         """
@@ -649,6 +758,12 @@ def initialize_db():
     )
     cursor.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_clustering_embedding_cache_model
+        ON clustering_embedding_cache(model_name, model_revision)
+        """
+    )
+    cursor.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_story_cluster_transitions_old
         ON story_cluster_transitions(old_cluster_key, created_at)
         """
@@ -657,6 +772,12 @@ def initialize_db():
         """
         CREATE INDEX IF NOT EXISTS idx_story_cluster_transitions_new
         ON story_cluster_transitions(new_cluster_key, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_semantic_pair_constraints_decision
+        ON semantic_pair_constraints(decision, left_article_id, right_article_id)
         """
     )
     cursor.execute(
@@ -881,6 +1002,7 @@ def initialize_db():
         (CLEAN_STATUS_CLEANED, DEDUPE_STATUS_UNIQUE),
     )
 
+    _backfill_semantic_pair_constraints(conn)
     conn.commit()
     conn.close()
 

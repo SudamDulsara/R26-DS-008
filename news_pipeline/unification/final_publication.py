@@ -386,6 +386,98 @@ def _write_csv(
         writer.writerows(rows)
 
 
+def _article_dispositions(connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            discovered.id AS discovered_url_id,
+            discovered.url,
+            discovered.source,
+            discovered.discovered_at,
+            discovered.discovery_method,
+            discovered.status AS url_status,
+            discovered.last_error_code,
+            article.id AS article_id,
+            COALESCE(article.title, discovered.rss_title) AS title,
+            COALESCE(
+                article.published_date,
+                discovered.rss_published
+            ) AS published_date,
+            article.clean_status,
+            article.dedupe_status,
+            article.quality_flags,
+            article.duplicate_of_id,
+            published.story_id,
+            duplicate_published.story_id AS duplicate_story_id
+        FROM discovered_urls AS discovered
+        LEFT JOIN articles AS article ON article.url = discovered.url
+        LEFT JOIN final_story_sources AS published
+          ON published.article_id = article.id
+        LEFT JOIN final_story_sources AS duplicate_published
+          ON duplicate_published.article_id = article.duplicate_of_id
+        ORDER BY discovered.id
+        """
+    ).fetchall()
+    dispositions = []
+    for row in rows:
+        reason_codes = []
+        if row["story_id"] is not None:
+            disposition = "published"
+        elif row["dedupe_status"] == "exact_duplicate":
+            disposition = "exact_duplicate"
+            reason_codes.append("exact_content_duplicate")
+        elif row["clean_status"] == "retryable_extraction" or row[
+            "last_error_code"
+        ] == "article_body_incomplete":
+            disposition = "extraction_incomplete"
+            reason_codes.append("article_body_incomplete")
+        elif row["clean_status"] == "unsupported_media":
+            disposition = "unsupported_media"
+            try:
+                reason_codes.extend(json.loads(row["quality_flags"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                reason_codes.append("unsupported_image_only_media")
+        elif row["clean_status"] in {"quality_quarantine", "rejected"}:
+            disposition = "quality_quarantine"
+            try:
+                reason_codes.extend(json.loads(row["quality_flags"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                reason_codes.append("quality_status_unparseable")
+        elif row["url_status"] in {"discovered", "fetch_failed"}:
+            disposition = "pending_retry"
+            if row["last_error_code"]:
+                reason_codes.append(str(row["last_error_code"]))
+        elif row["url_status"] in {"exhausted", "rejected"}:
+            disposition = "fetch_failed"
+            if row["last_error_code"]:
+                reason_codes.append(str(row["last_error_code"]))
+        elif row["clean_status"] == "pending":
+            disposition = "pending_cleaning"
+        elif row["dedupe_status"] == "pending":
+            disposition = "pending_deduplication"
+        else:
+            disposition = "not_published"
+            reason_codes.append("unclassified_pipeline_state")
+        dispositions.append(
+            {
+                "discovered_url_id": int(row["discovered_url_id"]),
+                "article_id": row["article_id"],
+                "publisher": row["source"],
+                "title": row["title"],
+                "url": row["url"],
+                "published_date": row["published_date"],
+                "discovered_at": row["discovered_at"],
+                "discovery_method": row["discovery_method"],
+                "disposition": disposition,
+                "story_id": row["story_id"],
+                "duplicate_of_article_id": row["duplicate_of_id"],
+                "duplicate_story_id": row["duplicate_story_id"],
+                "reason_codes_json": _json(sorted(set(reason_codes))),
+            }
+        )
+    return dispositions
+
+
 def materialize_gpt_only_publication(
     *,
     output_dir: Union[str, Path],
@@ -423,6 +515,7 @@ def materialize_gpt_only_publication(
     internal_review_override_story_ids: list[str] = []
     singleton_passthrough_story_ids: list[str] = []
     evidence_safe_fallback_story_ids: list[str] = []
+    dispositions: list[dict[str, Any]] = []
     try:
         candidates = _load_generation_candidates(
             connection,
@@ -859,6 +952,7 @@ def materialize_gpt_only_publication(
             states,
         )
         connection.commit()
+        dispositions = _article_dispositions(connection)
     except Exception:
         connection.rollback()
         raise
@@ -870,6 +964,7 @@ def materialize_gpt_only_publication(
     claim_path = selected_dir / "final_story_claims.csv"
     conflict_path = selected_dir / "final_story_conflicts.csv"
     state_path = selected_dir / "final_story_publication_states.csv"
+    disposition_path = selected_dir / "article_processing_disposition.csv"
     _write_csv(
         story_path,
         [
@@ -932,6 +1027,25 @@ def materialize_gpt_only_publication(
         ],
         states,
     )
+    _write_csv(
+        disposition_path,
+        [
+            "discovered_url_id",
+            "article_id",
+            "publisher",
+            "title",
+            "url",
+            "published_date",
+            "discovered_at",
+            "discovery_method",
+            "disposition",
+            "story_id",
+            "duplicate_of_article_id",
+            "duplicate_story_id",
+            "reason_codes_json",
+        ],
+        dispositions,
+    )
     status_counts = {
         status: sum(
             row["publication_status"] == status for row in states
@@ -939,6 +1053,10 @@ def materialize_gpt_only_publication(
         for status in sorted(
             {str(row["publication_status"]) for row in states}
         )
+    }
+    disposition_counts = {
+        disposition: sum(row["disposition"] == disposition for row in dispositions)
+        for disposition in sorted({str(row["disposition"]) for row in dispositions})
     }
     manifest_path = selected_dir / "final_publication_manifest.json"
     manifest = {
@@ -1055,6 +1173,8 @@ def materialize_gpt_only_publication(
             "final_story_conflicts": len(conflicts),
             "explicit_nonpublishable_states": len(states) - len(stories),
             "publication_statuses": status_counts,
+            "article_dispositions": disposition_counts,
+            "discovered_urls": len(dispositions),
         },
         "reconciliation": {
             "every_cluster_has_one_state": len(states) == len(candidates),
@@ -1070,6 +1190,12 @@ def materialize_gpt_only_publication(
                 == GPT_PUBLICATION_STATUS_PUBLISHABLE
                 for state in states
                 if state["story_id"] in story_ids
+            ),
+            "every_discovered_url_has_disposition": all(
+                bool(row["disposition"]) for row in dispositions
+            ),
+            "published_article_dispositions_match_sources": (
+                disposition_counts.get("published", 0) == len(sources)
             ),
         },
         "paths": {
@@ -1088,6 +1214,9 @@ def materialize_gpt_only_publication(
             "final_story_publication_states": str(
                 published_dir / state_path.name
             ),
+            "article_processing_disposition": str(
+                published_dir / disposition_path.name
+            ),
             "manifest": str(published_dir / manifest_path.name),
         },
         "artifact_sha256": {
@@ -1096,6 +1225,7 @@ def materialize_gpt_only_publication(
             "final_story_claims": _sha256(claim_path),
             "final_story_conflicts": _sha256(conflict_path),
             "final_story_publication_states": _sha256(state_path),
+            "article_processing_disposition": _sha256(disposition_path),
         },
     }
     fingerprint_payload = {

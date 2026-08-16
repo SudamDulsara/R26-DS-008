@@ -9,7 +9,7 @@ from news_pipeline.config import PipelineConfig, load_config
 from news_pipeline.storage.database import get_connection
 
 
-PIPELINE_STATUS_VERSION = "pipeline_operational_status_v2"
+PIPELINE_STATUS_VERSION = "pipeline_operational_status_v3"
 
 
 def _counts_by(connection, table: str, column: str) -> dict[str, int]:
@@ -97,6 +97,12 @@ def build_pipeline_status(
                 "autonomous_audit_enabled": (
                     selected_config.gpt_autonomous_audit_enabled
                 ),
+                "autonomous_audit_policy_mode": (
+                    selected_config.gpt_audit_policy_mode
+                ),
+                "low_risk_audit_sample_rate": (
+                    selected_config.gpt_low_risk_audit_sample_rate
+                ),
                 "autonomous_audit_model": (
                     selected_config.gpt_audit_model
                 ),
@@ -158,7 +164,7 @@ def build_pipeline_status(
                     "gpt_unification_review_queue",
                     "queue_status",
                 ),
-                "actionable_gpt_review_queue_items": int(
+                "unreviewed_gpt_queue_rows": int(
                     connection.execute(
                         """
                         SELECT COUNT(*)
@@ -199,10 +205,15 @@ def build_pipeline_status(
         "pending_gpt_reviews": status["counts"][
             "final_publication_statuses"
         ].get("pending_review", 0),
-        "pending_review_queue_items": (
+        "manual_review_required_items": (
             0
             if selected_config.gpt_autonomous_audit_enabled
-            else status["counts"]["actionable_gpt_review_queue_items"]
+            else status["counts"]["unreviewed_gpt_queue_rows"]
+        ),
+        "autonomous_recovery_queue_rows": (
+            status["counts"]["unreviewed_gpt_queue_rows"]
+            if selected_config.gpt_autonomous_audit_enabled
+            else 0
         ),
         "autonomous_safe_fallbacks": status["counts"][
             "evidence_safe_fallback_stories"
