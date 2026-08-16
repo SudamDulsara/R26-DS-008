@@ -113,6 +113,7 @@ except ImportError:
     print("\n*** If the kernel restarts now, simply run this cell again. ***\n")
     from transformers import LightOnOcrForConditionalGeneration  # noqa: F401
 
+import contextlib
 import gc
 import json
 import math
@@ -143,6 +144,7 @@ from peft import (
 )
 from PIL import Image
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     BitsAndBytesConfig,
     Trainer,
@@ -231,24 +233,44 @@ LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
 EPOCHS = 3
 SEED = 42
 
-#: "fp16" or "fp32". Set PRECISION=fp32 in the environment to switch.
+#: How numbers are represented. Three modes, tried in this order by default.
 #:
-#: The first smoke test returned validation loss `nan` in fp16. The comment
-#: here previously claimed fp16 was safe because the decoder is Qwen3-based;
-#: that was wrong, because the OTHER half of this model is a Pixtral vision
-#: encoder -- Mistral-family, trained in bfloat16, and prone to exactly the
-#: fp16 overflow that destroyed the ByT5 run.
+#:   name    weights   matmuls   notes
+#:   ------  --------  --------  ------------------------------------------
+#:   fp16    fp16      fp16      fastest; OVERFLOWED on this model (nan)
+#:   amp     fp32      fp16      master weights fp32, autocast for matmuls;
+#:                               softmax/layernorm/loss stay fp32, which is
+#:                               where fp16 actually overflows
+#:   fp32    fp32      fp32      slowest, always stable
 #:
-#: Two changes below target that directly: the vision encoder is no longer
-#: quantised to 4 bits, and a forward pass is checked for a finite loss before
-#: any training starts. If the check still reports nan, set PRECISION=fp32 --
-#: roughly half the speed, but the T4 is Turing and has no bf16 to fall back
-#: on, so fp32 is the only remaining option.
-PRECISION = os.environ.get("PRECISION", "fp16")
-if PRECISION not in ("fp16", "fp32"):
-    sys.exit(f"PRECISION must be fp16 or fp32, got {PRECISION!r}")
-DTYPE = torch.float32 if PRECISION == "fp32" else torch.float16
+#: Why this matters more than it looks: the T4 runs fp32 at 8.1 TFLOPS but
+#: fp16 on its tensor cores at 65. Falling all the way back to fp32 is not a
+#: 2x slowdown, it can be closer to 8x -- the difference between a three-hour
+#: run and most of a day. `amp` keeps the tensor cores while fixing the part
+#: that actually overflows, so it is worth trying before giving them up.
+#:
+#: Measured on this model: plain fp16 gives a nan forward loss before any
+#: training. Unquantising the vision encoder did NOT fix it, so the overflow
+#: is inherent to fp16 activations here, not an artefact of 4-bit weights.
+#:
+#: PRECISION=auto (default) builds the model, checks whether one real page
+#: produces a finite loss, and moves down the ladder until one does. Set it
+#: explicitly to skip straight to a known-good mode on later runs.
+PRECISION_LADDER = ["fp16", "amp", "fp32"]
+
+PRECISION = os.environ.get("PRECISION", "auto")
+if PRECISION not in PRECISION_LADDER + ["auto"]:
+    sys.exit(f"PRECISION must be auto, fp16, amp or fp32; got {PRECISION!r}")
 print(f"precision: {PRECISION}")
+
+
+def precision_spec(name):
+    """(weight dtype, 4-bit compute dtype, use autocast) for a mode."""
+    return {
+        "fp16": (torch.float16, torch.float16, True),
+        "amp": (torch.float32, torch.float16, True),
+        "fp32": (torch.float32, torch.float32, False),
+    }[name]
 
 #: 5% of the run, not 41% of it.
 #:
@@ -403,23 +425,8 @@ processor = AutoProcessor.from_pretrained(MODEL_NAME)
 #: output projection degrades generation quality out of proportion to its size.
 NO_QUANT = ["vision_encoder", "vision_projection", "lm_head"]
 
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_compute_dtype=DTYPE,
-    llm_int8_skip_modules=NO_QUANT,
-)
-
-model = LightOnOcrForConditionalGeneration.from_pretrained(
-    MODEL_NAME,
-    quantization_config=quant_config,
-    dtype=DTYPE,
-    device_map={"": 0},
-)
-
-model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-model.config.use_cache = False       # incompatible with gradient checkpointing
+CONFIG = AutoConfig.from_pretrained(MODEL_NAME)
+IMAGE_TOKEN_ID = getattr(CONFIG, "image_token_id", None)
 
 # Adapt the text decoder, not the vision encoder.
 #
@@ -441,28 +448,48 @@ LORA_TARGETS = (
     r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 )
 
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=LORA_TARGETS,
-)
+def build_model(precision: str):
+    """Load, quantise and attach LoRA at the given precision."""
+    weight_dtype, compute_dtype, _ = precision_spec(precision)
 
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+        llm_int8_skip_modules=NO_QUANT,
+    )
 
-# Verify the regex hit the decoder and nothing else. A silent miss here would
-# either train nothing or train the wrong tower.
-_adapted = [n for n, _ in model.named_modules() if n.endswith("lora_A.default")]
-_vision_hits = [n for n in _adapted if "vision" in n]
-print(f"LoRA attached to {len(_adapted)} modules; "
-      f"{len(_vision_hits)} of them in the vision encoder")
-if not _adapted:
-    sys.exit("LoRA matched nothing. Check LORA_TARGETS against the module names.")
-if _vision_hits:
-    print("  WARNING: vision modules were adapted; the regex is too loose.")
+    m = LightOnOcrForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        quantization_config=quant_config,
+        dtype=weight_dtype,
+        device_map={"": 0},
+    )
+    m = prepare_model_for_kbit_training(m, use_gradient_checkpointing=True)
+    m.config.use_cache = False       # incompatible with gradient checkpointing
+
+    m = get_peft_model(m, LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=LORA_TARGETS,
+    ))
+
+    # Verify the regex hit the decoder and nothing else. A silent miss here
+    # would either train nothing or train the wrong tower.
+    adapted = [n for n, _ in m.named_modules() if n.endswith("lora_A.default")]
+    vision_hits = [n for n in adapted if "vision" in n]
+    m.print_trainable_parameters()
+    print(f"LoRA attached to {len(adapted)} modules; "
+          f"{len(vision_hits)} of them in the vision encoder")
+    if not adapted:
+        sys.exit("LoRA matched nothing. Check LORA_TARGETS against module names.")
+    if vision_hits:
+        print("  WARNING: vision modules were adapted; the regex is too loose.")
+    return m
 
 
 # ══════════════════════════════════════════════════════════════
@@ -536,10 +563,11 @@ def collate(batch):
         labels[labels == pad_id] = -100
 
     # Never train on the image placeholder tokens either -- they are inputs,
-    # not something the model should learn to produce.
-    image_token_id = getattr(model.config, "image_token_id", None)
-    if image_token_id is not None:
-        labels[enc["input_ids"] == image_token_id] = -100
+    # not something the model should learn to produce. Read from the config
+    # rather than a model instance, so the collator can be built before any
+    # model exists (the precision ladder below builds several).
+    if IMAGE_TOKEN_ID is not None:
+        labels[enc["input_ids"] == IMAGE_TOKEN_ID] = -100
 
     for i, plen in enumerate(prompt_lens):
         labels[i, :plen] = -100
@@ -559,28 +587,63 @@ print(f"probe example: {_total} tokens, {_kept} of them supervised "
 if _kept == 0:
     sys.exit("Prompt masking removed every label. Fix build_texts() before training.")
 
-# Does a forward pass actually produce a finite loss?
+# ── Build the model, at the fastest precision that survives ─────────
 #
-# The first smoke test reported validation loss `nan` and only found out after
-# training. This asks the same question in two seconds, before anything is
-# committed. A nan here means the numbers are overflowing in the forward pass,
-# not that training diverged -- and on a Turing card the answer is fp32.
-with torch.no_grad():
-    _out = model(**{k: v.to(model.device) for k, v in _probe.items()})
-_probe_loss = float(_out.loss)
-print(f"probe forward loss: {_probe_loss:.4f}")
-del _out
-gc.collect()
-torch.cuda.empty_cache()
+# One real page is pushed through the model and the loss is checked for being
+# a finite number. Plain fp16 returns nan on this model -- measured, not
+# assumed -- so the ladder drops to fp32 master weights with fp16 autocast,
+# and only then to full fp32.
+#
+# Doing this here rather than after training is the whole point: the first
+# attempt spent two minutes training before reporting nan, and full fp32 could
+# cost most of a day for a run that never had to be that slow.
 
-if not math.isfinite(_probe_loss):
+
+def probe_forward(m, precision) -> float:
+    """Loss on one real page, computed the same way training will compute it."""
+    _, _, use_amp = precision_spec(precision)
+    batch = {k: v.to(m.device) for k, v in _probe.items()}
+    ctx = (torch.autocast("cuda", dtype=torch.float16)
+           if use_amp else contextlib.nullcontext())
+    with torch.no_grad(), ctx:
+        out = m(**batch)
+    loss = float(out.loss)
+    del out, batch
+    gc.collect()
+    torch.cuda.empty_cache()
+    return loss
+
+
+_candidates = PRECISION_LADDER if PRECISION == "auto" else [PRECISION]
+model = None
+
+for _p in _candidates:
+    print(f"\n--- building model in {_p} ---")
+    _candidate = build_model(_p)
+    _loss = probe_forward(_candidate, _p)
+    print(f"probe forward loss ({_p}): {_loss}")
+
+    if math.isfinite(_loss):
+        model = _candidate
+        PRECISION = _p
+        break
+
+    print(f"  {_p} overflowed; discarding and trying the next mode")
+    del _candidate
+    gc.collect()
+    torch.cuda.empty_cache()
+
+if model is None:
     sys.exit(
-        f"\nForward pass produced {_probe_loss} in {PRECISION}.\n"
-        "The activations are overflowing before training even begins.\n"
-        "Re-run with PRECISION=fp32 in the first cell:\n"
-        "    os.environ['PRECISION'] = 'fp32'\n"
-        "It is roughly half the speed, but the T4 has no bf16 to fall back on."
+        "\nEvery precision mode produced a non-finite loss, including fp32.\n"
+        "That is not a precision problem -- something is wrong with the "
+        "inputs or the masking. Inspect the probe batch before running again."
     )
+
+DTYPE = precision_spec(PRECISION)[0]
+USE_AMP = precision_spec(PRECISION)[2]
+print(f"\n>>> training in {PRECISION} "
+      f"(weights {DTYPE}, autocast {'on' if USE_AMP else 'off'})")
 
 
 # ── How long is a page, in tokens? ──────────────────────────────────
@@ -601,8 +664,8 @@ def _cfg(obj, *names, default=None):
     return default
 
 
-_patch = _cfg(getattr(model.config, "vision_config", object()), "patch_size", default=14)
-_merge = _cfg(model.config, "spatial_merge_size", default=2)
+_patch = _cfg(getattr(CONFIG, "vision_config", object()), "patch_size", default=14)
+_merge = _cfg(CONFIG, "spatial_merge_size", default=2)
 _stride = _patch * _merge
 print(f"vision: patch {_patch} x merge {_merge} -> {_stride}px per image token")
 
@@ -694,7 +757,10 @@ args = TrainingArguments(
     metric_for_best_model="eval_loss",
     greater_is_better=False,
 
-    fp16=(PRECISION == "fp16"),
+    # Autocast is what makes fp16 tensor cores usable without fp16 weights.
+    # In "amp" mode the master weights stay fp32 while matmuls run in fp16;
+    # in "fp32" mode this is off entirely.
+    fp16=USE_AMP,
     bf16=False,          # T4 is Turing; no bf16 support exists on this card
 
     logging_steps=5,     # ~265 steps total, so log often
