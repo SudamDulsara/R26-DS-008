@@ -163,6 +163,26 @@ OUTPUT_DIR = "lightonocr-sinhala-acts"
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
 
+#: BASE_ONLY=1 skips training entirely and scores the UNTUNED model.
+#:
+#: Nobody knows what LightOnOCR does on Sinhala out of the box. Its card lists
+#: 11 languages and Sinhala is not one of them, and the paper reports only
+#: 1.05% AFTER their fine-tune. The number before it has never been published.
+#:
+#: It is worth an hour to find out, because it decides how much work the rest
+#: of this project needs:
+#:
+#:   base is already good     -> Pipeline B works with no training at all, and
+#:                               the fine-tune becomes an optional improvement
+#:   base is poor             -> "untuned X vs fine-tuned Y" is exactly the
+#:                               evidence that justifies the fine-tuning step
+#:
+#: Either answer is useful; not knowing is the only bad state. Pair it with
+#: EVAL_LIMIT to keep it to a sensible length.
+BASE_ONLY = os.environ.get("BASE_ONLY", "0") == "1"
+if BASE_ONLY:
+    print("*** BASE_ONLY -- no training, scoring the untuned model ***")
+
 #: Tesseract's score on the 202 test pages, measured in this project.
 #: Do NOT substitute the paper's 0.1069 -- quote the number you measured
 #: under the same conditions as everything else you report.
@@ -268,22 +288,28 @@ SEED = 42
 #: `amp32` dequantises the language model in fp32 while still autocasting the
 #: vision encoder to fp16.
 #:
-#: RESULT (measured 2026-08-16): fp16, amp and amp32 ALL return nan; only fp32
-#: survives. amp32 failing is the informative one -- autocast governs only the
-#: unquantised half, so the overflow is in the PIXTRAL VISION ENCODER, not in
-#: the 4-bit language model.
+#: `mixed` is the mirror image: vision encoder in fp32 (no autocast, so it is
+#: never pushed to fp16), language model dequantised to fp16.
 #:
-#: Hence `mixed`: vision encoder in fp32 (no autocast, so it is never pushed
-#: to fp16), language model dequantised to fp16. That protects the fragile
-#: half while letting the expensive half use the tensor cores. The split
-#: matters because the work is lopsided -- per page, roughly:
+#: RESULT, all five measured on a T4 on 2026-08-16:
 #:
-#:     vision encoder   24 layers x 2,145 tokens    ~0.65 TFLOP
-#:     language model   0.6B params x 4,646 tokens  ~5.6  TFLOP
+#:     mode    vision   language model   probe loss
+#:     ------  -------  ---------------  ----------
+#:     fp16    fp16     fp16             nan
+#:     amp     fp16     fp16             nan
+#:     amp32   fp16     fp32             nan
+#:     mixed   fp32     fp16             nan
+#:     fp32    fp32     fp32             0.8904
 #:
-#: The language model does ~8x the work and tolerates fp16 fine. Running it in
-#: fp32 to protect the vision encoder is paying eight times over to fix an
-#: eighth of the problem.
+#: Read the middle two rows together: amp32 puts only the vision encoder in
+#: fp16 and fails; mixed puts only the language model in fp16 and also fails.
+#: BOTH halves overflow independently, so there is no split that rescues the
+#: tensor cores. On this card fp32 is the only option, and it costs roughly
+#: 18s per page against a ~4s fp16 equivalent.
+#:
+#: The real fix is a card with bfloat16 -- any RTX 30/40, L4, A100. bf16 has
+#: fp32's exponent range at fp16's speed, and this whole ladder becomes
+#: unnecessary. The T4 is Turing and predates it.
 PRECISION_LADDER = ["fp16", "amp", "amp32", "mixed", "fp32"]
 
 PRECISION = os.environ.get("PRECISION", "auto")
@@ -858,19 +884,23 @@ args = TrainingArguments(
     dataloader_num_workers=2,
 )
 
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=eval_ds,
-    data_collator=collate,
-)
+if BASE_ONLY:
+    print("\nBASE_ONLY: skipping training. Section 8 scores the untuned model.")
+    trainer = None
+else:
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collate,
+    )
 
-trainer.train()
+    trainer.train()
 
-trainer.save_model(OUTPUT_DIR)
-processor.save_pretrained(OUTPUT_DIR)
-print(f"\nAdapter saved to {OUTPUT_DIR}/ -- download this folder.")
+    trainer.save_model(OUTPUT_DIR)
+    processor.save_pretrained(OUTPUT_DIR)
+    print(f"\nAdapter saved to {OUTPUT_DIR}/ -- download this folder.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -885,25 +915,34 @@ print(f"\nAdapter saved to {OUTPUT_DIR}/ -- download this folder.")
 
 EVAL_LIMIT = int(os.environ.get("EVAL_LIMIT", "0"))
 
-# Swap the quantised training model for merged fp16 weights before measuring.
+# Swap the 4-bit training model for unquantised weights before measuring.
 #
 # Each page needs ~2,265 generated tokens, and 4-bit inference through
 # bitsandbytes is slow -- it trades speed for the memory that made training
 # possible at all. Over 202 pages that difference is hours, not minutes.
+# Folding the adapter into plain weights gives the same model mathematically,
+# at better speed, and the optimiser state is gone so there is room.
 #
-# Folding the adapter into plain fp16 weights gives the same model
-# mathematically, at roughly twice the speed. A 1B model in fp16 is ~2 GB and
-# fits comfortably now that the optimiser state is gone.
+# The dtype is DTYPE, whatever the precision ladder settled on. On a T4 that
+# is fp32, because generation overflows in fp16 for the same reason training
+# does -- it is the same forward pass.
 
 del trainer, model
 gc.collect()
 torch.cuda.empty_cache()
 
-print("\nmerging adapter into fp16 weights for evaluation ...")
 _base = LightOnOcrForConditionalGeneration.from_pretrained(
     MODEL_NAME, dtype=DTYPE, device_map={"": 0},
 )
-infer_model = PeftModel.from_pretrained(_base, OUTPUT_DIR).merge_and_unload()
+
+if BASE_ONLY:
+    # No adapter exists. Score the model exactly as it comes off the Hub.
+    print(f"\nloading UNTUNED {MODEL_NAME} in {PRECISION} for evaluation ...")
+    infer_model = _base
+else:
+    print(f"\nmerging adapter into {PRECISION} weights for evaluation ...")
+    infer_model = PeftModel.from_pretrained(_base, OUTPUT_DIR).merge_and_unload()
+
 infer_model.eval()
 infer_model.config.use_cache = True
 print(f"eval model on {infer_model.device}, "
@@ -951,10 +990,14 @@ for n, i in enumerate(rows):
 
 model_cer = float(np.mean([r["cer_model"] for r in results]))
 
+_what = "UNTUNED base model" if BASE_ONLY else "This fine-tune"
 print(f"\n== HELD-OUT TEST SET ({len(results)} pages) ==")
 print(f"Tesseract        : {TESSERACT_BASELINE:.4f} CER   (measured 2026-08-16)")
-print(f"This fine-tune   : {model_cer:.4f} CER")
+print(f"{_what:17}: {model_cer:.4f} CER")
 print(f"Paper's target   : 0.0105 CER   (same model, same data, their QLoRA run)")
+if EVAL_LIMIT:
+    print(f"  NOTE: {len(results)} pages, not all 202. The Tesseract figure above is")
+    print("  the mean over all 202, so this comparison is indicative, not quotable.")
 
 if model_cer < TESSERACT_BASELINE:
     drop = 100 * (TESSERACT_BASELINE - model_cer) / TESSERACT_BASELINE
@@ -975,10 +1018,11 @@ for era, vals in by_era.items():
     if vals:
         print(f"  {era}: {np.mean(vals):.4f} over {len(vals)} pages")
 
-with open("test_predictions.jsonl", "w", encoding="utf-8") as f:
+_outfile = "test_predictions_base.jsonl" if BASE_ONLY else "test_predictions.jsonl"
+with open(_outfile, "w", encoding="utf-8") as f:
     for r in results:
         f.write(json.dumps(r, ensure_ascii=False) + "\n")
-print("\nper-page predictions written to test_predictions.jsonl")
+print(f"\nper-page predictions written to {_outfile}")
 
 
 # ══════════════════════════════════════════════════════════════
