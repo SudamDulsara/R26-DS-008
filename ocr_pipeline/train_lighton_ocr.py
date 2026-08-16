@@ -310,17 +310,31 @@ SEED = 42
 #: The real fix is a card with bfloat16 -- any RTX 30/40, L4, A100. bf16 has
 #: fp32's exponent range at fp16's speed, and this whole ladder becomes
 #: unnecessary. The T4 is Turing and predates it.
+#: `bf16` is the answer on any card that supports it, and it is tried first
+#: when one is present. bfloat16 has fp32's exponent range with fp16's speed,
+#: so the overflow that defeats every fp16 mode above simply does not occur,
+#: and the tensor cores are still used. Support starts at Ampere (RTX 30) and
+#: includes Ada (RTX 40), Blackwell (RTX 50), L4, A100, H100.
+#:
+#: The T4 in Kaggle is Turing and predates it, which is the entire reason this
+#: ladder exists.
+_ALL_MODES = ["bf16", "fp16", "amp", "amp32", "mixed", "fp32"]
 PRECISION_LADDER = ["fp16", "amp", "amp32", "mixed", "fp32"]
 
+if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    PRECISION_LADDER = ["bf16"] + PRECISION_LADDER
+    print("this GPU supports bfloat16 -- trying it first")
+
 PRECISION = os.environ.get("PRECISION", "auto")
-if PRECISION not in PRECISION_LADDER + ["auto"]:
-    sys.exit(f"PRECISION must be auto, fp16, amp or fp32; got {PRECISION!r}")
+if PRECISION not in _ALL_MODES + ["auto"]:
+    sys.exit(f"PRECISION must be auto or one of {_ALL_MODES}; got {PRECISION!r}")
 print(f"precision: {PRECISION}")
 
 
 def precision_spec(name):
-    """(weight dtype, 4-bit compute dtype, use autocast) for a mode."""
+    """(weight dtype, 4-bit compute dtype, use fp16 autocast) for a mode."""
     return {
+        "bf16": (torch.bfloat16, torch.bfloat16, False),
         "fp16": (torch.float16, torch.float16, True),
         "amp": (torch.float32, torch.float16, True),
         "amp32": (torch.float32, torch.float32, True),
@@ -698,8 +712,10 @@ if model is None:
 
 DTYPE = precision_spec(PRECISION)[0]
 USE_AMP = precision_spec(PRECISION)[2]
+USE_BF16 = PRECISION == "bf16"
 print(f"\n>>> training in {PRECISION} "
-      f"(weights {DTYPE}, autocast {'on' if USE_AMP else 'off'})")
+      f"(weights {DTYPE}, fp16 autocast {'on' if USE_AMP else 'off'}, "
+      f"bf16 {'on' if USE_BF16 else 'off'})")
 
 
 # ── How long is a page, in tokens? ──────────────────────────────────
@@ -871,11 +887,11 @@ args = TrainingArguments(
     metric_for_best_model="eval_loss",
     greater_is_better=False,
 
-    # Autocast is what makes fp16 tensor cores usable without fp16 weights.
-    # In "amp" mode the master weights stay fp32 while matmuls run in fp16;
-    # in "fp32" mode this is off entirely.
+    # Exactly one of these may be on. bf16 is preferred wherever the card
+    # supports it; fp16 autocast is the fallback that keeps tensor cores when
+    # the weights are fp32; both are off in plain fp32 mode.
     fp16=USE_AMP,
-    bf16=False,          # T4 is Turing; no bf16 support exists on this card
+    bf16=USE_BF16,
 
     logging_steps=5,     # ~265 steps total, so log often
     report_to="none",
