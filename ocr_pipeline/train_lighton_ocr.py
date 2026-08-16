@@ -834,6 +834,23 @@ def time_one_step(m, precision, warmup=1, runs=2) -> float:
     _, _, use_amp = precision_spec(precision)
     ctx = (torch.autocast("cuda", dtype=torch.float16)
            if use_amp else contextlib.nullcontext())
+
+    # Match the Trainer's checkpointing settings before timing anything.
+    #
+    # prepare_model_for_kbit_training() enables gradient checkpointing with
+    # PyTorch's default (reentrant) implementation, while TrainingArguments
+    # re-enables it with use_reentrant=False. The two recompute different
+    # amounts of the graph, and the difference is not small: this function
+    # read 42.7s per page against the Trainer's actual 18.25s, inflating the
+    # projected run from 10.7 hours to 25.1 and nearly changing the decision
+    # about what settings to use.
+    try:
+        m.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    except TypeError:                      # older transformers
+        m.gradient_checkpointing_enable()
+
     m.train()
 
     def one():

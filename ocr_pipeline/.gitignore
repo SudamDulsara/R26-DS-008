@@ -56,6 +56,14 @@ data/gazette_pdfs/
 # from HuggingFace: avishadilhara/sinhala-ocr-lk-acts-1010)
 data/acts1010/
 
+# Pipeline B: scanned Act PDFs in, generated pairs out. Both regenerable —
+# the PDFs by re-downloading, the pairs by re-running the pipeline.
+data/inbox/
+data/generated/
+
+# Fine-tuned LoRA adapter downloaded from Kaggle
+lightonocr-sinhala-acts/
+
 # SQLite database of saved pipeline runs (export to CSV for submission)
 *.db
 *.sqlite
