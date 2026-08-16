@@ -258,14 +258,22 @@ BATCH_SIZE = 1          # one page per step; pages are large
 GRAD_ACCUM = 8          # effective batch of 8
 LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
 
-#: Four rather than three, bought with the time saved by MAX_IMAGE_EDGE.
+#: MEASURED, not estimated. At 1024px in fp32 on a T4: 15.8s per page.
 #:
-#: The untuned model scores 1.79 CER on these pages -- it cannot produce
-#: Sinhala at all, never mind read it accurately. Closing that gap is a
-#: decoder-learning problem, and decoder learning is driven by optimiser
-#: steps, not by pixels. 4 epochs over 704 pages at an effective batch of 8
-#: gives 352 steps against 264, for less total time than 3 epochs at 1536.
-EPOCHS = 4
+#:     epochs   steps   training   + evaluation
+#:     2        178     6.2 h      ~7 h
+#:     3        267     9.3 h      ~10 h      <- fits a Kaggle session
+#:     4        356     12.4 h     ~13 h      <- does not
+#:
+#: Dropping the image edge from 1536 to 1024 saved only 13% (18.2s -> 15.8s),
+#: not the ~50% first assumed. Image tokens fell by more than half, but the
+#: sequence only shrank 4,646 -> 3,445 tokens, and the language model works
+#: across the whole sequence. Cost tracks total tokens, not image tokens.
+#:
+#: 3 epochs is the most that fits with room for the evaluation pass. The
+#: adapter is saved before evaluation begins, so an overrun would cost the
+#: measurement but not the model.
+EPOCHS = 3
 SEED = 42
 
 #: How numbers are represented. Three modes, tried in this order by default.
@@ -335,9 +343,29 @@ SEED = 42
 _ALL_MODES = ["bf16", "fp16", "amp", "amp32", "mixed", "fp32"]
 PRECISION_LADDER = ["fp16", "amp", "amp32", "mixed", "fp32"]
 
-if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+def has_real_bf16() -> bool:
+    """
+    True only if the GPU has bfloat16 in HARDWARE.
+
+    torch.cuda.is_bf16_supported() is not the right question: it returns True
+    when bf16 can be *emulated*, and it duly claimed yes on a Tesla T4, which
+    is Turing and has no bf16 units at all. Emulated bf16 gives none of the
+    speed, which is the entire reason to want it.
+
+    Compute capability 8.0 (Ampere) is where hardware bf16 starts. That covers
+    A100, RTX 30xx, L4, RTX 40xx (8.9), RTX 50xx (12.x), H100. Turing is 7.5.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability()
+    return major >= 8
+
+
+if has_real_bf16():
     PRECISION_LADDER = ["bf16"] + PRECISION_LADDER
-    print("this GPU supports bfloat16 -- trying it first")
+    _cap = torch.cuda.get_device_capability()
+    print(f"GPU compute capability {_cap[0]}.{_cap[1]} -- has hardware "
+          f"bfloat16, trying it first")
 
 PRECISION = os.environ.get("PRECISION", "auto")
 if PRECISION not in _ALL_MODES + ["auto"]:
