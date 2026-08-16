@@ -247,12 +247,21 @@ MAX_SEQ_TOKENS = 6144
 #: If you hit out-of-memory, lower this BEFORE touching batch size -- there is
 #: no batch size below 1, and image area is where the memory actually goes.
 #:
-#: Set to 1024 (~88 DPI) for the first real run, down from 1536 (~131 DPI).
-#: The T4 is forced into fp32 -- see PRECISION -- which costs ~18s per page at
-#: 1536, or 10.7 hours for three epochs. 1024 roughly halves that, and the
-#: time is spent on epochs instead. Raise it again on a bf16-capable card,
-#: where the whole run is about two hours at full resolution.
-MAX_IMAGE_EDGE = 1024
+#: BACK TO 1536 after run 1 (2026-08-17).
+#:
+#: Run 1 used 1024 (~88 DPI) on the theory that it would roughly halve the
+#: time. It saved 13%, not 50% -- cost tracks total sequence tokens, and the
+#: sequence only shrank 4,646 -> 3,445 because the text half is unchanged.
+#: So the resolution was given up almost for nothing.
+#:
+#: And it appears to have cost accuracy. Run 1 scored 0.3312 CER producing
+#: fluent but wrong Sinhala with perfect layout and correct numerals -- large
+#: shapes survived 88 DPI, the small marks that carry meaning in this script
+#: did not.
+#:
+#: 1536 is ~131 DPI and sits at the vision encoder's own native image_size of
+#: 1540, so it is the most this model was built to use.
+MAX_IMAGE_EDGE = 1536
 
 BATCH_SIZE = 1          # one page per step; pages are large
 GRAD_ACCUM = 8          # effective batch of 8
@@ -540,24 +549,43 @@ NO_QUANT = ["vision_encoder", "vision_projection", "lm_head"]
 CONFIG = AutoConfig.from_pretrained(MODEL_NAME)
 IMAGE_TOKEN_ID = getattr(CONFIG, "image_token_id", None)
 
-# Adapt the text decoder, not the vision encoder.
+# Adapt BOTH towers and the bridge between them.
 #
-# This must be a REGEX, not a list of bare names. Both towers use the same
-# leaf names -- q_proj, gate_proj and the rest appear in the Pixtral encoder
-# as well as in Qwen3 -- and peft matches a plain list by name suffix. The
-# earlier list-of-names version therefore attached LoRA to the vision encoder
-# too, silently doing the opposite of what this comment claimed.
+# This must be a REGEX, not a list of bare names: both towers use the same
+# leaf names (q_proj, gate_proj and so on appear in the Pixtral encoder as
+# well as in Qwen3) and peft matches a plain list by suffix, so a list cannot
+# express "these, in that tower".
 #
-# Anchoring on `language_model` restricts adaptation to the decoder, which is
-# where the real gap is: the encoder was trained to read documents and can
-# already see the glyphs, but nothing in this model has ever had to EMIT
-# Sinhala.
+# WHY THIS CHANGED (2026-08-17, after run 1 scored 0.3312 CER)
+# ------------------------------------------------------------
+# The first version anchored on `language_model` only, arguing that the
+# encoder "already reads printed glyphs well" and only the decoder needed to
+# learn to emit Sinhala. That was an assumption, and the run disproved it.
 #
-# If accuracy disappoints, adding the projector (linear_1, linear_2,
-# merging_layer) is the next lever to try -- it is the bridge between what the
-# encoder sees and what the decoder says.
+# What run 1 actually produced was fluent, well-formed, WRONG Sinhala: layout,
+# line breaks, numerals and punctuation all correct, individual words wrong.
+# That is the signature of a decoder that learned the language perfectly and
+# is guessing words that fit, because the visual features reaching it do not
+# distinguish one Sinhala glyph from another.
+#
+# Corroborating it: Tesseract is 2.4x worse on 1980s scans than modern print,
+# but run 1 was uniformly bad across both eras (0.360 vs 0.319). A model
+# limited by paper quality tracks paper quality. One limited by its own
+# perception does not.
+#
+# So the vision path is now adapted too:
+#
+#   vision_encoder     24 Pixtral layers -- learns to see Sinhala glyphs
+#   vision_projection  linear_1, linear_2, merging_layer -- the bridge from
+#                      what the encoder sees to what the decoder reads
+#   language_model     as before
+#
+# This roughly triples the trainable parameters, which on a LoRA budget is
+# still around 3% of the model.
 LORA_TARGETS = (
-    r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+    r".*(language_model|vision_encoder|vision_projection).*\."
+    r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
+    r"|linear_1|linear_2|merging_layer)"
 )
 
 def build_model(precision: str):
@@ -590,17 +618,23 @@ def build_model(precision: str):
         target_modules=LORA_TARGETS,
     ))
 
-    # Verify the regex hit the decoder and nothing else. A silent miss here
-    # would either train nothing or train the wrong tower.
+    # Verify the regex hit all three parts. A silent miss trains the wrong
+    # thing, and run 1 showed what that costs: adapting only the decoder gave
+    # fluent, confident, wrong Sinhala at 0.3312 CER.
     adapted = [n for n, _ in m.named_modules() if n.endswith("lora_A.default")]
-    vision_hits = [n for n in adapted if "vision" in n]
+    enc = sum("vision_encoder" in n for n in adapted)
+    proj = sum("vision_projection" in n for n in adapted)
+    lang = sum("language_model" in n for n in adapted)
     m.print_trainable_parameters()
-    print(f"LoRA attached to {len(adapted)} modules; "
-          f"{len(vision_hits)} of them in the vision encoder")
+    print(f"LoRA attached to {len(adapted)} modules: "
+          f"{enc} vision encoder, {proj} projector, {lang} language model")
     if not adapted:
         sys.exit("LoRA matched nothing. Check LORA_TARGETS against module names.")
-    if vision_hits:
-        print("  WARNING: vision modules were adapted; the regex is too loose.")
+    for part, count in (("vision encoder", enc), ("projector", proj),
+                        ("language model", lang)):
+        if count == 0:
+            print(f"  WARNING: nothing adapted in the {part}. If that is not "
+                  f"deliberate, LORA_TARGETS is wrong.")
     return m
 
 
