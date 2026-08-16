@@ -246,12 +246,26 @@ MAX_SEQ_TOKENS = 6144
 #:
 #: If you hit out-of-memory, lower this BEFORE touching batch size -- there is
 #: no batch size below 1, and image area is where the memory actually goes.
-MAX_IMAGE_EDGE = 1536
+#:
+#: Set to 1024 (~88 DPI) for the first real run, down from 1536 (~131 DPI).
+#: The T4 is forced into fp32 -- see PRECISION -- which costs ~18s per page at
+#: 1536, or 10.7 hours for three epochs. 1024 roughly halves that, and the
+#: time is spent on epochs instead. Raise it again on a bf16-capable card,
+#: where the whole run is about two hours at full resolution.
+MAX_IMAGE_EDGE = 1024
 
 BATCH_SIZE = 1          # one page per step; pages are large
 GRAD_ACCUM = 8          # effective batch of 8
 LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
-EPOCHS = 3
+
+#: Four rather than three, bought with the time saved by MAX_IMAGE_EDGE.
+#:
+#: The untuned model scores 1.79 CER on these pages -- it cannot produce
+#: Sinhala at all, never mind read it accurately. Closing that gap is a
+#: decoder-learning problem, and decoder learning is driven by optimiser
+#: steps, not by pixels. 4 epochs over 704 pages at an effective batch of 8
+#: gives 352 steps against 264, for less total time than 3 epochs at 1536.
+EPOCHS = 4
 SEED = 42
 
 #: How numbers are represented. Three modes, tried in this order by default.
