@@ -119,6 +119,7 @@ import json
 import math
 import os
 import random
+import time
 import unicodedata
 
 # ── Must be set before torch is imported ────────────────────────────
@@ -256,7 +257,19 @@ SEED = 42
 #: PRECISION=auto (default) builds the model, checks whether one real page
 #: produces a finite loss, and moves down the ladder until one does. Set it
 #: explicitly to skip straight to a known-good mode on later runs.
-PRECISION_LADDER = ["fp16", "amp", "fp32"]
+#: `amp32` exists because both fp16 and amp returned nan, which does not
+#: localise the overflow. The model has two numerically distinct halves:
+#:
+#:   - the vision encoder is NOT quantised, so autocast governs its dtype
+#:   - the language model IS 4-bit, and bitsandbytes dequantises straight to
+#:     bnb_4bit_compute_dtype regardless of what autocast says
+#:
+#: In `amp` both run in fp16, so a nan says nothing about which one broke.
+#: `amp32` dequantises the language model in fp32 while still autocasting the
+#: vision encoder to fp16. If it survives, the overflow was in the 4-bit path
+#: and the vision half -- 24 layers over 2,145 image tokens, the expensive
+#: part -- keeps its tensor cores.
+PRECISION_LADDER = ["fp16", "amp", "amp32", "fp32"]
 
 PRECISION = os.environ.get("PRECISION", "auto")
 if PRECISION not in PRECISION_LADDER + ["auto"]:
@@ -269,6 +282,7 @@ def precision_spec(name):
     return {
         "fp16": (torch.float16, torch.float16, True),
         "amp": (torch.float32, torch.float16, True),
+        "amp32": (torch.float32, torch.float32, True),
         "fp32": (torch.float32, torch.float32, False),
     }[name]
 
@@ -737,6 +751,49 @@ _total_steps = _steps_per_epoch * EPOCHS
 WARMUP_STEPS = max(5, round(_total_steps * WARMUP_RATIO))
 print(f"\nschedule: {_total_steps} optimiser steps over {EPOCHS} epoch(s), "
       f"{WARMUP_STEPS} of them warmup ({100 * WARMUP_STEPS / _total_steps:.0f}%)")
+
+
+# ── How long will this actually take? ───────────────────────────────
+#
+# Measure one real forward+backward and extrapolate, rather than finding out
+# four hours in. Falling back to fp32 costs a large multiple of fp16 on a
+# Turing card, and at 1536px a page is ~4,300 tokens, so the two together can
+# turn a three-hour plan into an overnight one.
+#
+# If the estimate is uncomfortable, MAX_IMAGE_EDGE is the lever with the most
+# leverage -- image tokens dominate the sequence and attention cost grows with
+# its square.
+
+def time_one_step(m, precision) -> float:
+    """Seconds for one page's forward + backward, as training will run it."""
+    _, _, use_amp = precision_spec(precision)
+    batch = {k: v.to(m.device) for k, v in _probe.items()}
+    ctx = (torch.autocast("cuda", dtype=torch.float16)
+           if use_amp else contextlib.nullcontext())
+    m.train()
+    torch.cuda.synchronize()
+    t0 = time.time()
+    with ctx:
+        loss = m(**batch).loss
+    loss.backward()
+    torch.cuda.synchronize()
+    elapsed = time.time() - t0
+    m.zero_grad(set_to_none=True)
+    del batch, loss
+    gc.collect()
+    torch.cuda.empty_cache()
+    return elapsed
+
+
+_sec_per_page = time_one_step(model, PRECISION)
+_page_passes = len(train_ds) * EPOCHS
+_train_hours = _sec_per_page * _page_passes / 3600
+print(f"timing: {_sec_per_page:.1f}s per page in {PRECISION} at "
+      f"{MAX_IMAGE_EDGE}px -> ~{_train_hours:.1f}h for {_page_passes:,} "
+      f"page-passes (plus evaluation)")
+if not SMOKE and _train_hours > 8:
+    print("  WARNING: that is a long session. Lower MAX_IMAGE_EDGE or EPOCHS,")
+    print("  or accept that this needs a full uninterrupted run.")
 
 args = TrainingArguments(
     output_dir=OUTPUT_DIR,
