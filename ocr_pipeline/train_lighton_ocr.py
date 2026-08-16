@@ -266,10 +266,25 @@ SEED = 42
 #:
 #: In `amp` both run in fp16, so a nan says nothing about which one broke.
 #: `amp32` dequantises the language model in fp32 while still autocasting the
-#: vision encoder to fp16. If it survives, the overflow was in the 4-bit path
-#: and the vision half -- 24 layers over 2,145 image tokens, the expensive
-#: part -- keeps its tensor cores.
-PRECISION_LADDER = ["fp16", "amp", "amp32", "fp32"]
+#: vision encoder to fp16.
+#:
+#: RESULT (measured 2026-08-16): fp16, amp and amp32 ALL return nan; only fp32
+#: survives. amp32 failing is the informative one -- autocast governs only the
+#: unquantised half, so the overflow is in the PIXTRAL VISION ENCODER, not in
+#: the 4-bit language model.
+#:
+#: Hence `mixed`: vision encoder in fp32 (no autocast, so it is never pushed
+#: to fp16), language model dequantised to fp16. That protects the fragile
+#: half while letting the expensive half use the tensor cores. The split
+#: matters because the work is lopsided -- per page, roughly:
+#:
+#:     vision encoder   24 layers x 2,145 tokens    ~0.65 TFLOP
+#:     language model   0.6B params x 4,646 tokens  ~5.6  TFLOP
+#:
+#: The language model does ~8x the work and tolerates fp16 fine. Running it in
+#: fp32 to protect the vision encoder is paying eight times over to fix an
+#: eighth of the problem.
+PRECISION_LADDER = ["fp16", "amp", "amp32", "mixed", "fp32"]
 
 PRECISION = os.environ.get("PRECISION", "auto")
 if PRECISION not in PRECISION_LADDER + ["auto"]:
@@ -283,6 +298,7 @@ def precision_spec(name):
         "fp16": (torch.float16, torch.float16, True),
         "amp": (torch.float32, torch.float16, True),
         "amp32": (torch.float32, torch.float32, True),
+        "mixed": (torch.float32, torch.float16, False),
         "fp32": (torch.float32, torch.float32, False),
     }[name]
 
@@ -764,25 +780,40 @@ print(f"\nschedule: {_total_steps} optimiser steps over {EPOCHS} epoch(s), "
 # leverage -- image tokens dominate the sequence and attention cost grows with
 # its square.
 
-def time_one_step(m, precision) -> float:
-    """Seconds for one page's forward + backward, as training will run it."""
+def time_one_step(m, precision, warmup=1, runs=2) -> float:
+    """
+    Seconds for one page's forward + backward, as training will run it.
+
+    The first call is discarded. CUDA compiles and autotunes kernels on first
+    use, so an unwarmed measurement reads roughly twice the sustained rate --
+    40.8s against a true 18.2s when this was first added, which would have
+    doubled every estimate built on it.
+    """
     _, _, use_amp = precision_spec(precision)
-    batch = {k: v.to(m.device) for k, v in _probe.items()}
     ctx = (torch.autocast("cuda", dtype=torch.float16)
            if use_amp else contextlib.nullcontext())
     m.train()
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with ctx:
-        loss = m(**batch).loss
-    loss.backward()
-    torch.cuda.synchronize()
-    elapsed = time.time() - t0
-    m.zero_grad(set_to_none=True)
-    del batch, loss
+
+    def one():
+        batch = {k: v.to(m.device) for k, v in _probe.items()}
+        torch.cuda.synchronize()
+        t0 = time.time()
+        with ctx:
+            loss = m(**batch).loss
+        loss.backward()
+        torch.cuda.synchronize()
+        dt = time.time() - t0
+        m.zero_grad(set_to_none=True)
+        del batch, loss
+        return dt
+
+    for _ in range(warmup):
+        one()
+    timings = [one() for _ in range(runs)]
+
     gc.collect()
     torch.cuda.empty_cache()
-    return elapsed
+    return min(timings)
 
 
 _sec_per_page = time_one_step(model, PRECISION)
