@@ -88,14 +88,20 @@ _ensure("peft")
 # the single most fragile dependency here, especially on a new GPU
 # architecture or on Windows. Failing to install it should cost the run some
 # memory headroom, not the whole evening.
+# The import is guarded and expected to fail on some machines, so editors
+# flagging it as unresolved are correct and unhelpful at the same time --
+# hence the type: ignore. It is a real import rather than a find_spec check
+# because a broken install (wrong CUDA version, missing DLL) is present on
+# disk but raises when imported, which is exactly the case worth catching.
 try:
     _ensure("bitsandbytes")
-    import bitsandbytes as _bnb                      # noqa: F401
+    import bitsandbytes as _bnb                      # type: ignore
     HAVE_BNB = True
+    print(f"bitsandbytes {getattr(_bnb, '__version__', 'unknown')}")
 except Exception as _exc:
     HAVE_BNB = False
-    print(f"bitsandbytes unavailable ({type(_exc).__name__}); "
-          f"will run without 4-bit quantisation")
+    print(f"bitsandbytes unavailable ({type(_exc).__name__}: {_exc}); "
+          f"running without 4-bit quantisation")
 
 # Kaggle ships torchao 0.10.0. peft probes for it when building a LoRA layer
 # and RAISES ImportError if the version is below 0.16 rather than simply
