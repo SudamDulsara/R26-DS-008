@@ -79,7 +79,23 @@ def _ensure(pkg, spec=None):
 
 _ensure("jiwer")
 _ensure("peft")
-_ensure("bitsandbytes")
+
+# bitsandbytes is OPTIONAL and its absence is not fatal.
+#
+# It provides 4-bit quantisation, which is what squeezed this model onto a
+# 16 GB T4. On a card with bfloat16 the model fits in ~2 GB unquantised, so
+# quantisation buys headroom rather than feasibility -- and bitsandbytes is
+# the single most fragile dependency here, especially on a new GPU
+# architecture or on Windows. Failing to install it should cost the run some
+# memory headroom, not the whole evening.
+try:
+    _ensure("bitsandbytes")
+    import bitsandbytes as _bnb                      # noqa: F401
+    HAVE_BNB = True
+except Exception as _exc:
+    HAVE_BNB = False
+    print(f"bitsandbytes unavailable ({type(_exc).__name__}); "
+          f"will run without 4-bit quantisation")
 
 # Kaggle ships torchao 0.10.0. peft probes for it when building a LoRA layer
 # and RAISES ImportError if the version is below 0.16 rather than simply
@@ -262,6 +278,27 @@ MAX_SEQ_TOKENS = 6144
 #: 1536 is ~131 DPI and sits at the vision encoder's own native image_size of
 #: 1540, so it is the most this model was built to use.
 MAX_IMAGE_EDGE = 1536
+
+#: 4-bit quantisation: "auto", "4bit" or "none".
+#:
+#: "auto" uses 4-bit when bitsandbytes is importable and skips it otherwise.
+#:
+#: What quantisation is actually for here: it made a 1B vision-language model
+#: trainable on a 16 GB T4 alongside fp32 activations. On a bf16-capable card
+#: the whole model is ~2 GB unquantised, so 4-bit becomes a way to buy
+#: activation headroom rather than a requirement.
+#:
+#: Worth turning off deliberately if VRAM allows, because unquantised weights
+#: skip the dequantisation step on every matmul and remove the project's most
+#: fragile dependency. On an 8 GB card at 1536px it is close either way -- try
+#: "none" first, and fall back to "4bit" if it runs out of memory.
+QUANT = os.environ.get("QUANT", "auto")
+if QUANT not in ("auto", "4bit", "none"):
+    sys.exit(f"QUANT must be auto, 4bit or none; got {QUANT!r}")
+USE_4BIT = HAVE_BNB if QUANT == "auto" else (QUANT == "4bit")
+if USE_4BIT and not HAVE_BNB:
+    sys.exit("QUANT=4bit but bitsandbytes did not import. Use QUANT=none.")
+print(f"quantisation: {'4-bit' if USE_4BIT else 'none (full precision weights)'}")
 
 BATCH_SIZE = 1          # one page per step; pages are large
 GRAD_ACCUM = 8          # effective batch of 8
@@ -598,7 +635,7 @@ def build_model(precision: str):
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=compute_dtype,
         llm_int8_skip_modules=NO_QUANT,
-    )
+    ) if USE_4BIT else None
 
     m = LightOnOcrForConditionalGeneration.from_pretrained(
         MODEL_NAME,
@@ -606,7 +643,21 @@ def build_model(precision: str):
         dtype=weight_dtype,
         device_map={"": 0},
     )
-    m = prepare_model_for_kbit_training(m, use_gradient_checkpointing=True)
+
+    if USE_4BIT:
+        m = prepare_model_for_kbit_training(m, use_gradient_checkpointing=True)
+    else:
+        # prepare_model_for_kbit_training() is specifically for quantised
+        # models -- it casts norms to fp32 and freezes the base. Unquantised,
+        # do the two things that actually matter by hand: freeze everything
+        # (LoRA re-enables its own parameters) and turn on checkpointing.
+        for param in m.parameters():
+            param.requires_grad = False
+        m.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        m.enable_input_require_grads()
+
     m.config.use_cache = False       # incompatible with gradient checkpointing
 
     m = get_peft_model(m, LoraConfig(
