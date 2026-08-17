@@ -2443,10 +2443,9 @@ def run_gpt_unification(
     }
     if not candidates:
         connection.close()
-        logger.info(
-            "GPT unification: no new or changed story clusters; "
-            "generation calls: 0"
-        )
+        logger.info("Unification summary:")
+        logger.info("  No new or changed multi-article stories.")
+        logger.info("  GPT calls made: 0 generation | 0 audit")
         return stats
     total_cost = Decimal("0")
     audit_policy_config = replace(
@@ -3270,15 +3269,31 @@ def run_gpt_unification(
         connection.close()
 
     stats["estimated_cost_usd"] = format(total_cost, "f")
+    logger.info("Unification summary:")
     logger.info(
-        "GPT unification: %s accepted (%s cache hits), %s pending review, "
-        "%s fallbacks, %s primary calls, %s audit calls, %s deferred",
+        "  Unified multi-article stories ready to publish: %s",
         stats["accepted"],
+    )
+    logger.info(
+        "  Cached outcomes reused: %s total (%s cached fallbacks)",
         stats["cache_hits"],
+        stats["cached_fallbacks"],
+    )
+    logger.info(
+        "  Stories awaiting review: %s",
         stats["pending_review"],
+    )
+    logger.info(
+        "  New safe fallbacks: %s (a source article is used instead)",
         stats["fallbacks"],
+    )
+    logger.info(
+        "  GPT calls made: %s generation | %s audit",
         stats["generation_calls"],
         stats["audit_calls"],
+    )
+    logger.info(
+        "  Candidates left for a later run by the run limit: %s",
         stats["deferred_provider_candidates"],
     )
     followup_keys = tuple(

@@ -160,12 +160,16 @@ def run_event_clustering(
     singleton_clusters_backfilled = 0
 
     logger.info("=== Incremental Same-Event Clustering Started ===")
-    logger.info("Eligible unique cleaned articles: %s", len(articles))
+    logger.info("Clustering setup:")
+    logger.info("  Eligible cleaned articles: %s", len(articles))
     logger.info(
-        "Model: %s@%s | Link threshold: %s | Representative threshold: %s | "
-        "Cohesion threshold: %s",
+        "  Embedding model: %s@%s",
         selected_model,
         selected_revision or "latest",
+    )
+    logger.info(
+        "  Similarity thresholds: direct link >= %s | representative >= %s | "
+        "all-member cohesion >= %s",
         threshold,
         representative_cutoff,
         cohesion_cutoff,
@@ -357,7 +361,9 @@ def run_event_clustering(
             incremental_noop=True,
         )
         conn.close()
-        logger.info("No clustering input changes; embedding calls: 0")
+        logger.info("Clustering summary:")
+        logger.info("  No new, changed, or retired clustering inputs.")
+        logger.info("  Embeddings generated: 0")
         return result
 
     potential_pairs = build_candidate_pairs(
@@ -547,35 +553,50 @@ def run_event_clustering(
     story_clusters, clustered_articles = current_counts()
     conn.close()
 
-    logger.info("Affected articles embedded: %s", len(affected_articles))
+    logger.info("Clustering summary:")
     logger.info(
-        "Embedding cache: %s hits, %s misses, %s encoded vectors in %.3fs",
+        "  Articles reconsidered: %s (changed articles and nearby context)",
+        len(affected_articles),
+    )
+    logger.info(
+        "  Embeddings: %s reused, %s cache misses, %s newly encoded in %.3fs",
         embedding_metrics["embedding_cache_hits"],
         embedding_metrics["embedding_cache_misses"],
         embedding_metrics["embedding_encoded_vectors"],
         embedding_metrics["embedding_total_seconds"],
     )
-    logger.info("Candidate pairs in affected window: %s", len(candidates))
-    logger.info("Linked pairs over threshold: %s", len(linked_pairs))
+    logger.info(
+        "  Candidate comparisons: %s (article pairs inside the configured window)",
+        len(candidates),
+    )
+    logger.info(
+        "  Same-event links retained: %s (after thresholds and safeguards)",
+        len(linked_pairs),
+    )
     if build_result.unclustered_articles:
         logger.info(
-            "Articles routed to publishable singleton stories: %s",
+            "  Standalone stories: %s (not safely grouped with another article)",
             build_result.unclustered_articles,
         )
     if bridge_pairs_removed:
         logger.info(
-            "Bridge links removed to protect existing story boundaries: %s",
+            "  Ambiguous bridge links removed: %s",
             bridge_pairs_removed,
         )
     if semantic_constraint_pairs_removed:
         logger.info(
-            "Model-audited different-event links removed: %s",
+            "  Previously audited different-event links removed: %s",
             semantic_constraint_pairs_removed,
         )
     logger.info(
-        "Replaced %s clusters and preserved %s unrelated clusters",
+        "  Previously stored groups replaced: %s | Unrelated groups kept: %s",
         len(affected_cluster_ids),
         len(clusters_by_key) - len(affected_cluster_ids),
+    )
+    logger.info(
+        "  Final story groups: %s covering %s eligible articles",
+        story_clusters,
+        clustered_articles,
     )
 
     return {

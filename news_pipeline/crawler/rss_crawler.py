@@ -535,6 +535,7 @@ def run_discovery(feed_pages: int | None = None):
             coverage_by_source[source_name] = result
             if result.get("error"):
                 failures_by_source[source_name] = {str(result["error"]): 1}
+            logger.info("")
         connection.commit()
     finally:
         connection.close()
@@ -543,7 +544,6 @@ def run_discovery(feed_pages: int | None = None):
     for result in coverage_by_source.values():
         status = str(result["status"])
         coverage_counts[status] = coverage_counts.get(status, 0) + 1
-    logger.info("")
     logger.info("=== Discovery Complete - %s total new URLs found ===", total)
     return {
         "new_urls": total,

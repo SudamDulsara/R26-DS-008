@@ -1,4 +1,15 @@
 {
+  "news_sources": {
+    "Mawbima": "https://www.mawbima.lk/feed",
+    "Divaina": "https://www.divaina.lk/feed",
+    "Silumina": "https://www.silumina.lk/feed",
+    "BBC Sinhala": "https://www.bbc.com/sinhala/index.xml",
+    "Ada Derana Sinhala": "https://sinhala.adaderana.lk/rsshotnews.php",
+    "Anidda": "https://www.anidda.lk/feed",
+    "NethnewsLk": "https://www.nethnews.lk/feed",
+    "Navaliya": "https://www.navaliya.lk/feed",
+    "Dinamina": "https://www.dinamina.lk/feed"
+  },
   "settings": {
     "NEWS_PIPELINE_DATA_DIR": "data",
     "NEWS_PIPELINE_LOGS_DIR": "logs",
@@ -55,16 +66,5 @@
     "NEWS_PIPELINE_GPT_AUDIT_REASONING_EFFORT": "low",
     "NEWS_PIPELINE_GPT_AUDIT_COMPLEX_REASONING_EFFORT": "medium",
     "NEWS_PIPELINE_GPT_AUDIT_MAX_OUTPUT_TOKENS": 8192
-  },
-  "news_sources": {
-    "Mawbima": "https://www.mawbima.lk/feed",
-    "Divaina": "https://www.divaina.lk/feed",
-    "Silumina": "https://www.silumina.lk/feed",
-    "BBC Sinhala": "https://www.bbc.com/sinhala/index.xml",
-    "Ada Derana Sinhala": "https://sinhala.adaderana.lk/rsshotnews.php",
-    "Anidda": "https://www.anidda.lk/feed",
-    "NethnewsLk": "https://www.nethnews.lk/feed",
-    "Navaliya": "https://www.navaliya.lk/feed",
-    "Dinamina": "https://www.dinamina.lk/feed"
   }
 }
