@@ -4,10 +4,19 @@ Storage for Pipeline B — SQLite for state, JSONL for the deliverable
 
 Two files, two jobs:
 
-    data/generated/pairs.jsonl     the dataset. Append-only. What gets
-                                   published. One JSON object per page.
-    data/generated/pipeline_b.db   the bookkeeping. Which pages are done,
+    data/ocr_correction_pairs.db   the database. Every generated pair plus
+                                   the bookkeeping: which pages are done,
                                    what each run did, what got flagged.
+    data/generated/pairs.jsonl     the same pairs as a flat file, for people
+                                   who want to download the dataset rather
+                                   than query it.
+
+LAYOUT IS FIXED BY THE GROUP, NOT BY THIS MODULE
+------------------------------------------------
+The group agreed: SQLite, the database file directly inside a `data` folder
+at the repository root, and any supporting files in a subfolder beneath it.
+That is why the .db sits at data/ and the JSONL at data/generated/ rather
+than both living together. Do not "tidy" them back into one folder.
 
 Why both, rather than one:
 
@@ -40,7 +49,12 @@ import sqlite3
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUT = os.path.join(HERE, "data", "generated")
+
+#: The database goes directly in data/ ; everything else in a subfolder.
+#: Group convention -- see the module docstring.
+DEFAULT_DATA = os.path.join(HERE, "data")
+DEFAULT_DB_NAME = "ocr_correction_pairs.db"
+DEFAULT_SUPPORT = os.path.join(DEFAULT_DATA, "generated")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -133,11 +147,13 @@ class Store:
     connections cost microseconds and remove that failure mode entirely.
     """
 
-    def __init__(self, out_dir: str = DEFAULT_OUT):
-        self.out_dir = out_dir
-        os.makedirs(out_dir, exist_ok=True)
-        self.db_path = os.path.join(out_dir, "pipeline_b.db")
-        self.jsonl_path = os.path.join(out_dir, "pairs.jsonl")
+    def __init__(self, data_dir: str = DEFAULT_DATA,
+                 db_name: str = DEFAULT_DB_NAME,
+                 support_dir: str = DEFAULT_SUPPORT):
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(support_dir, exist_ok=True)
+        self.db_path = os.path.join(data_dir, db_name)
+        self.jsonl_path = os.path.join(support_dir, "pairs.jsonl")
         with self._connect() as conn:
             conn.executescript(SCHEMA)
 
