@@ -81,6 +81,30 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+# Let the allocator grow its segments instead of fragmenting them.
+#
+# This also used to live in section 2 and also needs to be here. Gradient
+# checkpointing recomputes activations during the backward pass, so it
+# allocates and frees a stream of tensors of constantly changing sizes. Left
+# to the default allocator those freed blocks are the wrong shape to reuse,
+# and the reserved pool grows without the memory being available:
+#
+#     OutOfMemoryError: Tried to allocate 1.41 GiB. ... 1.12 GiB is free.
+#     Of the allocated memory 7.55 GiB is allocated by PyTorch, and
+#     5.75 GiB is reserved by PyTorch but unallocated.
+#
+# 5.75 GB held and unusable on a 14.5 GB card, observed on a T4 2026-08-18.
+#
+# BOTH names are set. PyTorch renamed this to PYTORCH_ALLOC_CONF; the old
+# name is deprecated and, on the version Kaggle now ships, apparently ignored
+# -- the OOM message asks for the new name even though the old one was set.
+#
+# Windows supports neither and prints "expandable_segments not supported on
+# this platform", so do not ask for it there.
+if os.name != "nt":
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # ══════════════════════════════════════════════════════════════
 #  1. Install
 # ══════════════════════════════════════════════════════════════
@@ -174,15 +198,10 @@ import random
 import time
 import unicodedata
 
-# CUDA_VISIBLE_DEVICES is set in section 0, at the very top of the file.
-# It cannot live here: section 1 imports transformers, which imports torch,
-# so by this point torch has already counted the cards.
-
-# Lets the allocator grow segments rather than fragment them.
-# Linux only -- Windows prints "expandable_segments not supported on this
-# platform" and ignores it, so do not ask for it there.
-if os.name != "nt":
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# CUDA_VISIBLE_DEVICES and the allocator config are both set in section 0, at
+# the very top of the file. Neither can live here: section 1 imports
+# transformers, which imports torch, so by this point torch has already
+# counted the cards and read its allocator settings.
 
 import numpy as np
 import torch
