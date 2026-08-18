@@ -153,7 +153,10 @@ import unicodedata
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # Lets the allocator grow segments rather than fragment them.
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Linux only -- Windows prints "expandable_segments not supported on this
+# platform" and ignores it, so do not ask for it there.
+if os.name != "nt":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import numpy as np
 import torch
@@ -325,7 +328,13 @@ LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
 #: 3 epochs is the most that fits with room for the evaluation pass. The
 #: adapter is saved before evaluation begins, so an overrun would cost the
 #: measurement but not the model.
-EPOCHS = 3
+#:
+#: Settable from the environment (EPOCHS=2) because the affordable number
+#: depends on the machine, and Kaggle kills a session at 12 hours whether or
+#: not the adapter has been saved. At the T4's measured 18.2s per page,
+#: 2 epochs is ~7h of training and 3 is ~11h -- the second does not leave room
+#: to score the test set.
+EPOCHS = int(os.environ.get("EPOCHS", "3"))
 SEED = 42
 
 #: How numbers are represented. Three modes, tried in this order by default.
@@ -1047,7 +1056,26 @@ args = TrainingArguments(
     report_to="none",
     seed=SEED,
     remove_unused_columns=False,   # the collator needs `image` and `text`
-    dataloader_num_workers=2,
+
+    # ZERO WORKERS ON WINDOWS -- this is not a tuning choice, it is a bug fix.
+    #
+    # Dataloader workers are separate processes. On Linux they are forked, so
+    # they inherit the parent and re-run nothing. Windows has no fork: Python
+    # SPAWNS them, and a spawned worker re-imports the main module from the
+    # top. This script does all its work at module level, so every worker
+    # re-executed the whole thing -- re-downloading, rebuilding the model and
+    # loading another 2 GB copy onto the GPU.
+    #
+    # Observed on an 8 GB RTX 5050: all output printed three times, the timing
+    # probe read 691s per page instead of ~5, and the run died with
+    # "CUDA error: out of memory" in backward.
+    #
+    # The alternative fix is to wrap everything in `if __name__ == "__main__"`,
+    # but this file is deliberately a flat script that can be pasted into a
+    # Kaggle cell, and that guard does not work in a notebook. Zero workers
+    # costs little here anyway: at batch size 1 the GPU step dominates, and
+    # the collator's work is one image resize.
+    dataloader_num_workers=0 if os.name == "nt" else 2,
 )
 
 if BASE_ONLY:
