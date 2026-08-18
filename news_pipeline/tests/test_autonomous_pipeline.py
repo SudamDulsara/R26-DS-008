@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,11 +10,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from news_pipeline.clustering.candidate_builder import build_candidate_pairs
+from news_pipeline.clustering.candidate_builder import (
+    CandidatePair,
+    build_candidate_pairs,
+)
+from news_pipeline.clustering.embedder import embedding_norm
 from news_pipeline.clustering.event_clusterer import (
     ScoredPair,
     _prevent_incompatible_components,
     _prevent_bridge_merges,
+    _score_pairs,
     run_event_clustering,
 )
 from news_pipeline.clustering.semantic_partition import (
@@ -34,6 +40,7 @@ from news_pipeline.crawler.rss_crawler import (
     _discover_source,
     build_feed_page_urls,
 )
+from news_pipeline.deduplicator.exact_deduper import run_exact_dedup
 from news_pipeline.extractor.article_extractor import (
     _best_extraction,
     _summarize_extraction_origins,
@@ -44,6 +51,7 @@ from news_pipeline.observability import (
     write_pipeline_health_report,
 )
 from news_pipeline.storage.database import get_connection, initialize_db
+from news_pipeline.storage.backup import create_verified_backup
 from news_pipeline.unification.autonomous_audit import (
     AutonomousAuditResponse,
     classify_audit_route,
@@ -73,6 +81,7 @@ from news_pipeline.unification.production import (
     _audit_circuit_breaker_status,
     _budget_safe_audit_route,
     _cached_candidate_requires_autonomous_audit,
+    build_generation_identity,
     run_gpt_unification,
     version_is_deployable_gpt,
 )
@@ -173,6 +182,91 @@ class _RejectTerraPreflight(OfflineRequestSizePreflight):
 
 
 class AutonomousPipelineTests(unittest.TestCase):
+    def test_precomputed_embedding_norms_preserve_exact_pair_scores(self):
+        embeddings = {
+            1: [0.123456789, -0.25, 0.75, 0.0000001],
+            2: [-0.987654321, 0.5, 0.125, -0.333333333],
+            3: [0.0, 0.0, 0.0, 0.0],
+        }
+        candidates = [
+            CandidatePair(1, 2, 0.25, 1.0),
+            CandidatePair(1, 3, 0.5, 2.0),
+        ]
+        norms = {
+            article_id: embedding_norm(vector)
+            for article_id, vector in embeddings.items()
+        }
+
+        baseline = _score_pairs(candidates, embeddings)
+        optimized = _score_pairs(
+            candidates,
+            embeddings,
+            embedding_norms=norms,
+        )
+
+        self.assertEqual(
+            [pair.similarity_score.hex() for pair in baseline],
+            [pair.similarity_score.hex() for pair in optimized],
+        )
+
+    def test_online_backup_is_atomic_verified_and_reopenable(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            config = replace(
+                load_config(load_env_file=False),
+                data_dir=root,
+                db_path=root / "pipeline.db",
+            )
+            with patch(
+                "news_pipeline.storage.database.load_config",
+                return_value=config,
+            ):
+                initialize_db()
+            connection = get_connection(config)
+            connection.execute(
+                """
+                INSERT INTO articles (
+                    url, source, clean_status, dedupe_status
+                ) VALUES (
+                    'https://backup.test/article', 'Backup publisher',
+                    'pending', 'pending'
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            backup_path = root / "backups" / "verified.db"
+            result = create_verified_backup(
+                config=config,
+                output_path=backup_path,
+            )
+            self.assertEqual(result["quick_check"], "ok")
+            self.assertEqual(result["restore_read_check"], "ok")
+            self.assertEqual(result["foreign_key_violations"], 0)
+            self.assertEqual(result["article_count"], 1)
+            self.assertGreater(result["table_count"], 0)
+            self.assertEqual(len(result["sha256"]), 64)
+            self.assertEqual(result["size_bytes"], backup_path.stat().st_size)
+
+            restored_config = replace(config, db_path=backup_path)
+            restored = get_connection(restored_config)
+            try:
+                self.assertEqual(
+                    restored.execute(
+                        "SELECT url FROM articles"
+                    ).fetchone()[0],
+                    "https://backup.test/article",
+                )
+            finally:
+                restored.close()
+
+            with self.assertRaises(FileExistsError):
+                create_verified_backup(
+                    config=config,
+                    output_path=backup_path,
+                )
+
     def _prepare_cluster(self, root):
         config = replace(
             load_config(load_env_file=False),
@@ -530,6 +624,282 @@ class AutonomousPipelineTests(unittest.TestCase):
             config.project_root / ".env.example"
         ).read_text(encoding="utf-8").splitlines()
         self.assertEqual(example_lines, ["OPENAI_API_KEY="])
+
+    def test_custom_embedding_model_does_not_inherit_default_revision(self):
+        with patch.dict(
+            os.environ,
+            {"NEWS_PIPELINE_CLUSTER_MODEL": "example/custom-model"},
+            clear=True,
+        ):
+            config = load_config(load_env_file=False)
+        self.assertEqual(config.cluster_model_name, "example/custom-model")
+        self.assertIsNone(config.cluster_model_revision)
+
+        with patch.dict(
+            os.environ,
+            {
+                "NEWS_PIPELINE_CLUSTER_MODEL": "example/custom-model",
+                "NEWS_PIPELINE_CLUSTER_MODEL_REVISION": "custom-revision",
+            },
+            clear=True,
+        ):
+            config = load_config(load_env_file=False)
+        self.assertEqual(config.cluster_model_revision, "custom-revision")
+
+    def test_review_queue_migration_preserves_history_and_repairs_links(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            config = replace(
+                load_config(load_env_file=False),
+                data_dir=root,
+                db_path=root / "pipeline.db",
+            )
+            with patch(
+                "news_pipeline.storage.database.load_config",
+                return_value=config,
+            ):
+                initialize_db()
+
+            connection = get_connection(config)
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                1,
+            )
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("DROP TABLE gpt_unification_review_queue")
+            connection.execute(
+                """
+                CREATE TABLE gpt_unification_review_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    unified_story_version_id INTEGER NOT NULL UNIQUE,
+                    cluster_id INTEGER,
+                    story_id TEXT NOT NULL,
+                    request_fingerprint_sha256 TEXT NOT NULL UNIQUE,
+                    queue_status TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                    validation_status TEXT NOT NULL,
+                    fallback_reason TEXT,
+                    candidate_title TEXT,
+                    candidate_story TEXT,
+                    prompt_version TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    response_id TEXT,
+                    detected_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    review_decision TEXT,
+                    review_notes TEXT,
+                    FOREIGN KEY (unified_story_version_id)
+                        REFERENCES unified_story_versions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (cluster_id) REFERENCES story_clusters(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO story_clusters (
+                    id, cluster_key, model_name, text_variant,
+                    similarity_threshold, representative_threshold,
+                    cohesion_threshold, article_count, source_count,
+                    confidence
+                ) VALUES (
+                    1, 'existing-cluster', 'test-model', 'test',
+                    0.9, 0.9, 0.9, 1, 1, 1.0
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO unified_story_versions (
+                    id, cluster_id, cluster_key,
+                    source_fingerprint_sha256,
+                    input_fingerprint_sha256,
+                    request_fingerprint_sha256, model_name,
+                    prompt_version, input_schema_version,
+                    output_schema_version, reasoning_effort,
+                    max_output_tokens, generation_status,
+                    validation_status, validation_json, created_at,
+                    updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, 'test-model', 'test-prompt',
+                    'input-v1', 'output-v1', 'low', 100,
+                    'accepted', 'accepted', '{}',
+                    '2026-08-17T00:00:00', '2026-08-17T00:00:00'
+                )
+                """,
+                [
+                    (1, 1, "existing-cluster", "s1", "i1", "r1"),
+                    (2, 999, "replaced-cluster", "s2", "i2", "r2"),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO gpt_unification_review_queue (
+                    unified_story_version_id, cluster_id, story_id,
+                    request_fingerprint_sha256, queue_status,
+                    validation_status, prompt_version, model_name,
+                    detected_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'approved', 'accepted',
+                          'test-prompt', 'test-model',
+                          '2026-08-17T00:00:00',
+                          '2026-08-17T00:00:00')
+                """,
+                [
+                    (1, 1, "existing-cluster", "r1"),
+                    (2, 999, "replaced-cluster", "r2"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            with patch(
+                "news_pipeline.storage.database.load_config",
+                return_value=config,
+            ):
+                initialize_db()
+
+            connection = get_connection(config)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, cluster_id, story_id
+                    FROM gpt_unification_review_queue
+                    ORDER BY id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in rows],
+                    [
+                        (1, 1, "existing-cluster"),
+                        (2, None, "replaced-cluster"),
+                    ],
+                )
+                cluster_foreign_key = next(
+                    row
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_list(gpt_unification_review_queue)"
+                    )
+                    if row[3] == "cluster_id"
+                )
+                self.assertEqual(cluster_foreign_key[6], "SET NULL")
+                self.assertEqual(
+                    connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall(),
+                    [],
+                )
+
+                connection.execute(
+                    "DELETE FROM story_clusters WHERE id = 1"
+                )
+                connection.commit()
+                remaining = connection.execute(
+                    """
+                    SELECT cluster_id, story_id
+                    FROM gpt_unification_review_queue
+                    ORDER BY id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in remaining],
+                    [
+                        (None, "existing-cluster"),
+                        (None, "replaced-cluster"),
+                    ],
+                )
+            finally:
+                connection.close()
+
+    def test_exact_dedup_skips_unchanged_rows_and_repairs_affected_group(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            config = replace(
+                load_config(load_env_file=False),
+                data_dir=root,
+                db_path=root / "pipeline.db",
+            )
+            with patch(
+                "news_pipeline.storage.database.load_config",
+                return_value=config,
+            ):
+                initialize_db()
+            connection = get_connection(config)
+            connection.executemany(
+                """
+                INSERT INTO articles (
+                    id, url, source, clean_text, clean_status,
+                    dedupe_status
+                ) VALUES (?, ?, 'Publisher', ?, 'cleaned', 'pending')
+                """,
+                [
+                    (1, "https://example.test/1", "same article"),
+                    (2, "https://example.test/2", "same article"),
+                    (3, "https://example.test/3", "different article"),
+                    (4, "https://example.test/4", "   "),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            with patch(
+                "news_pipeline.deduplicator.exact_deduper.get_connection",
+                side_effect=lambda: get_connection(config),
+            ):
+                cold = run_exact_dedup()
+                warm = run_exact_dedup()
+
+            self.assertEqual(cold["updated_articles"], 3)
+            self.assertEqual(warm["updated_articles"], 0)
+            self.assertEqual(warm["unchanged_articles"], 4)
+            self.assertEqual(warm["reused_hashes"], 3)
+            self.assertEqual(warm["computed_hashes"], 1)
+            self.assertEqual(warm["unique_articles"], 2)
+            self.assertEqual(warm["exact_duplicates"], 1)
+            self.assertEqual(warm["unhashable_articles"], 1)
+
+            connection = get_connection(config)
+            connection.execute(
+                """
+                UPDATE articles
+                SET clean_text = 'replacement article',
+                    clean_hash = NULL,
+                    dedupe_status = 'pending'
+                WHERE id = 1
+                """
+            )
+            connection.commit()
+            connection.close()
+            with patch(
+                "news_pipeline.deduplicator.exact_deduper.get_connection",
+                side_effect=lambda: get_connection(config),
+            ):
+                changed = run_exact_dedup()
+
+            self.assertEqual(changed["updated_articles"], 2)
+            self.assertEqual(changed["reused_hashes"], 2)
+            self.assertEqual(changed["computed_hashes"], 2)
+            self.assertEqual(changed["unique_articles"], 3)
+            self.assertEqual(changed["exact_duplicates"], 0)
+            connection = get_connection(config)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT id, dedupe_status, is_duplicate, duplicate_of_id
+                    FROM articles
+                    ORDER BY id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in rows],
+                    [
+                        (1, "unique", 0, None),
+                        (2, "unique", 0, None),
+                        (3, "unique", 0, None),
+                        (4, "pending", 0, None),
+                    ],
+                )
+            finally:
+                connection.close()
 
     def test_singleton_routing_is_not_reported_as_cluster_failure(self):
         counts = _stage_counts(
@@ -892,7 +1262,10 @@ class AutonomousPipelineTests(unittest.TestCase):
                 side_effect=lambda: get_connection(config),
             )
             with patch_config, patch_embedder, patch_connection:
-                uncached = run_event_clustering(use_embedding_cache=False)
+                uncached = run_event_clustering(
+                    use_embedding_cache=False,
+                    reuse_embedding_norms=False,
+                )
                 uncached_memberships = memberships_and_scores()
                 cold = run_event_clustering(
                     force_article_ids={1, 2, 3},
@@ -971,6 +1344,8 @@ class AutonomousPipelineTests(unittest.TestCase):
         self.assertEqual(cold["embedding_cache_hits"], 0)
         self.assertEqual(cold["embedding_cache_misses"], 3)
         self.assertEqual(cold["embedding_encoded_vectors"], 3)
+        self.assertEqual(uncached["similarity_norm_vectors"], 0)
+        self.assertEqual(cold["similarity_norm_vectors"], 3)
         self.assertEqual(warm["embedding_cache_hits"], 3)
         self.assertEqual(warm["embedding_cache_misses"], 0)
         self.assertEqual(warm["embedding_encoded_vectors"], 0)
@@ -1282,6 +1657,28 @@ class AutonomousPipelineTests(unittest.TestCase):
                 WHERE id = 1
                 """
             )
+            connection.execute(
+                """
+                INSERT INTO final_unified_stories (
+                    story_id, cluster_id, title, story,
+                    last_updated, article_count
+                ) VALUES (
+                    'story-test', 1, 'Prior title', 'Prior story',
+                    '2026-08-13T10:05:00+05:30', 3
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO final_story_publication_states (
+                    story_id, cluster_id, publication_status,
+                    reason_codes_json, updated_at
+                ) VALUES (
+                    'story-test', 1, 'publishable', '[]',
+                    '2026-08-13T10:05:00+05:30'
+                )
+                """
+            )
             connection.commit()
             connection.close()
 
@@ -1338,6 +1735,13 @@ class AutonomousPipelineTests(unittest.TestCase):
                 connection.cursor(),
                 article_by_id=article_by_id,
             )
+            stale_publication_rows = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM final_unified_stories)
+                    + (SELECT COUNT(*) FROM final_story_publication_states)
+                """
+            ).fetchone()[0]
             connection.close()
 
         self.assertEqual(result["semantic_partitions_applied"], 1, result)
@@ -1350,6 +1754,7 @@ class AutonomousPipelineTests(unittest.TestCase):
         self.assertEqual(constraint_count, 2)
         self.assertEqual(active_constraints, {(1, 3), (2, 3)})
         self.assertEqual(expired_constraints, set())
+        self.assertEqual(stale_publication_rows, 0)
 
     def test_active_risk_policy_skips_clean_low_risk_audit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1554,6 +1959,104 @@ class AutonomousPipelineTests(unittest.TestCase):
                 "evidence_safe_fallback",
                 json.loads(state_rows[0]["reason_codes_json"]),
             )
+
+    def test_publication_identity_cache_and_incremental_rows_are_exact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._prepare_cluster(root)
+            first_dir = root / "publication-first"
+            second_dir = root / "publication-second"
+            third_dir = root / "publication-third"
+            with patch(
+                "news_pipeline.unification.final_publication."
+                "build_generation_identity",
+                wraps=build_generation_identity,
+            ) as identity_builder:
+                first = materialize_gpt_only_publication(
+                    output_dir=first_dir,
+                    config=config,
+                )
+                first_build_count = identity_builder.call_count
+                second = materialize_gpt_only_publication(
+                    output_dir=second_dir,
+                    config=config,
+                )
+                second_build_count = identity_builder.call_count
+
+                connection = get_connection(config)
+                connection.execute(
+                    "UPDATE articles SET title = ? WHERE id = 1",
+                    ("Changed exact identity input",),
+                )
+                connection.commit()
+                connection.close()
+                third = materialize_gpt_only_publication(
+                    output_dir=third_dir,
+                    config=config,
+                )
+
+            first_metrics = first["_runtime_metrics"]
+            second_metrics = second["_runtime_metrics"]
+            third_metrics = third["_runtime_metrics"]
+            self.assertEqual(first_build_count, 3)
+            self.assertEqual(second_build_count, first_build_count)
+            self.assertEqual(
+                first_metrics["generation_identity_cache"]["misses"],
+                3,
+            )
+            self.assertEqual(
+                second_metrics["generation_identity_cache"]["hits"],
+                3,
+            )
+            self.assertEqual(
+                second_metrics["publication_rows"],
+                {
+                    "incremental": True,
+                    "inserted": 0,
+                    "updated": 0,
+                    "deleted": 0,
+                    "unchanged": 4,
+                    "seconds": second_metrics["publication_rows"][
+                        "seconds"
+                    ],
+                },
+            )
+            self.assertEqual(
+                third_metrics["generation_identity_cache"]["misses"],
+                3,
+            )
+            self.assertEqual(
+                identity_builder.call_count - second_build_count,
+                3,
+            )
+            self.assertEqual(
+                first["publication_fingerprint_sha256"],
+                second["publication_fingerprint_sha256"],
+            )
+            for name in (
+                "final_unified_stories.csv",
+                "final_story_sources.csv",
+                "final_story_claims.csv",
+                "final_story_conflicts.csv",
+                "final_story_publication_states.csv",
+                "article_processing_disposition.csv",
+            ):
+                self.assertEqual(
+                    (first_dir / name).read_bytes(),
+                    (second_dir / name).read_bytes(),
+                )
+
+            connection = get_connection(config)
+            try:
+                cache_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM "
+                        "publication_generation_identity_cache"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+            self.assertEqual(cache_count, 6)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ from news_pipeline.clustering.embedding_cache import (
 )
 from news_pipeline.clustering.embedder import (
     cosine_similarity,
+    cosine_similarity_with_norms,
     create_embedder,
+    embedding_norm,
     embedding_input_fingerprint,
 )
 from news_pipeline.clustering.semantic_constraints import (
@@ -95,6 +97,7 @@ def run_event_clustering(
     cohesion_threshold: Optional[float] = None,
     force_article_ids: Optional[set[int]] = None,
     use_embedding_cache: bool = True,
+    reuse_embedding_norms: bool = True,
 ):
     config = load_config()
     selected_model = model_name or config.cluster_model_name
@@ -222,6 +225,9 @@ def run_event_clustering(
             "embedding_encoding_seconds": 0.0,
             "embedding_cache_write_seconds": 0.0,
             "embedding_total_seconds": 0.0,
+            "similarity_norm_vectors": 0,
+            "similarity_norm_seconds": 0.0,
+            "candidate_scoring_seconds": 0.0,
             "changed_story_keys": [],
             "transition_batch_id": None,
             "cluster_transition_counts": {},
@@ -414,6 +420,10 @@ def run_event_clustering(
     embedding_metrics = _empty_embedding_metrics(use_embedding_cache)
     linked_pairs = []
     build_result = ClusterBuildResult([], 0, 0, 0, 0, 0)
+    embedding_norms = None
+    similarity_norm_vectors = 0
+    similarity_norm_seconds = 0.0
+    candidate_scoring_seconds = 0.0
     if len(affected_articles) >= config.cluster_min_articles:
         embeddings, embedder, embedding_metrics = _embed_articles_with_cache(
             affected_articles,
@@ -423,7 +433,27 @@ def run_event_clustering(
             batch_size=config.cluster_batch_size,
             use_embedding_cache=use_embedding_cache,
         )
-        scored_pairs = _score_pairs(candidates, embeddings)
+        if reuse_embedding_norms:
+            norm_started = perf_counter()
+            embedding_norms = {
+                article_id: embedding_norm(vector)
+                for article_id, vector in embeddings.items()
+            }
+            similarity_norm_vectors = len(embedding_norms)
+            similarity_norm_seconds = round(
+                perf_counter() - norm_started,
+                6,
+            )
+        scoring_started = perf_counter()
+        scored_pairs = _score_pairs(
+            candidates,
+            embeddings,
+            embedding_norms=embedding_norms,
+        )
+        candidate_scoring_seconds = round(
+            perf_counter() - scoring_started,
+            6,
+        )
         linked_pairs = [
             pair
             for pair in scored_pairs
@@ -460,6 +490,7 @@ def run_event_clustering(
             embeddings=embeddings,
             representative_threshold=representative_cutoff,
             incompatible_pairs=different_event_pairs,
+            embedding_norms=embedding_norms,
         )
         build_result = _build_story_clusters(
             affected_articles,
@@ -468,6 +499,7 @@ def run_event_clustering(
             min_articles=config.cluster_min_articles,
             representative_threshold=representative_cutoff,
             cohesion_threshold=cohesion_cutoff,
+            embedding_norms=embedding_norms,
         )
     elif affected_articles:
         semantic_constraint_pairs_removed = 0
@@ -633,6 +665,9 @@ def run_event_clustering(
         "baseline_initialized": baseline_initialized,
         "incremental_noop": False,
         "embedding_articles": len(affected_articles),
+        "similarity_norm_vectors": similarity_norm_vectors,
+        "similarity_norm_seconds": similarity_norm_seconds,
+        "candidate_scoring_seconds": candidate_scoring_seconds,
         **{
             key: value
             for key, value in embedding_metrics.items()
@@ -760,6 +795,7 @@ def _prevent_bridge_merges(
     embeddings: dict[int, list[float]],
     representative_threshold: float,
     incompatible_pairs: Optional[set[tuple[int, int]]] = None,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[ScoredPair], int]:
     """Stop one new broad article from collapsing unrelated old stories."""
     removed: set[tuple[int, int]] = set()
@@ -788,9 +824,11 @@ def _prevent_bridge_merges(
                 max(left_id, right_id),
             )
             not in incompatible_pairs
-            and cosine_similarity(
-                embeddings.get(left_id, []),
-                embeddings.get(right_id, []),
+            and _article_cosine_similarity(
+                left_id,
+                right_id,
+                embeddings,
+                embedding_norms,
             )
             >= representative_threshold
             for index, left_id in enumerate(representatives)
@@ -944,6 +982,14 @@ def _delete_affected_clusters_and_states(
             [(article_id,) for article_id in sorted(affected_article_ids)],
         )
     if affected_cluster_ids:
+        cursor.executemany(
+            "DELETE FROM final_story_publication_states WHERE cluster_id = ?",
+            [(cluster_id,) for cluster_id in affected_cluster_ids],
+        )
+        cursor.executemany(
+            "DELETE FROM final_unified_stories WHERE cluster_id = ?",
+            [(cluster_id,) for cluster_id in affected_cluster_ids],
+        )
         cursor.executemany(
             "DELETE FROM story_cluster_members WHERE cluster_id = ?",
             [(cluster_id,) for cluster_id in affected_cluster_ids],
@@ -1341,6 +1387,7 @@ def _embed_articles(articles, embedder, batch_size: int) -> dict[int, list[float
 def _score_pairs(
     candidates: list[CandidatePair],
     embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> list[ScoredPair]:
     scored_pairs: list[ScoredPair] = []
     for candidate in candidates:
@@ -1353,7 +1400,12 @@ def _score_pairs(
             ScoredPair(
                 left_id=candidate.left_id,
                 right_id=candidate.right_id,
-                similarity_score=cosine_similarity(left_embedding, right_embedding),
+                similarity_score=_article_cosine_similarity(
+                    candidate.left_id,
+                    candidate.right_id,
+                    embeddings,
+                    embedding_norms,
+                ),
                 lexical_overlap=candidate.lexical_overlap,
                 hours_apart=candidate.hours_apart,
             )
@@ -1369,6 +1421,7 @@ def _build_story_clusters(
     min_articles: int,
     representative_threshold: float,
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> ClusterBuildResult:
     if not linked_pairs:
         singleton_clusters = _singleton_story_clusters(
@@ -1409,6 +1462,7 @@ def _build_story_clusters(
                 min_articles,
                 representative_threshold,
                 cohesion_threshold,
+                embedding_norms,
             )
         )
         clusters.extend(component_clusters)
@@ -1486,6 +1540,7 @@ def _partition_component_by_representative(
     min_articles: int,
     representative_threshold: float,
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[StoryCluster], int]:
     pending_groups = [sorted(article_ids)]
     clusters: list[StoryCluster] = []
@@ -1505,6 +1560,7 @@ def _partition_component_by_representative(
             group,
             representative_id,
             embeddings,
+            embedding_norms,
         )
         accepted_ids = [
             article_id
@@ -1517,6 +1573,7 @@ def _partition_component_by_representative(
             member_scores,
             embeddings,
             cohesion_threshold,
+            embedding_norms,
         )
 
         if len(accepted_ids) >= min_articles:
@@ -1563,6 +1620,7 @@ def _add_cohesive_borderline_members(
     representative_scores: dict[int, float],
     embeddings: dict[int, list[float]],
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[int], list[int]]:
     accepted = list(accepted_ids)
     accepted_set = set(accepted_ids)
@@ -1582,7 +1640,12 @@ def _add_cohesive_borderline_members(
         if not candidate_embedding:
             continue
         is_cohesive = all(
-            cosine_similarity(candidate_embedding, embeddings.get(member_id, []))
+            _article_cosine_similarity(
+                candidate_id,
+                member_id,
+                embeddings,
+                embedding_norms,
+            )
             >= cohesion_threshold
             for member_id in accepted
         )
@@ -1618,6 +1681,7 @@ def _member_scores_to_representative(
     article_ids: list[int],
     representative_article_id: int,
     embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> dict[int, float]:
     representative_embedding = embeddings.get(representative_article_id)
     member_scores = {}
@@ -1627,11 +1691,34 @@ def _member_scores_to_representative(
         else:
             member_embedding = embeddings.get(article_id)
             member_scores[article_id] = (
-                cosine_similarity(representative_embedding, member_embedding)
+                _article_cosine_similarity(
+                    representative_article_id,
+                    article_id,
+                    embeddings,
+                    embedding_norms,
+                )
                 if representative_embedding and member_embedding
                 else 0.0
             )
     return member_scores
+
+
+def _article_cosine_similarity(
+    left_id: int,
+    right_id: int,
+    embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]],
+) -> float:
+    left_embedding = embeddings.get(left_id, [])
+    right_embedding = embeddings.get(right_id, [])
+    if embedding_norms is None:
+        return cosine_similarity(left_embedding, right_embedding)
+    return cosine_similarity_with_norms(
+        left_embedding,
+        right_embedding,
+        embedding_norms.get(left_id, 0.0),
+        embedding_norms.get(right_id, 0.0),
+    )
 
 
 def _cluster_confidence(
@@ -1649,6 +1736,9 @@ def _cluster_confidence(
 
 
 def _replace_clusters(cursor):
+    cursor.execute("DELETE FROM final_story_publication_states")
+    cursor.execute("DELETE FROM final_unified_stories")
+    cursor.execute("UPDATE clustering_article_state SET cluster_key = NULL")
     cursor.execute("DELETE FROM story_cluster_members")
     cursor.execute("DELETE FROM story_clusters")
 

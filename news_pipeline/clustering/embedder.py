@@ -100,6 +100,30 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def embedding_norm(vector: list[float]) -> float:
+    """Compute a vector norm with the clustering scorer's exact arithmetic."""
+    if not vector:
+        return 0.0
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def cosine_similarity_with_norms(
+    left: list[float],
+    right: list[float],
+    left_norm: float,
+    right_norm: float,
+) -> float:
+    """Compute cosine similarity while reusing exact precomputed norms."""
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(left, right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+
+    return dot / (left_norm * right_norm)
+
+
 def prepare_embedding_input(model_name: str, text: str) -> str:
     if model_name.startswith("intfloat/multilingual-e5"):
         return f"passage: {text}"

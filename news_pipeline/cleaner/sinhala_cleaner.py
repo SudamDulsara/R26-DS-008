@@ -12,6 +12,7 @@ from news_pipeline.statuses import (
     CLEAN_STATUS_QUALITY_QUARANTINE,
     CLEAN_STATUS_RETRYABLE_EXTRACTION,
     CLEAN_STATUS_UNSUPPORTED_MEDIA,
+    DEDUPE_STATUS_PENDING,
     URL_ERROR_ARTICLE_BODY_INCOMPLETE,
     URL_STATUS_EXHAUSTED,
     URL_STATUS_FETCH_FAILED,
@@ -213,7 +214,9 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                     """
                     UPDATE articles
                     SET clean_text = ?, sinhala_purity = ?, clean_status = ?,
-                        quality_flags = ?, cleaned_at = ?
+                        quality_flags = ?, cleaned_at = ?, clean_hash = NULL,
+                        dedupe_status = ?, is_duplicate = 0,
+                        duplicate_of_id = NULL
                     WHERE id = ?
                     """,
                     (
@@ -222,6 +225,7 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         CLEAN_STATUS_UNSUPPORTED_MEDIA,
                         json.dumps(quality_flags, ensure_ascii=False),
                         cleaned_at,
+                        DEDUPE_STATUS_PENDING,
                         article_id,
                     ),
                 )
@@ -239,7 +243,11 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         sinhala_purity = ?,
                         clean_status = ?,
                         quality_flags = ?,
-                        cleaned_at = ?
+                        cleaned_at = ?,
+                        clean_hash = NULL,
+                        dedupe_status = ?,
+                        is_duplicate = 0,
+                        duplicate_of_id = NULL
                     WHERE id = ?
                     """,
                     (
@@ -248,6 +256,7 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         CLEAN_STATUS_CLEANED,
                         json.dumps(quality_flags, ensure_ascii=False),
                         cleaned_at,
+                        DEDUPE_STATUS_PENDING,
                         article_id,
                     ),
                 )
@@ -266,7 +275,11 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         sinhala_purity = ?,
                         clean_status = ?,
                         quality_flags = ?,
-                        cleaned_at = ?
+                        cleaned_at = ?,
+                        clean_hash = NULL,
+                        dedupe_status = ?,
+                        is_duplicate = 0,
+                        duplicate_of_id = NULL
                     WHERE id = ?
                     """,
                     (
@@ -275,6 +288,7 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         CLEAN_STATUS_RETRYABLE_EXTRACTION,
                         json.dumps(quality_flags, ensure_ascii=False),
                         cleaned_at,
+                        DEDUPE_STATUS_PENDING,
                         article_id,
                     ),
                 )
@@ -319,7 +333,9 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                     """
                     UPDATE articles
                     SET clean_text = ?, sinhala_purity = ?, clean_status = ?,
-                        quality_flags = ?, cleaned_at = ?
+                        quality_flags = ?, cleaned_at = ?, clean_hash = NULL,
+                        dedupe_status = ?, is_duplicate = 0,
+                        duplicate_of_id = NULL
                     WHERE id = ?
                     """,
                     (
@@ -328,6 +344,7 @@ def run_cleaner(*, article_ids: set[int] | None = None):
                         CLEAN_STATUS_QUALITY_QUARANTINE,
                         json.dumps(quality_flags, ensure_ascii=False),
                         cleaned_at,
+                        DEDUPE_STATUS_PENDING,
                         article_id,
                     ),
                 )

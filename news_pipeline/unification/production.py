@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any, Mapping, Optional, Sequence
 
 from pydantic import ValidationError
@@ -562,6 +563,15 @@ def sync_gpt_unification_review_queue(
             return None
         queue_status = GPT_REVIEW_QUEUE_STATUS_APPROVED
 
+    cluster_id = version.get("cluster_id")
+    if cluster_id is not None:
+        cluster_exists = connection.execute(
+            "SELECT 1 FROM story_clusters WHERE id = ?",
+            (int(cluster_id),),
+        ).fetchone()
+        if cluster_exists is None:
+            cluster_id = None
+
     title, story = _candidate_snapshot(version)
     detected_at = (
         str(existing["detected_at"])
@@ -614,7 +624,7 @@ def sync_gpt_unification_review_queue(
         """,
         (
             int(version["id"]),
-            version.get("cluster_id"),
+            cluster_id,
             str(version["cluster_key"]),
             fingerprint,
             queue_status,
@@ -746,6 +756,12 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(
         _canonical_json(value).encode("utf-8")
     ).hexdigest()
+
+
+@lru_cache(maxsize=None)
+def _response_format_schema(model_class: type) -> dict[str, Any]:
+    """Build each immutable Pydantic response schema once per process."""
+    return model_class.model_json_schema()
 
 
 def build_reviewed_correction_followup_requirements(
@@ -1126,7 +1142,7 @@ def build_generation_identity(
         "model": request.model,
         "instructions": request.instructions,
         "input": request.input,
-        "text_format_schema": request.text_format.model_json_schema(),
+        "text_format_schema": _response_format_schema(request.text_format),
         "max_output_tokens": request.max_output_tokens,
         "reasoning_effort": request.reasoning_effort,
     }

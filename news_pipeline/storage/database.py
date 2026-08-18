@@ -29,6 +29,7 @@ def get_connection(config=None):
 
     conn = sqlite3.connect(config.db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -38,6 +39,128 @@ def _ensure_column(cursor, table_name: str, column_name: str, column_def: str):
     existing_columns = {row[1] for row in cursor.fetchall()}
     if column_name not in existing_columns:
         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+
+
+def _review_queue_cluster_delete_action(connection) -> Optional[str]:
+    for row in connection.execute(
+        "PRAGMA foreign_key_list(gpt_unification_review_queue)"
+    ):
+        if row[2] == "story_clusters" and row[3] == "cluster_id":
+            return str(row[6]).upper()
+    return None
+
+
+def _migrate_review_queue_cluster_foreign_key(connection) -> int:
+    """Preserve review history when its replaceable cluster row is deleted."""
+    if _review_queue_cluster_delete_action(connection) == "SET NULL":
+        return 0
+
+    orphan_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM gpt_unification_review_queue AS queue
+            LEFT JOIN story_clusters AS clusters
+              ON clusters.id = queue.cluster_id
+            WHERE queue.cluster_id IS NOT NULL
+              AND clusters.id IS NULL
+            """
+        ).fetchone()[0]
+    )
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE gpt_unification_review_queue_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                unified_story_version_id INTEGER NOT NULL UNIQUE,
+                cluster_id INTEGER,
+                story_id TEXT NOT NULL,
+                request_fingerprint_sha256 TEXT NOT NULL UNIQUE,
+                queue_status TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                validation_status TEXT NOT NULL,
+                fallback_reason TEXT,
+                candidate_title TEXT,
+                candidate_story TEXT,
+                prompt_version TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                response_id TEXT,
+                detected_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                review_decision TEXT,
+                review_notes TEXT,
+                FOREIGN KEY (unified_story_version_id)
+                    REFERENCES unified_story_versions(id) ON DELETE CASCADE,
+                FOREIGN KEY (cluster_id)
+                    REFERENCES story_clusters(id) ON DELETE SET NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO gpt_unification_review_queue_migration (
+                id, unified_story_version_id, cluster_id, story_id,
+                request_fingerprint_sha256, queue_status,
+                reason_codes_json, validation_status, fallback_reason,
+                candidate_title, candidate_story, prompt_version,
+                model_name, response_id, detected_at, updated_at,
+                reviewed_at, review_decision, review_notes
+            )
+            SELECT
+                queue.id,
+                queue.unified_story_version_id,
+                CASE
+                    WHEN queue.cluster_id IS NULL THEN NULL
+                    WHEN clusters.id IS NOT NULL THEN queue.cluster_id
+                    ELSE NULL
+                END,
+                queue.story_id,
+                queue.request_fingerprint_sha256,
+                queue.queue_status,
+                queue.reason_codes_json,
+                queue.validation_status,
+                queue.fallback_reason,
+                queue.candidate_title,
+                queue.candidate_story,
+                queue.prompt_version,
+                queue.model_name,
+                queue.response_id,
+                queue.detected_at,
+                queue.updated_at,
+                queue.reviewed_at,
+                queue.review_decision,
+                queue.review_notes
+            FROM gpt_unification_review_queue AS queue
+            LEFT JOIN story_clusters AS clusters
+              ON clusters.id = queue.cluster_id
+            ORDER BY queue.id
+            """
+        )
+        connection.execute("DROP TABLE gpt_unification_review_queue")
+        connection.execute(
+            """
+            ALTER TABLE gpt_unification_review_queue_migration
+            RENAME TO gpt_unification_review_queue
+            """
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            "foreign-key migration left integrity violations: "
+            f"{len(violations)}"
+        )
+    return orphan_count
 
 
 def _backfill_pipeline_snapshot_state(cursor) -> None:
@@ -284,6 +407,26 @@ def initialize_db():
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS publication_generation_identity_cache (
+            cache_key_sha256 TEXT PRIMARY KEY,
+            cache_revision TEXT NOT NULL,
+            cluster_key TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            reasoning_effort TEXT NOT NULL,
+            max_output_tokens INTEGER NOT NULL,
+            source_fingerprint_sha256 TEXT NOT NULL,
+            input_fingerprint_sha256 TEXT NOT NULL,
+            request_fingerprint_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS story_cluster_transitions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transition_batch_id TEXT NOT NULL,
@@ -401,7 +544,7 @@ def initialize_db():
             FOREIGN KEY (unified_story_version_id)
                 REFERENCES unified_story_versions(id) ON DELETE CASCADE,
             FOREIGN KEY (cluster_id)
-                REFERENCES story_clusters(id)
+                REFERENCES story_clusters(id) ON DELETE SET NULL
         )
         """
     )
@@ -489,6 +632,8 @@ def initialize_db():
         )
         """
     )
+
+    _migrate_review_queue_cluster_foreign_key(conn)
 
     _ensure_column(cursor, "discovered_urls", "rss_title", "rss_title TEXT")
     _ensure_column(cursor, "discovered_urls", "rss_published", "rss_published TEXT")
@@ -734,6 +879,34 @@ def initialize_db():
     )
     cursor.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_articles_dedup_scan
+        ON articles(
+            clean_status,
+            id,
+            source,
+            clean_hash,
+            dedupe_status,
+            is_duplicate,
+            duplicate_of_id
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_articles_publication_disposition
+        ON articles(
+            url,
+            title,
+            published_date,
+            clean_status,
+            dedupe_status,
+            quality_flags,
+            duplicate_of_id
+        )
+        """
+    )
+    cursor.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_story_clusters_representative
         ON story_clusters(representative_article_id)
         """
@@ -760,6 +933,14 @@ def initialize_db():
         """
         CREATE INDEX IF NOT EXISTS idx_clustering_embedding_cache_model
         ON clustering_embedding_cache(model_name, model_revision)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_publication_identity_cache_request
+        ON publication_generation_identity_cache(
+            request_fingerprint_sha256
+        )
         """
     )
     cursor.execute(
@@ -802,6 +983,12 @@ def initialize_db():
         """
         CREATE INDEX IF NOT EXISTS idx_final_story_state_status
         ON final_story_publication_states(publication_status, story_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_final_story_sources_article
+        ON final_story_sources(article_id, story_id)
         """
     )
     cursor.execute(

@@ -215,6 +215,7 @@ def _result(
     manifest: dict[str, Any],
     exported_unique_articles: int,
     reused: bool,
+    runtime_metrics: dict[str, Any],
 ) -> dict[str, Any]:
     counts = manifest["counts"]
     return {
@@ -231,6 +232,7 @@ def _result(
         "exported_unique_articles": exported_unique_articles,
         "story_clusters": counts["eligible_clusters"],
         "unified_stories": counts["final_unified_stories"],
+        "publication_performance": runtime_metrics,
     }
 
 
@@ -265,6 +267,7 @@ def export_current_publication(
             published_output_dir=current_dir,
             config=selected_config,
         )
+        runtime_metrics = dict(manifest.pop("_runtime_metrics", {}))
         report = {
             "export_version": CURRENT_EXPORT_VERSION,
             "generated_at": datetime.now().astimezone().isoformat(
@@ -318,6 +321,7 @@ def export_current_publication(
                 manifest=existing_manifest,
                 exported_unique_articles=exported_unique_articles,
                 reused=True,
+                runtime_metrics=runtime_metrics,
             )
 
         _atomic_publish(
@@ -334,6 +338,7 @@ def export_current_publication(
             manifest=manifest,
             exported_unique_articles=exported_unique_articles,
             reused=False,
+            runtime_metrics=runtime_metrics,
         )
     except Exception:
         if staging_dir.exists():

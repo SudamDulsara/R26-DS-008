@@ -132,6 +132,22 @@ def _apply_semantic_partition(
     )
 
     connection.execute(
+        "DELETE FROM final_story_publication_states WHERE cluster_id = ?",
+        (int(cluster["id"]),),
+    )
+    connection.execute(
+        "DELETE FROM final_unified_stories WHERE cluster_id = ?",
+        (int(cluster["id"]),),
+    )
+    connection.execute(
+        """
+        UPDATE clustering_article_state
+        SET cluster_key = NULL
+        WHERE cluster_key = ?
+        """,
+        (cluster_key,),
+    )
+    connection.execute(
         "DELETE FROM story_cluster_members WHERE cluster_id = ?",
         (int(cluster["id"]),),
     )

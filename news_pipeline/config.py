@@ -421,6 +421,16 @@ def load_config(
         )
         for field_name, (setting_name, kind) in SETTING_SPECS.items()
     }
+    configured_model_name = settings["NEWS_PIPELINE_CLUSTER_MODEL"].strip()
+    selected_model_name = str(operational_values["cluster_model_name"])
+    if (
+        selected_model_name != configured_model_name
+        and "NEWS_PIPELINE_CLUSTER_MODEL" in os.environ
+        and "NEWS_PIPELINE_CLUSTER_MODEL_REVISION" not in os.environ
+    ):
+        # A revision is model-specific. An explicit environment override of the
+        # model must not silently inherit the committed default model's pin.
+        operational_values["cluster_model_revision"] = None
     api_key = environment.get("OPENAI_API_KEY")
     return PipelineConfig(
         project_root=project_root,

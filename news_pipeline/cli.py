@@ -9,6 +9,15 @@ def build_parser():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init-db", help="Initialize the SQLite database")
+    backup_parser = subparsers.add_parser(
+        "backup-db",
+        help="Create and verify an online SQLite backup",
+    )
+    backup_parser.add_argument(
+        "--output",
+        type=str,
+        help="Optional non-existing destination .db path",
+    )
     status_parser = subparsers.add_parser(
         "status",
         help="Show local pipeline, snapshot, and publication health",
@@ -148,6 +157,13 @@ def build_parser():
         "export",
         help="Export a versioned dataset snapshot",
     )
+    subparsers.add_parser(
+        "publish-current",
+        help=(
+            "Rebuild or reuse the current consumer bundle without crawling "
+            "or making GPT calls"
+        ),
+    )
 
     run_parser = subparsers.add_parser(
         "run",
@@ -170,6 +186,22 @@ def main(argv=None):
         from news_pipeline.pipeline import run_pipeline
 
         return run_pipeline(no_gpt=args.no_gpt)
+
+    if args.command == "backup-db":
+        from pathlib import Path
+
+        from news_pipeline.storage.backup import create_verified_backup
+
+        result = create_verified_backup(
+            output_path=Path(args.output) if args.output else None,
+        )
+        print(
+            "Verified SQLite backup: "
+            f"{result['backup_path']} | {result['size_bytes']} bytes | "
+            f"SHA-256 {result['sha256']} | "
+            f"foreign-key violations {result['foreign_key_violations']}"
+        )
+        return result
 
     initialize_db()
     setup_logger()
@@ -208,6 +240,12 @@ def main(argv=None):
         from news_pipeline.extractor.metadata_backfill import run_metadata_backfill
 
         return run_metadata_backfill(overwrite=args.overwrite)
+    if args.command == "publish-current":
+        from news_pipeline.dataset.current_exporter import (
+            export_current_publication,
+        )
+
+        return export_current_publication()
     if args.command == "clean":
         from news_pipeline.cleaner.sinhala_cleaner import run_cleaner
 
