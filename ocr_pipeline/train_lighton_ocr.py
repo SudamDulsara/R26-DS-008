@@ -355,7 +355,26 @@ if USE_4BIT and not HAVE_BNB:
 print(f"quantisation: {'4-bit' if USE_4BIT else 'none (full precision weights)'}")
 
 BATCH_SIZE = 1          # one page per step; pages are large
-GRAD_ACCUM = 8          # effective batch of 8
+
+#: How many pages are averaged into one weight update.
+#:
+#: This does NOT change how long the run takes. Wall-clock time is set by the
+#: number of pages pushed through the model, and that is epochs x 707 whatever
+#: this is. What it changes is how many times the weights actually move:
+#:
+#:     accum   updates per epoch   effective batch
+#:     8       89                  8
+#:     4       177                 4
+#:     2       354                 2
+#:
+#: That matters when the budget only allows one epoch. At 42.1s per page on a
+#: T4, 707 pages is 8.3 hours, so a Kaggle session fits one epoch and no more.
+#: One epoch at accum 8 is 89 updates -- too few for LoRA to learn a script
+#: the model has never seen. Dropping to 4 doubles the updates for free.
+#:
+#: The cost is a noisier gradient. 4 is the compromise: still an average over
+#: four pages, twice the learning steps.
+GRAD_ACCUM = int(os.environ.get("GRAD_ACCUM", "8"))
 LEARNING_RATE = 1e-4    # standard for LoRA; the base weights stay frozen
 
 #: MEASURED, not estimated. At 1024px in fp32 on a T4: 15.8s per page.
