@@ -52,6 +52,36 @@ you run it for real. Set SMOKE=0 (or unset it) for the full run.
 """
 
 # ══════════════════════════════════════════════════════════════
+#  0. One GPU. This must be the first executable line in the file.
+# ══════════════════════════════════════════════════════════════
+# Kaggle's "GPU T4 x2" gives two cards. The Trainer sees two, wraps the model
+# in DataParallel, and copies it to the second card on every step.
+#
+# That is fatal here, not merely wasteful: a 4-bit quantised layer holds
+# pointers into the memory of the card it was created on. DataParallel copies
+# the module to card 1 without moving what those pointers refer to, so the
+# copy reads addresses belonging to card 0 and CUDA aborts with
+#
+#     torch.AcceleratorError: CUDA error: an illegal memory access
+#     ... in peft/tuners/lora/bnb.py, forward
+#
+# observed 2026-08-18 in the vision encoder's feed-forward LoRA.
+#
+# WHY THIS MOVED TO THE TOP OF THE FILE
+# -------------------------------------
+# It used to sit next to the torch import in section 2, which looked correct
+# -- the rule is "set it before torch is imported". But section 1 checks that
+# transformers knows LightOnOcr, and importing transformers imports torch.
+# So torch was already loaded by the time the variable was set, CUDA counted
+# two devices, and the pin did nothing.
+#
+# Nothing may execute above this line. In a notebook, also make sure no
+# earlier cell imports torch or transformers.
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# ══════════════════════════════════════════════════════════════
 #  1. Install
 # ══════════════════════════════════════════════════════════════
 # LightOnOCR is a recent addition to transformers. Kaggle's preinstalled
@@ -144,13 +174,9 @@ import random
 import time
 import unicodedata
 
-# ── Must be set before torch is imported ────────────────────────────
-#
-# One GPU, not two. Kaggle offers T4 x2 and the Trainer would wrap the model
-# in DataParallel, replicating it on both cards and gathering every output
-# onto card 0 -- which is the card that then runs out. This exact failure cost
-# a run on this project already.
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# CUDA_VISIBLE_DEVICES is set in section 0, at the very top of the file.
+# It cannot live here: section 1 imports transformers, which imports torch,
+# so by this point torch has already counted the cards.
 
 # Lets the allocator grow segments rather than fragment them.
 # Linux only -- Windows prints "expandable_segments not supported on this
@@ -467,6 +493,20 @@ if not torch.cuda.is_available():
     sys.exit("No GPU. Kaggle: Settings -> Accelerator -> GPU T4 x2.")
 print("GPU:", torch.cuda.get_device_name(0))
 print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# Did the pin in section 0 actually take? Print it rather than assume it.
+#
+# The failure is silent otherwise: the Trainer builds DataParallel, the run
+# looks fine for several minutes, and then dies inside a quantised LoRA layer
+# with an error that says nothing about multiple GPUs.
+_N_GPU = torch.cuda.device_count()
+print(f"visible GPUs: {_N_GPU}")
+if _N_GPU > 1:
+    print("  WARNING: more than one GPU is visible, so CUDA_VISIBLE_DEVICES "
+          "did not take effect.")
+    print("  Something imported torch before section 0 ran -- in a notebook, "
+          "check the cells above.")
+    print("  Section 7 forces single-GPU training anyway, but fix the cause.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1077,6 +1117,16 @@ args = TrainingArguments(
     # the collator's work is one image resize.
     dataloader_num_workers=0 if os.name == "nt" else 2,
 )
+
+# Second lock on the single-GPU rule, independent of the environment variable.
+#
+# TrainingArguments counts the cards at construction time and the Trainer
+# wraps the model in DataParallel whenever that count is above one. Setting it
+# back to one here works no matter what happened during import, so the run
+# cannot be destroyed by an import-order accident in a notebook.
+if getattr(args, "_n_gpu", 1) > 1:
+    print(f"forcing single-GPU training (Trainer had counted {args._n_gpu})")
+    args._n_gpu = 1
 
 if BASE_ONLY:
     print("\nBASE_ONLY: skipping training. Section 8 scores the untuned model.")
