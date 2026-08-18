@@ -3,13 +3,27 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from time import perf_counter
 from typing import Optional
 
 from news_pipeline.clustering.candidate_builder import (
     CandidatePair,
     build_candidate_pairs,
 )
-from news_pipeline.clustering.embedder import cosine_similarity, create_embedder
+from news_pipeline.clustering.embedding_cache import (
+    load_cached_vectors,
+    persist_cached_vectors,
+)
+from news_pipeline.clustering.embedder import (
+    cosine_similarity,
+    cosine_similarity_with_norms,
+    create_embedder,
+    embedding_norm,
+    embedding_input_fingerprint,
+)
+from news_pipeline.clustering.semantic_constraints import (
+    load_active_different_event_pairs,
+)
 from news_pipeline.clustering.text import (
     ClusterArticle,
     build_similarity_text,
@@ -81,6 +95,9 @@ def run_event_clustering(
     similarity_threshold: Optional[float] = None,
     representative_threshold: Optional[float] = None,
     cohesion_threshold: Optional[float] = None,
+    force_article_ids: Optional[set[int]] = None,
+    use_embedding_cache: bool = True,
+    reuse_embedding_norms: bool = True,
 ):
     config = load_config()
     selected_model = model_name or config.cluster_model_name
@@ -122,6 +139,10 @@ def run_event_clustering(
     states = _load_clustering_states(cursor)
     articles = _load_cluster_articles(cursor, config.cluster_lead_char_limit)
     article_by_id = {article.id: article for article in articles}
+    different_event_pairs = load_active_different_event_pairs(
+        cursor,
+        article_by_id=article_by_id,
+    )
     eligible_article_ids = set(article_by_id)
     contract = _clustering_contract(
         model_name=selected_model,
@@ -142,12 +163,16 @@ def run_event_clustering(
     singleton_clusters_backfilled = 0
 
     logger.info("=== Incremental Same-Event Clustering Started ===")
-    logger.info("Eligible unique cleaned articles: %s", len(articles))
+    logger.info("Clustering setup:")
+    logger.info("  Eligible cleaned articles: %s", len(articles))
     logger.info(
-        "Model: %s@%s | Link threshold: %s | Representative threshold: %s | "
-        "Cohesion threshold: %s",
+        "  Embedding model: %s@%s",
         selected_model,
         selected_revision or "latest",
+    )
+    logger.info(
+        "  Similarity thresholds: direct link >= %s | representative >= %s | "
+        "all-member cohesion >= %s",
         threshold,
         representative_cutoff,
         cohesion_cutoff,
@@ -172,6 +197,7 @@ def run_event_clustering(
             "affected_articles": 0,
             "candidate_pairs": 0,
             "linked_pairs": 0,
+            "semantic_constraint_pairs_removed": 0,
             "bridge_pairs_removed": 0,
             "story_clusters": story_clusters,
             "clustered_articles": clustered_articles,
@@ -190,6 +216,18 @@ def run_event_clustering(
             "baseline_initialized": baseline_initialized,
             "incremental_noop": incremental_noop,
             "embedding_articles": 0,
+            "embedding_cache_enabled": bool(use_embedding_cache),
+            "embedding_cache_hits": 0,
+            "embedding_cache_misses": 0,
+            "embedding_encoded_vectors": 0,
+            "embedding_cache_lookup_seconds": 0.0,
+            "embedding_model_load_seconds": 0.0,
+            "embedding_encoding_seconds": 0.0,
+            "embedding_cache_write_seconds": 0.0,
+            "embedding_total_seconds": 0.0,
+            "similarity_norm_vectors": 0,
+            "similarity_norm_seconds": 0.0,
+            "candidate_scoring_seconds": 0.0,
             "changed_story_keys": [],
             "transition_batch_id": None,
             "cluster_transition_counts": {},
@@ -311,7 +349,7 @@ def run_event_clustering(
             or states[article_id]["clustering_status"]
             == CLUSTERING_STATUS_INELIGIBLE
         )
-    }
+    } | (set(force_article_ids or set()) & eligible_article_ids)
     retired_article_ids = {
         article_id
         for article_id, state in states.items()
@@ -329,7 +367,9 @@ def run_event_clustering(
             incremental_noop=True,
         )
         conn.close()
-        logger.info("No clustering input changes; embedding calls: 0")
+        logger.info("Clustering summary:")
+        logger.info("  No new, changed, or retired clustering inputs.")
+        logger.info("  Embeddings generated: 0")
         return result
 
     potential_pairs = build_candidate_pairs(
@@ -377,21 +417,71 @@ def run_event_clustering(
     ]
 
     embedder = None
+    embedding_metrics = _empty_embedding_metrics(use_embedding_cache)
     linked_pairs = []
     build_result = ClusterBuildResult([], 0, 0, 0, 0, 0)
+    embedding_norms = None
+    similarity_norm_vectors = 0
+    similarity_norm_seconds = 0.0
+    candidate_scoring_seconds = 0.0
     if len(affected_articles) >= config.cluster_min_articles:
-        embedder = create_embedder(selected_model, selected_revision)
-        embeddings = _embed_articles(
+        embeddings, embedder, embedding_metrics = _embed_articles_with_cache(
             affected_articles,
-            embedder,
-            config.cluster_batch_size,
+            cursor=cursor,
+            model_name=selected_model,
+            model_revision=selected_revision,
+            batch_size=config.cluster_batch_size,
+            use_embedding_cache=use_embedding_cache,
         )
-        scored_pairs = _score_pairs(candidates, embeddings)
+        if reuse_embedding_norms:
+            norm_started = perf_counter()
+            embedding_norms = {
+                article_id: embedding_norm(vector)
+                for article_id, vector in embeddings.items()
+            }
+            similarity_norm_vectors = len(embedding_norms)
+            similarity_norm_seconds = round(
+                perf_counter() - norm_started,
+                6,
+            )
+        scoring_started = perf_counter()
+        scored_pairs = _score_pairs(
+            candidates,
+            embeddings,
+            embedding_norms=embedding_norms,
+        )
+        candidate_scoring_seconds = round(
+            perf_counter() - scoring_started,
+            6,
+        )
         linked_pairs = [
             pair
             for pair in scored_pairs
             if pair.similarity_score >= threshold
         ]
+        linked_before_constraints = len(linked_pairs)
+        linked_pairs = [
+            pair
+            for pair in linked_pairs
+            if (
+                min(pair.left_id, pair.right_id),
+                max(pair.left_id, pair.right_id),
+            )
+            not in different_event_pairs
+        ]
+        direct_constraint_pairs_removed = (
+            linked_before_constraints - len(linked_pairs)
+        )
+        linked_pairs, component_constraint_pairs_removed = (
+            _prevent_incompatible_components(
+                linked_pairs=linked_pairs,
+                incompatible_pairs=different_event_pairs,
+            )
+        )
+        semantic_constraint_pairs_removed = (
+            direct_constraint_pairs_removed
+            + component_constraint_pairs_removed
+        )
         linked_pairs, bridge_pairs_removed = _prevent_bridge_merges(
             linked_pairs=linked_pairs,
             changed_article_ids=changed_article_ids,
@@ -399,6 +489,8 @@ def run_event_clustering(
             cluster_key_by_article=current_cluster_key_by_article,
             embeddings=embeddings,
             representative_threshold=representative_cutoff,
+            incompatible_pairs=different_event_pairs,
+            embedding_norms=embedding_norms,
         )
         build_result = _build_story_clusters(
             affected_articles,
@@ -407,8 +499,10 @@ def run_event_clustering(
             min_articles=config.cluster_min_articles,
             representative_threshold=representative_cutoff,
             cohesion_threshold=cohesion_cutoff,
+            embedding_norms=embedding_norms,
         )
     elif affected_articles:
+        semantic_constraint_pairs_removed = 0
         bridge_pairs_removed = 0
         build_result = _build_story_clusters(
             affected_articles,
@@ -420,13 +514,14 @@ def run_event_clustering(
         )
 
     else:
+        semantic_constraint_pairs_removed = 0
         bridge_pairs_removed = 0
 
-    resolved_model_name = (
-        embedder.model_name if embedder is not None else selected_model
+    resolved_model_name = str(
+        embedding_metrics.get("resolved_model_name") or selected_model
     )
     resolved_model_revision = (
-        embedder.model_revision if embedder is not None else selected_revision
+        embedding_metrics.get("resolved_model_revision") or selected_revision
     )
     _delete_affected_clusters_and_states(
         cursor,
@@ -439,7 +534,7 @@ def run_event_clustering(
         article_by_id=article_by_id,
         model_name=resolved_model_name,
         model_revision=resolved_model_revision,
-        text_variant="title_lead",
+        text_variant="title_lead_embedding_candidates_v2",
         similarity_threshold=threshold,
         representative_threshold=representative_cutoff,
         cohesion_threshold=cohesion_cutoff,
@@ -490,23 +585,50 @@ def run_event_clustering(
     story_clusters, clustered_articles = current_counts()
     conn.close()
 
-    logger.info("Affected articles embedded: %s", len(affected_articles))
-    logger.info("Candidate pairs in affected window: %s", len(candidates))
-    logger.info("Linked pairs over threshold: %s", len(linked_pairs))
+    logger.info("Clustering summary:")
+    logger.info(
+        "  Articles reconsidered: %s (changed articles and nearby context)",
+        len(affected_articles),
+    )
+    logger.info(
+        "  Embeddings: %s reused, %s cache misses, %s newly encoded in %.3fs",
+        embedding_metrics["embedding_cache_hits"],
+        embedding_metrics["embedding_cache_misses"],
+        embedding_metrics["embedding_encoded_vectors"],
+        embedding_metrics["embedding_total_seconds"],
+    )
+    logger.info(
+        "  Candidate comparisons: %s (article pairs inside the configured window)",
+        len(candidates),
+    )
+    logger.info(
+        "  Same-event links retained: %s (after thresholds and safeguards)",
+        len(linked_pairs),
+    )
     if build_result.unclustered_articles:
         logger.info(
-            "Articles routed to publishable singleton stories: %s",
+            "  Standalone stories: %s (not safely grouped with another article)",
             build_result.unclustered_articles,
         )
     if bridge_pairs_removed:
         logger.info(
-            "Bridge links removed to protect existing story boundaries: %s",
+            "  Ambiguous bridge links removed: %s",
             bridge_pairs_removed,
         )
+    if semantic_constraint_pairs_removed:
+        logger.info(
+            "  Previously audited different-event links removed: %s",
+            semantic_constraint_pairs_removed,
+        )
     logger.info(
-        "Replaced %s clusters and preserved %s unrelated clusters",
+        "  Previously stored groups replaced: %s | Unrelated groups kept: %s",
         len(affected_cluster_ids),
         len(clusters_by_key) - len(affected_cluster_ids),
+    )
+    logger.info(
+        "  Final story groups: %s covering %s eligible articles",
+        story_clusters,
+        clustered_articles,
     )
 
     return {
@@ -516,6 +638,9 @@ def run_event_clustering(
         "affected_articles": len(affected_article_ids),
         "candidate_pairs": len(candidates),
         "linked_pairs": len(linked_pairs),
+        "semantic_constraint_pairs_removed": (
+            semantic_constraint_pairs_removed
+        ),
         "bridge_pairs_removed": bridge_pairs_removed,
         "story_clusters": story_clusters,
         "clustered_articles": clustered_articles,
@@ -540,6 +665,14 @@ def run_event_clustering(
         "baseline_initialized": baseline_initialized,
         "incremental_noop": False,
         "embedding_articles": len(affected_articles),
+        "similarity_norm_vectors": similarity_norm_vectors,
+        "similarity_norm_seconds": similarity_norm_seconds,
+        "candidate_scoring_seconds": candidate_scoring_seconds,
+        **{
+            key: value
+            for key, value in embedding_metrics.items()
+            if not key.startswith("resolved_")
+        },
         "changed_story_keys": sorted(new_memberships_by_key),
         "transition_batch_id": transition_batch_id,
         "cluster_transition_counts": transition_counts,
@@ -661,6 +794,8 @@ def _prevent_bridge_merges(
     cluster_key_by_article: dict[int, str],
     embeddings: dict[int, list[float]],
     representative_threshold: float,
+    incompatible_pairs: Optional[set[tuple[int, int]]] = None,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[ScoredPair], int]:
     """Stop one new broad article from collapsing unrelated old stories."""
     removed: set[tuple[int, int]] = set()
@@ -682,10 +817,18 @@ def _prevent_bridge_merges(
             int(clusters_by_key[key]["representative_article_id"])
             for key in sorted(links_by_old_cluster)
         ]
+        incompatible_pairs = incompatible_pairs or set()
         representatives_are_compatible = all(
-            cosine_similarity(
-                embeddings.get(left_id, []),
-                embeddings.get(right_id, []),
+            (
+                min(left_id, right_id),
+                max(left_id, right_id),
+            )
+            not in incompatible_pairs
+            and _article_cosine_similarity(
+                left_id,
+                right_id,
+                embeddings,
+                embedding_norms,
             )
             >= representative_threshold
             for index, left_id in enumerate(representatives)
@@ -721,6 +864,83 @@ def _prevent_bridge_merges(
         not in removed
     ]
     return retained, len(linked_pairs) - len(retained)
+
+
+def _prevent_incompatible_components(
+    *,
+    linked_pairs: list[ScoredPair],
+    incompatible_pairs: set[tuple[int, int]],
+) -> tuple[list[ScoredPair], int]:
+    """Keep audited different-event articles out of the same component.
+
+    Removing only the direct link is insufficient because an otherwise
+    unreviewed article can bridge two audited-incompatible groups. Links are
+    considered strongest-first so a new article joins the best-supported
+    compatible component without needlessly forcing it to a singleton.
+    """
+    if not linked_pairs or not incompatible_pairs:
+        return linked_pairs, 0
+
+    article_ids = sorted(
+        {
+            article_id
+            for pair in linked_pairs
+            for article_id in (pair.left_id, pair.right_id)
+        }
+    )
+    union_find = UnionFind(article_ids)
+    members_by_root = {article_id: {article_id} for article_id in article_ids}
+    retained: list[ScoredPair] = []
+    removed = 0
+
+    for pair in sorted(
+        linked_pairs,
+        key=lambda item: (
+            -item.similarity_score,
+            min(item.left_id, item.right_id),
+            max(item.left_id, item.right_id),
+        ),
+    ):
+        left_root = union_find.find(pair.left_id)
+        right_root = union_find.find(pair.right_id)
+        if left_root == right_root:
+            retained.append(pair)
+            continue
+
+        left_members = members_by_root[left_root]
+        right_members = members_by_root[right_root]
+        would_violate = any(
+            (min(left_id, right_id), max(left_id, right_id))
+            in incompatible_pairs
+            for left_id in left_members
+            for right_id in right_members
+        )
+        if would_violate:
+            removed += 1
+            continue
+
+        union_find.union(left_root, right_root)
+        merged_root = union_find.find(left_root)
+        retired_root = (
+            right_root if merged_root == left_root else left_root
+        )
+        members_by_root[merged_root] = left_members | right_members
+        members_by_root.pop(retired_root, None)
+        retained.append(pair)
+
+    retained_ids = {
+        (min(pair.left_id, pair.right_id), max(pair.left_id, pair.right_id))
+        for pair in retained
+    }
+    return (
+        [
+            pair
+            for pair in linked_pairs
+            if (min(pair.left_id, pair.right_id), max(pair.left_id, pair.right_id))
+            in retained_ids
+        ],
+        removed,
+    )
 
 
 def _select_affected_article_ids(
@@ -762,6 +982,14 @@ def _delete_affected_clusters_and_states(
             [(article_id,) for article_id in sorted(affected_article_ids)],
         )
     if affected_cluster_ids:
+        cursor.executemany(
+            "DELETE FROM final_story_publication_states WHERE cluster_id = ?",
+            [(cluster_id,) for cluster_id in affected_cluster_ids],
+        )
+        cursor.executemany(
+            "DELETE FROM final_unified_stories WHERE cluster_id = ?",
+            [(cluster_id,) for cluster_id in affected_cluster_ids],
+        )
         cursor.executemany(
             "DELETE FROM story_cluster_members WHERE cluster_id = ?",
             [(cluster_id,) for cluster_id in affected_cluster_ids],
@@ -1010,6 +1238,142 @@ def _load_cluster_articles(cursor, lead_char_limit: int) -> list[ClusterArticle]
     return articles
 
 
+def _empty_embedding_metrics(use_embedding_cache: bool) -> dict:
+    return {
+        "embedding_cache_enabled": bool(use_embedding_cache),
+        "embedding_cache_hits": 0,
+        "embedding_cache_misses": 0,
+        "embedding_encoded_vectors": 0,
+        "embedding_cache_lookup_seconds": 0.0,
+        "embedding_model_load_seconds": 0.0,
+        "embedding_encoding_seconds": 0.0,
+        "embedding_cache_write_seconds": 0.0,
+        "embedding_total_seconds": 0.0,
+        "resolved_model_name": None,
+        "resolved_model_revision": None,
+    }
+
+
+def _embed_articles_with_cache(
+    articles,
+    *,
+    cursor,
+    model_name: str,
+    model_revision: Optional[str],
+    batch_size: int,
+    use_embedding_cache: bool,
+):
+    started = perf_counter()
+    metrics = _empty_embedding_metrics(use_embedding_cache)
+    fingerprints = [
+        embedding_input_fingerprint(model_name, article.similarity_text)
+        for article in articles
+    ]
+    cached_by_fingerprint: dict[str, list[float]] = {}
+    resolved_revision = model_revision
+    embedder = None
+
+    if resolved_revision is None:
+        model_load_started = perf_counter()
+        embedder = create_embedder(model_name, model_revision)
+        metrics["embedding_model_load_seconds"] = round(
+            perf_counter() - model_load_started,
+            6,
+        )
+        model_name = embedder.model_name
+        resolved_revision = embedder.model_revision
+
+    if use_embedding_cache and resolved_revision:
+        lookup_started = perf_counter()
+        cached_by_fingerprint = load_cached_vectors(
+            cursor,
+            input_fingerprints=fingerprints,
+            model_name=model_name,
+            model_revision=str(resolved_revision),
+        )
+        metrics["embedding_cache_lookup_seconds"] = round(
+            perf_counter() - lookup_started,
+            6,
+        )
+
+    missing_indexes = [
+        index
+        for index, fingerprint in enumerate(fingerprints)
+        if fingerprint not in cached_by_fingerprint
+    ]
+    metrics["embedding_cache_hits"] = len(articles) - len(missing_indexes)
+    metrics["embedding_cache_misses"] = len(missing_indexes)
+
+    if missing_indexes:
+        if embedder is None:
+            model_load_started = perf_counter()
+            embedder = create_embedder(model_name, resolved_revision)
+            metrics["embedding_model_load_seconds"] = round(
+                perf_counter() - model_load_started,
+                6,
+            )
+        actual_model_name = embedder.model_name
+        actual_revision = embedder.model_revision
+        if (
+            cached_by_fingerprint
+            and (
+                actual_model_name != model_name
+                or actual_revision != resolved_revision
+            )
+        ):
+            raise RuntimeError(
+                "embedding model resolved differently from the pinned cache key"
+            )
+        model_name = actual_model_name
+        resolved_revision = actual_revision
+        texts = [articles[index].similarity_text for index in missing_indexes]
+        encoding_started = perf_counter()
+        vectors = embedder.encode(texts, batch_size=batch_size)
+        metrics["embedding_encoding_seconds"] = round(
+            perf_counter() - encoding_started,
+            6,
+        )
+        encoded_by_index = {
+            index: vector
+            for index, vector in zip(missing_indexes, vectors)
+            if vector
+        }
+        metrics["embedding_encoded_vectors"] = len(encoded_by_index)
+        if use_embedding_cache and resolved_revision:
+            write_started = perf_counter()
+            persist_cached_vectors(
+                cursor,
+                vectors_by_fingerprint={
+                    fingerprints[index]: vector
+                    for index, vector in encoded_by_index.items()
+                },
+                model_name=model_name,
+                model_revision=str(resolved_revision),
+            )
+            metrics["embedding_cache_write_seconds"] = round(
+                perf_counter() - write_started,
+                6,
+            )
+    else:
+        encoded_by_index = {}
+
+    embeddings = {
+        article.id: (
+            cached_by_fingerprint.get(fingerprints[index])
+            or encoded_by_index.get(index)
+        )
+        for index, article in enumerate(articles)
+        if (
+            cached_by_fingerprint.get(fingerprints[index])
+            or encoded_by_index.get(index)
+        )
+    }
+    metrics["resolved_model_name"] = model_name
+    metrics["resolved_model_revision"] = resolved_revision
+    metrics["embedding_total_seconds"] = round(perf_counter() - started, 6)
+    return embeddings, embedder, metrics
+
+
 def _embed_articles(articles, embedder, batch_size: int) -> dict[int, list[float]]:
     texts = [article.similarity_text for article in articles]
     vectors = embedder.encode(texts, batch_size=batch_size)
@@ -1023,6 +1387,7 @@ def _embed_articles(articles, embedder, batch_size: int) -> dict[int, list[float
 def _score_pairs(
     candidates: list[CandidatePair],
     embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> list[ScoredPair]:
     scored_pairs: list[ScoredPair] = []
     for candidate in candidates:
@@ -1035,7 +1400,12 @@ def _score_pairs(
             ScoredPair(
                 left_id=candidate.left_id,
                 right_id=candidate.right_id,
-                similarity_score=cosine_similarity(left_embedding, right_embedding),
+                similarity_score=_article_cosine_similarity(
+                    candidate.left_id,
+                    candidate.right_id,
+                    embeddings,
+                    embedding_norms,
+                ),
                 lexical_overlap=candidate.lexical_overlap,
                 hours_apart=candidate.hours_apart,
             )
@@ -1051,6 +1421,7 @@ def _build_story_clusters(
     min_articles: int,
     representative_threshold: float,
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> ClusterBuildResult:
     if not linked_pairs:
         singleton_clusters = _singleton_story_clusters(
@@ -1091,6 +1462,7 @@ def _build_story_clusters(
                 min_articles,
                 representative_threshold,
                 cohesion_threshold,
+                embedding_norms,
             )
         )
         clusters.extend(component_clusters)
@@ -1110,14 +1482,15 @@ def _build_story_clusters(
     }
     singleton_article_ids = set(article_ids) - clustered_article_ids
     clusters.extend(_singleton_story_clusters(singleton_article_ids))
+    guarded_singleton_count = sum(
+        len(cluster.article_ids) == 1 for cluster in clusters
+    )
     return ClusterBuildResult(
         clusters=sorted(clusters, key=lambda cluster: cluster.article_ids),
         initial_components=len(initial_components),
         changed_components=changed_components,
         split_components=split_components,
-        unclustered_articles=len(
-            singleton_article_ids
-        ),
+        unclustered_articles=guarded_singleton_count,
         cohesion_fallback_members=cohesion_fallback_members,
     )
 
@@ -1167,6 +1540,7 @@ def _partition_component_by_representative(
     min_articles: int,
     representative_threshold: float,
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[StoryCluster], int]:
     pending_groups = [sorted(article_ids)]
     clusters: list[StoryCluster] = []
@@ -1186,6 +1560,7 @@ def _partition_component_by_representative(
             group,
             representative_id,
             embeddings,
+            embedding_norms,
         )
         accepted_ids = [
             article_id
@@ -1198,6 +1573,7 @@ def _partition_component_by_representative(
             member_scores,
             embeddings,
             cohesion_threshold,
+            embedding_norms,
         )
 
         if len(accepted_ids) >= min_articles:
@@ -1244,6 +1620,7 @@ def _add_cohesive_borderline_members(
     representative_scores: dict[int, float],
     embeddings: dict[int, list[float]],
     cohesion_threshold: float,
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> tuple[list[int], list[int]]:
     accepted = list(accepted_ids)
     accepted_set = set(accepted_ids)
@@ -1263,7 +1640,12 @@ def _add_cohesive_borderline_members(
         if not candidate_embedding:
             continue
         is_cohesive = all(
-            cosine_similarity(candidate_embedding, embeddings.get(member_id, []))
+            _article_cosine_similarity(
+                candidate_id,
+                member_id,
+                embeddings,
+                embedding_norms,
+            )
             >= cohesion_threshold
             for member_id in accepted
         )
@@ -1299,6 +1681,7 @@ def _member_scores_to_representative(
     article_ids: list[int],
     representative_article_id: int,
     embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]] = None,
 ) -> dict[int, float]:
     representative_embedding = embeddings.get(representative_article_id)
     member_scores = {}
@@ -1308,11 +1691,34 @@ def _member_scores_to_representative(
         else:
             member_embedding = embeddings.get(article_id)
             member_scores[article_id] = (
-                cosine_similarity(representative_embedding, member_embedding)
+                _article_cosine_similarity(
+                    representative_article_id,
+                    article_id,
+                    embeddings,
+                    embedding_norms,
+                )
                 if representative_embedding and member_embedding
                 else 0.0
             )
     return member_scores
+
+
+def _article_cosine_similarity(
+    left_id: int,
+    right_id: int,
+    embeddings: dict[int, list[float]],
+    embedding_norms: Optional[dict[int, float]],
+) -> float:
+    left_embedding = embeddings.get(left_id, [])
+    right_embedding = embeddings.get(right_id, [])
+    if embedding_norms is None:
+        return cosine_similarity(left_embedding, right_embedding)
+    return cosine_similarity_with_norms(
+        left_embedding,
+        right_embedding,
+        embedding_norms.get(left_id, 0.0),
+        embedding_norms.get(right_id, 0.0),
+    )
 
 
 def _cluster_confidence(
@@ -1330,6 +1736,9 @@ def _cluster_confidence(
 
 
 def _replace_clusters(cursor):
+    cursor.execute("DELETE FROM final_story_publication_states")
+    cursor.execute("DELETE FROM final_unified_stories")
+    cursor.execute("UPDATE clustering_article_state SET cluster_key = NULL")
     cursor.execute("DELETE FROM story_cluster_members")
     cursor.execute("DELETE FROM story_clusters")
 
