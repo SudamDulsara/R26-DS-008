@@ -116,8 +116,54 @@ def quality_flags(raw: str, corrected: str, corrector_name: str,
         if count >= 4:
             flags.append("repetition")
 
+    # ---- has the model stopped being the fine-tune? ----
+    #
+    # Both checks below catch the same underlying event: a page unlike
+    # anything in the 707 training pages, on which the model abandons what it
+    # was taught and falls back to the habits of the base checkpoint.
+    #
+    # Observed 2026-08-18 on the cover page of a 1982 Act -- coat of arms,
+    # centred title, a date, a printing notice. Tesseract read 499 characters
+    # of ordinary Sinhala from it. The fine-tuned model returned KANNADA
+    # wrapped in HTML: "<div style=\"text-align: center;\"> <h2>...".
+    #
+    # This is not hypothetical damage. A published post-OCR correction dataset
+    # whose corrected column contains a different language is worse than one
+    # with errors in it, because a downstream model would learn the
+    # substitution as if it were a correction.
+    #
+    # Neither check can fire on a page the model handled properly: correct
+    # output is Sinhala, and it is plain text.
+
+    if corrected.strip():
+        # Script drift. Compare like with like -- count only letters, so
+        # digits, punctuation and the clause markers common to both scripts
+        # cannot mask the change.
+        sinhala = sum(0x0D80 <= ord(ch) <= 0x0DFF for ch in corrected)
+        letters = sum(ch.isalpha() for ch in corrected)
+        raw_sinhala = sum(0x0D80 <= ord(ch) <= 0x0DFF for ch in raw)
+        if letters >= 40 and raw_sinhala >= 40:
+            if sinhala / letters < SINHALA_LETTER_FLOOR:
+                flags.append("wrong_script")
+
+        # Markup leakage. The base checkpoint is trained to emit documents as
+        # HTML/markdown; the fine-tune was trained on plain page text and
+        # never produces these.
+        low = corrected.lower()
+        if any(tag in low for tag in ("<div", "<h1>", "<h2>", "<table",
+                                      "<p>", "![image", "<hr />")):
+            flags.append("markup")
+
     return flags
 
+
+#: Below this share of Sinhala letters, the corrected side is not Sinhala.
+#:
+#: Deliberately low. A correct page is essentially 100% Sinhala letters, and
+#: the Kannada page measured 0%, so anything between the two separates them.
+#: A loose threshold avoids flagging a legitimate page that happens to carry
+#: an English schedule heading or a Latin-script citation.
+SINHALA_LETTER_FLOOR = 0.50
 
 #: A page with fewer extractable characters than this, and at least one
 #: image, is a picture of paper. Scanned pages give ~0; born-digital Act pages
