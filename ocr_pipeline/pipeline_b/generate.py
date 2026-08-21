@@ -110,11 +110,21 @@ def quality_flags(raw: str, corrected: str, corrector_name: str,
 
     # Repetition loop: a classic failure where a generative model gets stuck
     # emitting the same line. Cheap to detect, invisible in a CER average.
-    lines = [ln.strip() for ln in corrected.split("\n") if len(ln.strip()) > 20]
-    if lines:
-        most_common, count = Counter(lines).most_common(1)[0]
-        if count >= 4:
-            flags.append("repetition")
+    #
+    # TWO thresholds. The first version had only the >20-character rule and
+    # missed a real loop on 2026-08-21: page 2 of a 1982 Act ended in a
+    # nine-character line repeated to the token cap, so every occurrence was
+    # filtered out before counting.
+    #
+    # A long line repeating four times is suspicious. A short line repeating
+    # ten times is a loop -- no page of legal prose repeats the same short
+    # line ten times.
+    stripped = [ln.strip() for ln in corrected.split(chr(10)) if ln.strip()]
+    long_lines = [ln for ln in stripped if len(ln) > 20]
+    if long_lines and Counter(long_lines).most_common(1)[0][1] >= 4:
+        flags.append("repetition")
+    elif stripped and Counter(stripped).most_common(1)[0][1] >= 10:
+        flags.append("repetition")
 
     # ---- has the model stopped being the fine-tune? ----
     #
