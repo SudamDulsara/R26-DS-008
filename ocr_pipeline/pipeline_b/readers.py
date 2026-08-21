@@ -130,9 +130,16 @@ class LightOnCorrector:
         self.name = "lighton-base" if adapter_dir is None else "lighton-finetuned"
 
         if precision == "auto":
+            # NOT torch.cuda.is_bf16_supported(). That returns True whenever
+            # bf16 can be EMULATED, and it duly said yes on a Tesla T4, which
+            # is Turing and has no bf16 units -- giving none of the speed and
+            # a dtype the card does not really have. train_lighton_ocr.py hit
+            # this and replaced it with the same compute-capability test used
+            # here: hardware bf16 starts at 8.0 (Ampere). Turing is 7.5,
+            # Ada 8.9, Blackwell 12.x.
             if not torch.cuda.is_available():
                 precision = "fp32"
-            elif torch.cuda.is_bf16_supported():
+            elif torch.cuda.get_device_capability()[0] >= 8:
                 precision = "bf16"
             else:
                 # Turing and older. fp16 overflows in BOTH halves of this

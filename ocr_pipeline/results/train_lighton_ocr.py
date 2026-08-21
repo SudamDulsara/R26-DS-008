@@ -253,34 +253,6 @@ BASE_ONLY = os.environ.get("BASE_ONLY", "0") == "1"
 if BASE_ONLY:
     print("*** BASE_ONLY -- no training, scoring the untuned model ***")
 
-#: EVAL_ONLY=1 skips training and scores an adapter that ALREADY EXISTS.
-#:
-#: Why this is needed: a real run is capped at EVAL_LIMIT=60 pages because
-#: generating a full page is slow and a Kaggle session has a deadline. But
-#: Tesseract's 0.1079 is the mean over all 202, so a 60-page number is
-#: indicative rather than quotable. Getting the comparable figure used to
-#: require repeating the whole fine-tune -- hours of GPU for a measurement.
-#:
-#: With this, a finished adapter is loaded and scored directly. Inference
-#: only (5.2 GB in fp32, 3.2 GB in bf16), so an 8 GB laptop can do all 202
-#: overnight without touching the Kaggle quota.
-#:
-#:     EVAL_ONLY=1  EVAL_LIMIT=0  ADAPTER=results/lightonocr-sinhala-acts
-#:
-#: EVAL_LIMIT=0 means all 202 pages. ADAPTER defaults to OUTPUT_DIR.
-EVAL_ONLY = os.environ.get("EVAL_ONLY", "0") == "1"
-ADAPTER_DIR = os.environ.get("ADAPTER", OUTPUT_DIR)
-if EVAL_ONLY:
-    if BASE_ONLY:
-        sys.exit("BASE_ONLY and EVAL_ONLY are mutually exclusive: one scores "
-                 "the model WITHOUT an adapter, the other scores one WITH.")
-    if not os.path.isdir(ADAPTER_DIR):
-        sys.exit(f"EVAL_ONLY=1 but no adapter folder at {ADAPTER_DIR!r}.")
-    print(f"*** EVAL_ONLY -- no training, scoring {ADAPTER_DIR} ***")
-
-#: True when section 7 must not train. Both modes measure an existing model.
-SKIP_TRAINING = BASE_ONLY or EVAL_ONLY
-
 #: Tesseract's score on the 202 test pages, measured in this project.
 #: Do NOT substitute the paper's 0.1069 -- quote the number you measured
 #: under the same conditions as everything else you report.
@@ -1194,9 +1166,8 @@ if getattr(args, "_n_gpu", 1) > 1:
     print(f"forcing single-GPU training (Trainer had counted {args._n_gpu})")
     args._n_gpu = 1
 
-if SKIP_TRAINING:
-    _why = "the untuned model" if BASE_ONLY else f"the adapter in {ADAPTER_DIR}"
-    print(f"\nskipping training. Section 8 scores {_why}.")
+if BASE_ONLY:
+    print("\nBASE_ONLY: skipping training. Section 8 scores the untuned model.")
     trainer = None
 else:
     trainer = Trainer(
@@ -1251,8 +1222,8 @@ if BASE_ONLY:
     print(f"\nloading UNTUNED {MODEL_NAME} in {PRECISION} for evaluation ...")
     infer_model = _base
 else:
-    print(f"\nmerging adapter from {ADAPTER_DIR} into {PRECISION} weights ...")
-    infer_model = PeftModel.from_pretrained(_base, ADAPTER_DIR).merge_and_unload()
+    print(f"\nmerging adapter into {PRECISION} weights for evaluation ...")
+    infer_model = PeftModel.from_pretrained(_base, OUTPUT_DIR).merge_and_unload()
 
 infer_model.eval()
 infer_model.config.use_cache = True

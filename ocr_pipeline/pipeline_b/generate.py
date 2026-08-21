@@ -167,10 +167,30 @@ def iter_pdfs(input_dir: str):
     return sorted(found)
 
 
+def open_store(args) -> Store:
+    """
+    Build the Store, honouring --data-dir.
+
+    Why --data-dir exists: resumption is keyed on (doc_id, page_num), so a
+    document already in the database is SKIPPED on the next run even if you
+    have since improved the corrector. That is correct for the real dataset --
+    it is what makes the pipeline continuous -- but it makes the store awkward
+    to experiment against, because a trial run silently does nothing.
+
+    Pointing --data-dir at a scratch folder gives a throwaway database to test
+    against, leaving the real one untouched. Deleting the real database to
+    re-run a test would work too, and is the wrong habit to build.
+    """
+    if not args.data_dir:
+        return Store()
+    return Store(data_dir=args.data_dir,
+                 support_dir=os.path.join(args.data_dir, "generated"))
+
+
 def run(args) -> int:
     import fitz          # pymupdf; imported late so --status needs no deps
 
-    store = Store()
+    store = open_store(args)
     pdfs = iter_pdfs(args.input)
     if not pdfs:
         print(f"No PDFs found in {args.input}")
@@ -351,12 +371,16 @@ def main():
                    help="process born-digital PDFs too. OFF by default: OCRing "
                         "a rendered picture of clean typeset text is synthetic "
                         "degradation, which this project forbids in Pipeline B")
+    p.add_argument("--data-dir", default=None,
+                   help="write the database and JSONL somewhere other than "
+                        "data/ . Use a scratch folder to trial a corrector "
+                        "without touching the real dataset")
     p.add_argument("--status", action="store_true",
                    help="print what has been generated so far and exit")
     args = p.parse_args()
 
     if args.status:
-        show_status()
+        show_status(open_store(args))
         return 0
     return run(args)
 
