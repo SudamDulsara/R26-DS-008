@@ -48,11 +48,48 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#: This component's own folder: .../R26-DS-008/ocr_pipeline
+COMPONENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def find_repo_root(start: str = COMPONENT, levels: int = 4) -> str:
+    """
+    Walk up looking for the repository root, identified by a .git folder.
+
+    Why not just "three directories up": this component gets COPIED on its own
+    to other machines -- the GPU laptop has it at E:/ocr_pipeline with no repo
+    around it -- and a hard-coded number of levels would resolve to E:/ there
+    and scatter the group's data folder across the root of someone's drive.
+
+    Falling back to the component folder is the safe answer when there is no
+    repository: output stays next to the code that produced it, which is where
+    it used to go anyway.
+    """
+    path = start
+    for _ in range(levels):
+        if os.path.isdir(os.path.join(path, ".git")):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:            # reached the drive root
+            break
+        path = parent
+    return start
+
+
+#: The group writes into ONE data folder at the top of the repository, so all
+#: three members' output sits side by side. Set by the group leader
+#: 2026-08-22, clarifying the earlier instruction -- "root" means the root of
+#: R26-DS-008, not the root of this component.
+#:
+#: Already covered by the repo's .gitignore, which lists `data/` and therefore
+#: matches at any depth. Nothing here is ever committed.
+#:
+#: Override with --data-dir (see generate.py) or OCR_DATA_DIR.
+REPO_ROOT = find_repo_root()
 
 #: The database goes directly in data/ ; everything else in a subfolder.
 #: Group convention -- see the module docstring.
-DEFAULT_DATA = os.path.join(HERE, "data")
+DEFAULT_DATA = os.environ.get("OCR_DATA_DIR") or os.path.join(REPO_ROOT, "data")
 DEFAULT_DB_NAME = "ocr_correction_pairs.db"
 DEFAULT_SUPPORT = os.path.join(DEFAULT_DATA, "generated")
 
