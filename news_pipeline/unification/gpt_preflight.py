@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
@@ -16,7 +16,7 @@ from news_pipeline.unification.openai_adapter import (
 
 
 TOKENS_PER_MILLION = Decimal("1000000")
-GPT_PRICING_VERSION = "openai_model_pages_2026-08-13"
+GPT_PRICING_VERSION = "openai_model_pages_2026-08-14"
 GPT_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/models"
 OFFLINE_INPUT_BOUND_VERSION = "utf8_request_bytes_plus_framing_v1"
 DEFAULT_PROVIDER_FRAMING_TOKEN_ALLOWANCE = 1024
@@ -31,6 +31,7 @@ class ModelPricing:
     model: str
     input_usd_per_million_tokens: Decimal
     output_usd_per_million_tokens: Decimal
+    cached_input_usd_per_million_tokens: Optional[Decimal] = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -45,6 +46,11 @@ class ModelPricing:
             or self.output_usd_per_million_tokens < 0
         ):
             raise ValueError("output token price must be finite and nonnegative")
+        if self.cached_input_usd_per_million_tokens is not None and (
+            not self.cached_input_usd_per_million_tokens.is_finite()
+            or self.cached_input_usd_per_million_tokens < 0
+        ):
+            raise ValueError("cached input price must be finite and nonnegative")
 
     def estimate(
         self,
@@ -92,11 +98,13 @@ MODEL_PRICING: Mapping[str, ModelPricing] = MappingProxyType(
         "gpt-5.6-luna": ModelPricing(
             model="gpt-5.6-luna",
             input_usd_per_million_tokens=Decimal("0.20"),
+            cached_input_usd_per_million_tokens=Decimal("0.02"),
             output_usd_per_million_tokens=Decimal("1.20"),
         ),
         "gpt-5.6-terra": ModelPricing(
             model="gpt-5.6-terra",
             input_usd_per_million_tokens=Decimal("2.00"),
+            cached_input_usd_per_million_tokens=Decimal("0.20"),
             output_usd_per_million_tokens=Decimal("12.00"),
         ),
     }
@@ -146,6 +154,77 @@ def _field_value(value: Any, field_name: str) -> Any:
     if isinstance(value, Mapping):
         return value.get(field_name)
     return getattr(value, field_name, None)
+
+
+def response_usage_cost_usd(generation: Any, model_name: str) -> Optional[Decimal]:
+    """Calculate billed token cost when provider usage metadata is present."""
+    pricing = MODEL_PRICING.get(model_name)
+    response = _field_value(generation, "response") or generation
+    usage = _field_value(response, "usage")
+    input_tokens = _field_value(usage, "input_tokens")
+    output_tokens = _field_value(usage, "output_tokens")
+    if (
+        pricing is None
+        or isinstance(input_tokens, bool)
+        or not isinstance(input_tokens, int)
+        or input_tokens < 0
+        or isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens < 0
+    ):
+        return None
+    details = _field_value(usage, "input_tokens_details")
+    cached_tokens = _field_value(details, "cached_tokens") or 0
+    cache_write_tokens = _field_value(details, "cache_write_tokens") or 0
+    if not isinstance(cached_tokens, int) or cached_tokens < 0:
+        cached_tokens = 0
+    if not isinstance(cache_write_tokens, int) or cache_write_tokens < 0:
+        cache_write_tokens = 0
+    cached_tokens = min(cached_tokens, input_tokens)
+    cache_write_tokens = min(cache_write_tokens, input_tokens - cached_tokens)
+    uncached_tokens = input_tokens - cached_tokens - cache_write_tokens
+    cached_price = (
+        pricing.cached_input_usd_per_million_tokens
+        if pricing.cached_input_usd_per_million_tokens is not None
+        else pricing.input_usd_per_million_tokens
+    )
+    input_cost = (
+        Decimal(uncached_tokens) * pricing.input_usd_per_million_tokens
+        + Decimal(cached_tokens) * cached_price
+        + Decimal(cache_write_tokens)
+        * pricing.input_usd_per_million_tokens
+        * CACHE_WRITE_INPUT_PRICE_MULTIPLIER
+    )
+    output_cost = Decimal(output_tokens) * pricing.output_usd_per_million_tokens
+    if input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
+        input_cost *= LONG_CONTEXT_INPUT_PRICE_MULTIPLIER
+        output_cost *= LONG_CONTEXT_OUTPUT_PRICE_MULTIPLIER
+    return (input_cost + output_cost) / TOKENS_PER_MILLION
+
+
+def token_usage_cost_usd(
+    *,
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> Optional[Decimal]:
+    """Reprice stored aggregate usage when cache detail is unavailable."""
+    pricing = MODEL_PRICING.get(model_name)
+    if pricing is None or input_tokens < 0 or output_tokens < 0:
+        return None
+    input_multiplier = Decimal("1")
+    output_multiplier = Decimal("1")
+    if input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
+        input_multiplier = LONG_CONTEXT_INPUT_PRICE_MULTIPLIER
+        output_multiplier = LONG_CONTEXT_OUTPUT_PRICE_MULTIPLIER
+    return (
+        Decimal(input_tokens)
+        * pricing.input_usd_per_million_tokens
+        * input_multiplier
+        + Decimal(output_tokens)
+        * pricing.output_usd_per_million_tokens
+        * output_multiplier
+    ) / TOKENS_PER_MILLION
 
 
 class OpenAIInputTokenCounter:
@@ -424,6 +503,22 @@ class GPTPreflight:
             estimate=estimate,
         )
 
+    def settle(
+        self,
+        report: GPTPreflightReport,
+        actual_cost_usd: Optional[Decimal],
+    ) -> None:
+        if not report.should_generate or report.estimate is None:
+            return
+        if actual_cost_usd is None:
+            return
+        self._run_reserved_cost_usd = max(
+            Decimal("0"),
+            self._run_reserved_cost_usd
+            - report.estimate.max_total_cost_usd
+            + actual_cost_usd,
+        )
+
     def _fallback_report(
         self,
         *,
@@ -532,6 +627,69 @@ class OfflineRequestSizePreflight:
     def run_reserved_cost_usd(self) -> Decimal:
         return self._run_reserved_cost_usd
 
+    def fit_request_to_budget(
+        self,
+        request: StructuredResponseRequest,
+        *,
+        minimum_output_tokens: int = 1024,
+    ) -> Optional[StructuredResponseRequest]:
+        """Lower only the output ceiling so a request fits remaining budget."""
+        if minimum_output_tokens <= 0:
+            raise ValueError("minimum output tokens must be greater than zero")
+        model_pricing = self._pricing.get(request.model)
+        if model_pricing is None:
+            return None
+        input_token_upper_bound = request_input_token_upper_bound(
+            request,
+            provider_framing_token_allowance=(
+                self._provider_framing_token_allowance
+            ),
+            text_format_converter=self._text_format_converter,
+        )
+        input_multiplier = CACHE_WRITE_INPUT_PRICE_MULTIPLIER
+        output_multiplier = Decimal("1")
+        if input_token_upper_bound > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
+            input_multiplier = max(
+                input_multiplier,
+                LONG_CONTEXT_INPUT_PRICE_MULTIPLIER,
+            )
+            output_multiplier = LONG_CONTEXT_OUTPUT_PRICE_MULTIPLIER
+        input_cost = (
+            Decimal(input_token_upper_bound)
+            * model_pricing.input_usd_per_million_tokens
+            * input_multiplier
+            / TOKENS_PER_MILLION
+        )
+        available = min(
+            self._max_cost_per_story_usd,
+            max(
+                Decimal("0"),
+                self._max_cost_per_run_usd - self._run_reserved_cost_usd,
+            ),
+        )
+        output_budget = available - input_cost
+        if output_budget <= 0:
+            return None
+        output_price = (
+            model_pricing.output_usd_per_million_tokens
+            * output_multiplier
+        )
+        if output_price == 0:
+            affordable_output_tokens = request.max_output_tokens
+        else:
+            affordable_output_tokens = int(
+                output_budget * TOKENS_PER_MILLION / output_price
+            )
+        fitted_tokens = min(
+            request.max_output_tokens,
+            affordable_output_tokens,
+        )
+        if fitted_tokens < minimum_output_tokens:
+            return None
+        if fitted_tokens == request.max_output_tokens:
+            return request
+        return replace(request, max_output_tokens=fitted_tokens)
+
     def evaluate(
         self,
         request: StructuredResponseRequest,
@@ -612,6 +770,32 @@ class OfflineRequestSizePreflight:
             input_tokens_exact=False,
         )
 
+    def settle(
+        self,
+        report: GPTPreflightReport,
+        actual_cost_usd: Optional[Decimal],
+    ) -> None:
+        if not report.should_generate or report.estimate is None:
+            return
+        if actual_cost_usd is None:
+            return
+        self._run_reserved_cost_usd = max(
+            Decimal("0"),
+            self._run_reserved_cost_usd
+            - report.estimate.max_total_cost_usd
+            + actual_cost_usd,
+        )
+
+    def release(self, report: GPTPreflightReport) -> None:
+        """Release a successful reservation that will not reach a provider."""
+        if not report.should_generate or report.estimate is None:
+            return
+        self._run_reserved_cost_usd = max(
+            Decimal("0"),
+            self._run_reserved_cost_usd
+            - report.estimate.max_total_cost_usd,
+        )
+
     def _fallback_report(
         self,
         *,
@@ -666,7 +850,46 @@ class PreflightedGPTGenerator:
                 generation=None,
             )
 
+        try:
+            generation = self._generator.generate(request)
+        except Exception:
+            if hasattr(self._preflight, "release"):
+                self._preflight.release(report)
+            raise
+        if hasattr(self._preflight, "settle"):
+            self._preflight.settle(
+                report,
+                response_usage_cost_usd(generation, request.model),
+            )
         return PreflightedGenerationResult(
             preflight=report,
-            generation=self._generator.generate(request),
+            generation=generation,
         )
+
+    def fit_request_to_budget(
+        self,
+        request: StructuredResponseRequest,
+        *,
+        minimum_output_tokens: int = 1024,
+    ) -> Optional[StructuredResponseRequest]:
+        if not hasattr(self._preflight, "fit_request_to_budget"):
+            return request
+        return self._preflight.fit_request_to_budget(
+            request,
+            minimum_output_tokens=minimum_output_tokens,
+        )
+
+    def reserve_capacity(
+        self,
+        request: StructuredResponseRequest,
+    ) -> Optional[GPTPreflightReport]:
+        if not hasattr(self._preflight, "release"):
+            return None
+        return self._preflight.evaluate(request)
+
+    def release_capacity(
+        self,
+        report: Optional[GPTPreflightReport],
+    ) -> None:
+        if report is not None and hasattr(self._preflight, "release"):
+            self._preflight.release(report)

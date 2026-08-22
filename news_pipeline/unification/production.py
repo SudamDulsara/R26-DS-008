@@ -8,17 +8,24 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any, Mapping, Optional, Sequence
 
 from pydantic import ValidationError
 
+from news_pipeline.clustering.semantic_partition import (
+    apply_semantic_partition,
+    validate_semantic_partition,
+)
 from news_pipeline.config import PipelineConfig, load_config
 from news_pipeline.storage.database import get_connection
 from news_pipeline.storage.logger import get_logger
 from news_pipeline.unification.autonomous_audit import (
     AUTONOMOUS_AUDIT_VERSION,
+    AutonomousAuditResponse,
     build_autonomous_audit_request,
     classify_audit_route,
+    decide_autonomous_audit,
 )
 from news_pipeline.unification.fact_validation import (
     validate_claim_projection,
@@ -66,6 +73,7 @@ from news_pipeline.unification.gpt_preflight import (
     GPTPreflight,
     MODEL_PRICING,
     PreflightedGPTGenerator,
+    response_usage_cost_usd,
 )
 from news_pipeline.unification.openai_adapter import (
     AdapterOutcome,
@@ -75,6 +83,9 @@ from news_pipeline.unification.openai_adapter import (
 
 
 logger = get_logger()
+
+AUDIT_CAPACITY_MIN_OUTPUT_TOKENS = 2048
+AUDIT_CAPACITY_VALIDATION_ALLOWANCE_CHARS = 4096
 
 GENERATION_STATUS_ACCEPTED = "accepted"
 GENERATION_STATUS_FALLBACK = "fallback"
@@ -552,6 +563,15 @@ def sync_gpt_unification_review_queue(
             return None
         queue_status = GPT_REVIEW_QUEUE_STATUS_APPROVED
 
+    cluster_id = version.get("cluster_id")
+    if cluster_id is not None:
+        cluster_exists = connection.execute(
+            "SELECT 1 FROM story_clusters WHERE id = ?",
+            (int(cluster_id),),
+        ).fetchone()
+        if cluster_exists is None:
+            cluster_id = None
+
     title, story = _candidate_snapshot(version)
     detected_at = (
         str(existing["detected_at"])
@@ -604,7 +624,7 @@ def sync_gpt_unification_review_queue(
         """,
         (
             int(version["id"]),
-            version.get("cluster_id"),
+            cluster_id,
             str(version["cluster_key"]),
             fingerprint,
             queue_status,
@@ -672,6 +692,51 @@ class GenerationIdentity:
     request_fingerprint_sha256: str
 
 
+def _build_audit_capacity_probe(
+    *,
+    identity: GenerationIdentity,
+    route: Any,
+    config: PipelineConfig,
+) -> StructuredResponseRequest:
+    """Build a local-only upper-bound request used to reserve audit capacity."""
+    draft_allowance_chars = identity.request.max_output_tokens * 4
+    return build_autonomous_audit_request(
+        contract_input=identity.contract_input,
+        candidate={
+            "budget_capacity_reservation": "x" * draft_allowance_chars,
+        },
+        validation={
+            "budget_capacity_reservation": (
+                "x" * AUDIT_CAPACITY_VALIDATION_ALLOWANCE_CHARS
+            ),
+        },
+        route=route,
+        config=config,
+    )
+
+
+def _budget_safe_audit_route(
+    route: Any,
+    *,
+    config: PipelineConfig,
+) -> Any | None:
+    """Return the standard Luna route when a preferred route cannot fit."""
+    if (
+        route.model == config.gpt_audit_model
+        and route.reasoning_effort == config.gpt_audit_reasoning_effort
+    ):
+        return None
+    reasons = tuple(route.reasons)
+    if "budget_safe_luna_route" not in reasons:
+        reasons += ("budget_safe_luna_route",)
+    return replace(
+        route,
+        model=config.gpt_audit_model,
+        reasoning_effort=config.gpt_audit_reasoning_effort,
+        reasons=reasons,
+    )
+
+
 def _field_value(value: Any, field_name: str) -> Any:
     if isinstance(value, Mapping):
         return value.get(field_name)
@@ -691,6 +756,12 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(
         _canonical_json(value).encode("utf-8")
     ).hexdigest()
+
+
+@lru_cache(maxsize=None)
+def _response_format_schema(model_class: type) -> dict[str, Any]:
+    """Build each immutable Pydantic response schema once per process."""
+    return model_class.model_json_schema()
 
 
 def build_reviewed_correction_followup_requirements(
@@ -1071,7 +1142,7 @@ def build_generation_identity(
         "model": request.model,
         "instructions": request.instructions,
         "input": request.input,
-        "text_format_schema": request.text_format.model_json_schema(),
+        "text_format_schema": _response_format_schema(request.text_format),
         "max_output_tokens": request.max_output_tokens,
         "reasoning_effort": request.reasoning_effort,
     }
@@ -1434,12 +1505,7 @@ def _usage_metadata(
         and input_tokens is not None
         and output_tokens is not None
     ):
-        estimated_cost = (
-            Decimal(input_tokens)
-            * pricing.input_usd_per_million_tokens
-            + Decimal(output_tokens)
-            * pricing.output_usd_per_million_tokens
-        ) / Decimal("1000000")
+        estimated_cost = response_usage_cost_usd(response, model_name)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -1464,6 +1530,8 @@ def _combined_provider_values(
     primary: Mapping[str, Any],
     audited: Mapping[str, Any],
     route: Any,
+    audit_assessment: Any = None,
+    audit_decision: Any = None,
 ) -> dict[str, Any]:
     values = dict(audited)
     primary_input = int(primary.get("input_tokens") or 0)
@@ -1502,9 +1570,25 @@ def _combined_provider_values(
                 {
                     "audit_version": AUTONOMOUS_AUDIT_VERSION,
                     "complexity": route.complexity,
+                    "risk_tier": route.risk_tier,
                     "reasons": list(route.reasons),
                     "model": route.model,
                     "reasoning_effort": route.reasoning_effort,
+                    "policy_decision_reasons": list(
+                        audit_decision.reasons
+                        if audit_decision is not None
+                        else ()
+                    ),
+                    "change_level": (
+                        audit_assessment.change_level
+                        if audit_assessment is not None
+                        else None
+                    ),
+                    "correction_categories": (
+                        list(audit_assessment.correction_categories)
+                        if audit_assessment is not None
+                        else []
+                    ),
                 }
             ),
             "autonomous_audit_input_tokens": audited.get("input_tokens"),
@@ -1530,18 +1614,102 @@ def _cached_candidate_requires_autonomous_audit(
         return False
     if version_is_deployable_gpt(cached):
         return False
-    return bool(
-        not cached.get("autonomous_audit_status")
-        and cached.get("response_id")
+    if not (
+        cached.get("response_id")
         and cached.get("output_json")
         and cached.get("resolved_output_json")
-        and cached.get("validation_status")
-        in {
+    ):
+        return False
+    validation_status = str(cached.get("validation_status") or "")
+    audit_status = str(cached.get("autonomous_audit_status") or "")
+    if not audit_status:
+        return validation_status in {
             "fact_shape_failed",
             "claim_projection_failed",
             VALIDATION_STATUS_ACCEPTED_WITH_WARNINGS,
         }
+    # Budget preflight and provider transport failures did not produce an
+    # audit judgment. They are retryable on a later run. An audit that reached
+    # the model and rejected the candidate remains terminal.
+    return (
+        audit_status == "failed"
+        and validation_status
+        in {
+            "autonomous_audit_preflight",
+            "autonomous_audit_failed",
+        }
     )
+
+
+def _audit_circuit_breaker_status(
+    connection: sqlite3.Connection,
+    *,
+    config: PipelineConfig,
+) -> dict[str, Any]:
+    """Use prior model audit judgments to fail safely, not language rules."""
+    change_levels = {"none": 0, "editorial": 0, "material": 0}
+    rows = connection.execute(
+        """
+        SELECT stats_json
+        FROM pipeline_runs
+        WHERE status = 'completed' AND stats_json IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["stats_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        unification = payload.get("unification", {})
+        if not isinstance(unification, Mapping):
+            continue
+        by_risk = unification.get("audit_change_levels_by_risk", {})
+        if not isinstance(by_risk, Mapping):
+            continue
+        low = by_risk.get("low", {})
+        if not isinstance(low, Mapping):
+            continue
+        for level in change_levels:
+            try:
+                change_levels[level] += int(low.get(level) or 0)
+            except (TypeError, ValueError):
+                continue
+    evaluated = sum(change_levels.values())
+    material_rate = (
+        change_levels["material"] / evaluated if evaluated else None
+    )
+    configured_mode = config.gpt_audit_policy_mode
+    effective_mode = configured_mode
+    if configured_mode == "shadow":
+        state = "collecting_shadow_evidence"
+    elif configured_mode == "all":
+        state = "full_audit_configured"
+    elif evaluated < config.gpt_audit_circuit_min_evaluated:
+        state = "insufficient_evidence_full_audit"
+        effective_mode = "all"
+    elif (
+        material_rate is not None
+        and material_rate
+        > config.gpt_audit_circuit_max_material_rate
+    ):
+        state = "material_change_rate_open_full_audit"
+        effective_mode = "all"
+    else:
+        state = "closed_risk_tiered_active"
+    return {
+        "state": state,
+        "configured_mode": configured_mode,
+        "effective_mode": effective_mode,
+        "evaluated_low_risk_audits": evaluated,
+        "low_risk_change_levels": change_levels,
+        "material_change_rate": material_rate,
+        "minimum_evaluated": config.gpt_audit_circuit_min_evaluated,
+        "maximum_material_change_rate": (
+            config.gpt_audit_circuit_max_material_rate
+        ),
+    }
 
 
 def _validation_payload(
@@ -1662,6 +1830,9 @@ def _interpret_generation(
     identity: GenerationIdentity,
     preflight: Any,
     generation: Any,
+    structured_output_override: Optional[
+        GPTUnifiedStoryResponseV2
+    ] = None,
 ) -> dict[str, Any]:
     response = generation.response
     if generation.outcome is AdapterOutcome.REFUSAL:
@@ -1685,18 +1856,21 @@ def _interpret_generation(
         )
 
     try:
-        parsed = _field_value(response, "output_parsed")
-        if parsed is not None:
-            structured_output = GPTUnifiedStoryResponseV2.model_validate(
-                parsed
-            )
+        if structured_output_override is not None:
+            structured_output = structured_output_override
         else:
-            output_text = _field_value(response, "output_text")
-            if not isinstance(output_text, str) or not output_text.strip():
-                raise ValueError("missing structured output")
-            structured_output = (
-                GPTUnifiedStoryResponseV2.model_validate_json(output_text)
-            )
+            parsed = _field_value(response, "output_parsed")
+            if parsed is not None:
+                structured_output = GPTUnifiedStoryResponseV2.model_validate(
+                    parsed
+                )
+            else:
+                output_text = _field_value(response, "output_text")
+                if not isinstance(output_text, str) or not output_text.strip():
+                    raise ValueError("missing structured output")
+                structured_output = (
+                    GPTUnifiedStoryResponseV2.model_validate_json(output_text)
+                )
     except (ValidationError, ValueError, TypeError):
         return _fallback_values(
             base,
@@ -1794,6 +1968,16 @@ def _interpret_generation(
         }
     )
     return values
+
+
+def _parse_autonomous_audit_response(response: Any) -> AutonomousAuditResponse:
+    parsed = _field_value(response, "output_parsed")
+    if parsed is not None:
+        return AutonomousAuditResponse.model_validate(parsed)
+    output_text = _field_value(response, "output_text")
+    if not isinstance(output_text, str) or not output_text.strip():
+        raise ValueError("missing autonomous audit structured output")
+    return AutonomousAuditResponse.model_validate_json(output_text)
 
 
 def _revalidate_cached_values(
@@ -1937,6 +2121,9 @@ def revalidate_cached_unification(
         "provider_calls": 0,
         "audit_accepted": 0,
         "audit_failed": 0,
+        "audit_provider_failed": 0,
+        "audit_rejected": 0,
+        "audit_skipped_budget": 0,
         "audit_routes": {},
         "estimated_cost_usd": "0",
         "ongoing_generation_policy": None,
@@ -2090,6 +2277,110 @@ def verify_unification_cache(
     return stats
 
 
+def _merge_counter_mapping(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(left)
+    for key, value in right.items():
+        current = merged.get(key)
+        if isinstance(current, Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_counter_mapping(current, value)
+        elif isinstance(current, int) and isinstance(value, int):
+            merged[key] = current + value
+        elif current is None:
+            merged[key] = value
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_unification_pass_stats(
+    first: dict[str, Any],
+    followup: Mapping[str, Any],
+) -> dict[str, Any]:
+    summed_fields = {
+        "clusters_seen",
+        "eligible_clusters",
+        "accepted",
+        "cache_hits",
+        "cached_fallbacks",
+        "pending_review",
+        "generation_calls",
+        "audit_calls",
+        "provider_calls",
+        "audit_accepted",
+        "audit_failed",
+        "audit_provider_failed",
+        "audit_rejected",
+        "audit_skipped_budget",
+        "atomic_budget_deferred",
+        "budget_deferred",
+        "audit_budget_safe_routes",
+        "audit_policy_would_skip",
+        "audit_policy_sampled",
+        "audits_skipped_low_risk",
+        "shadow_avoidable_audit_calls",
+        "fallbacks",
+        "provider_failed",
+        "invalid_inputs",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "provider_request_candidates",
+        "provider_request_backlog",
+        "deferred_provider_candidates",
+        "semantic_partitions_applied",
+        "semantic_partition_groups",
+        "semantic_partition_multi_groups",
+        "semantic_partition_singletons",
+    }
+    counter_fields = {
+        "audit_routes",
+        "audit_risk_tiers",
+        "audit_change_levels",
+        "audit_change_levels_by_risk",
+        "fallback_reasons",
+        "cached_fallback_reasons",
+    }
+    list_fields = {
+        "semantic_partition_cluster_keys",
+        "semantic_partition_followup_keys",
+    }
+    for field in summed_fields:
+        first[field] = int(first.get(field) or 0) + int(
+            followup.get(field) or 0
+        )
+    for field in counter_fields:
+        first[field] = _merge_counter_mapping(
+            first.get(field) or {},
+            followup.get(field) or {},
+        )
+    for field in list_fields:
+        first[field] = sorted(
+            {
+                str(value)
+                for value in (
+                    list(first.get(field) or [])
+                    + list(followup.get(field) or [])
+                )
+            }
+        )
+    first["estimated_cost_usd"] = format(
+        _decimal_or_zero(first.get("estimated_cost_usd"))
+        + _decimal_or_zero(followup.get("estimated_cost_usd")),
+        "f",
+    )
+    first["shadow_avoidable_audit_cost_usd"] = format(
+        _decimal_or_zero(first.get("shadow_avoidable_audit_cost_usd"))
+        + _decimal_or_zero(
+            followup.get("shadow_avoidable_audit_cost_usd")
+        ),
+        "f",
+    )
+    return first
+
+
 def run_gpt_unification(
     *,
     no_gpt: bool = False,
@@ -2101,6 +2392,7 @@ def run_gpt_unification(
     correction_requirements_by_story: Optional[
         Mapping[str, str]
     ] = None,
+    _provider_candidates_remaining: Optional[int] = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     connection = get_connection(config)
@@ -2108,6 +2400,10 @@ def run_gpt_unification(
         candidates = _select_gpt_generation_candidates(
             connection,
             cluster_keys,
+        )
+        audit_circuit_breaker = _audit_circuit_breaker_status(
+            connection,
+            config=config,
         )
     except Exception:
         connection.close()
@@ -2124,10 +2420,37 @@ def run_gpt_unification(
         "provider_calls": 0,
         "audit_accepted": 0,
         "audit_failed": 0,
+        "audit_provider_failed": 0,
+        "audit_rejected": 0,
+        "audit_skipped_budget": 0,
+        "atomic_budget_deferred": 0,
+        "budget_deferred": 0,
+        "audit_budget_safe_routes": 0,
         "audit_routes": {},
+        "audit_policy_mode": config.gpt_audit_policy_mode,
+        "audit_policy_effective_mode": (
+            audit_circuit_breaker["effective_mode"]
+        ),
+        "audit_circuit_breaker": audit_circuit_breaker,
+        "audit_risk_tiers": {},
+        "audit_policy_would_skip": 0,
+        "audit_policy_sampled": 0,
+        "audits_skipped_low_risk": 0,
+        "shadow_avoidable_audit_calls": 0,
+        "shadow_avoidable_audit_cost_usd": "0",
+        "audit_change_levels": {},
+        "audit_change_levels_by_risk": {},
+        "semantic_partitions_applied": 0,
+        "semantic_partition_groups": 0,
+        "semantic_partition_multi_groups": 0,
+        "semantic_partition_singletons": 0,
+        "semantic_partition_cluster_keys": [],
+        "semantic_partition_followup_keys": [],
         "fallbacks": 0,
+        "provider_failed": 0,
         "invalid_inputs": 0,
         "fallback_reasons": {},
+        "cached_fallback_reasons": {},
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
@@ -2136,12 +2459,17 @@ def run_gpt_unification(
     }
     if not candidates:
         connection.close()
-        logger.info(
-            "GPT unification: no new or changed story clusters; "
-            "generation calls: 0"
-        )
+        logger.info("Unification summary:")
+        logger.info("  No new or changed multi-article stories.")
+        logger.info("  GPT calls made: 0 generation | 0 audit")
         return stats
     total_cost = Decimal("0")
+    audit_policy_config = replace(
+        config,
+        gpt_audit_policy_mode=str(
+            audit_circuit_breaker["effective_mode"]
+        ),
+    )
 
     prepared_candidates = []
     selected_correction_requirements = {
@@ -2227,11 +2555,17 @@ def run_gpt_unification(
         reverse=True,
     )
     provider_request_backlog = len(provider_candidates)
+    provider_candidates_remaining = (
+        config.gpt_max_clusters_per_run
+        if _provider_candidates_remaining is None
+        else max(0, int(_provider_candidates_remaining))
+    )
     provider_request_limit = provider_request_backlog
     if config.gpt_only_publication_enabled:
         provider_request_limit = min(
             provider_request_backlog,
             config.gpt_max_clusters_per_run,
+            provider_candidates_remaining,
         )
     selected_provider_keys = {
         str(candidate[0]["cluster_key"])
@@ -2284,6 +2618,13 @@ def run_gpt_unification(
     def record_fallback(reason: str) -> None:
         stats["fallbacks"] += 1
         reasons = stats["fallback_reasons"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if "preflight" in reason:
+            stats["budget_deferred"] += 1
+
+    def record_cached_fallback(reason: str) -> None:
+        stats["cached_fallbacks"] += 1
+        reasons = stats["cached_fallback_reasons"]
         reasons[reason] = reasons.get(reason, 0) + 1
 
     try:
@@ -2341,8 +2682,7 @@ def run_gpt_unification(
                 # terminal local outcome. Reuse its safe V2 fallback unless
                 # the operator explicitly requests a forced regeneration.
                 stats["cache_hits"] += 1
-                stats["cached_fallbacks"] += 1
-                record_fallback(effective_fallback_reason(cached))
+                record_cached_fallback(effective_fallback_reason(cached))
                 continue
 
             base = _base_version_values(
@@ -2359,8 +2699,7 @@ def run_gpt_unification(
             if offline_reason is not None:
                 if audit_only_cached:
                     stats["cache_hits"] += 1
-                    stats["cached_fallbacks"] += 1
-                    record_fallback(
+                    record_cached_fallback(
                         f"autonomous_audit_{offline_reason}"
                     )
                     continue
@@ -2374,11 +2713,101 @@ def run_gpt_unification(
                 record_fallback(offline_reason)
                 continue
 
+            route = None
+            audit_capacity_report = None
+            used_budget_safe_audit_route = False
+            if config.gpt_autonomous_audit_enabled:
+                route = classify_audit_route(
+                    cluster=cluster,
+                    members=members,
+                    config=config,
+                )
+                stats["audit_risk_tiers"][route.risk_tier] = (
+                    stats["audit_risk_tiers"].get(route.risk_tier, 0) + 1
+                )
+                reserve_audit_before_primary = bool(
+                    audit_policy_config.gpt_audit_policy_mode
+                    in {"all", "shadow"}
+                    or route.risk_tier != "low"
+                )
+                if not audit_only_cached and reserve_audit_before_primary:
+                    capacity_request = _build_audit_capacity_probe(
+                        identity=identity,
+                        route=route,
+                        config=config,
+                    )
+                    fitted_capacity_request = (
+                        gated_generator.fit_request_to_budget(
+                            capacity_request,
+                            minimum_output_tokens=AUDIT_CAPACITY_MIN_OUTPUT_TOKENS,
+                        )
+                    )
+                    if fitted_capacity_request is None:
+                        budget_route = _budget_safe_audit_route(
+                            route,
+                            config=config,
+                        )
+                        if budget_route is not None:
+                            budget_capacity_request = _build_audit_capacity_probe(
+                                identity=identity,
+                                route=budget_route,
+                                config=config,
+                            )
+                            fitted_capacity_request = (
+                                gated_generator.fit_request_to_budget(
+                                    budget_capacity_request,
+                                    minimum_output_tokens=(
+                                        AUDIT_CAPACITY_MIN_OUTPUT_TOKENS
+                                    ),
+                                )
+                            )
+                            if fitted_capacity_request is not None:
+                                route = budget_route
+                                used_budget_safe_audit_route = True
+                    capacity_request = fitted_capacity_request
+                    if capacity_request is None:
+                        reason = "preflight_atomic_story_budget_unavailable"
+                        _persist_version(
+                            connection,
+                            _fallback_values(
+                                base,
+                                reason=reason,
+                                validation_status="preflight_fallback",
+                            ),
+                        )
+                        stats["atomic_budget_deferred"] += 1
+                        record_fallback(reason)
+                        continue
+                    audit_capacity_report = (
+                        gated_generator.reserve_capacity(capacity_request)
+                    )
+                    if (
+                        audit_capacity_report is not None
+                        and not audit_capacity_report.should_generate
+                    ):
+                        reason = (
+                            "preflight_atomic_story_"
+                            + audit_capacity_report.reason.value
+                        )
+                        _persist_version(
+                            connection,
+                            _fallback_values(
+                                base,
+                                reason=reason,
+                                validation_status="preflight_fallback",
+                                preflight=audit_capacity_report,
+                            ),
+                        )
+                        stats["atomic_budget_deferred"] += 1
+                        record_fallback(reason)
+                        continue
+
             gated_result = None
             if not audit_only_cached:
                 try:
                     gated_result = gated_generator.generate(identity.request)
                 except Exception as error:
+                    gated_generator.release_capacity(audit_capacity_report)
                     diagnostic_error = getattr(error, "last_error", error)
                     body = getattr(diagnostic_error, "body", None)
                     error_code = (
@@ -2409,10 +2838,12 @@ def run_gpt_unification(
                             validation_status="provider_error",
                         ),
                     )
+                    stats["provider_failed"] += 1
                     record_fallback("provider_error")
                     continue
 
                 if gated_result.used_v2_fallback:
+                    gated_generator.release_capacity(audit_capacity_report)
                     reason = (
                         f"preflight_{gated_result.preflight.reason.value}"
                     )
@@ -2462,14 +2893,43 @@ def run_gpt_unification(
                     )
                 continue
 
-            route = classify_audit_route(
-                cluster=cluster,
-                members=members,
-                config=config,
+            audit_decision = decide_autonomous_audit(
+                route=route,
+                primary=primary_values,
+                request_fingerprint_sha256=(
+                    identity.request_fingerprint_sha256
+                ),
+                config=audit_policy_config,
+                force_audit=audit_only_cached,
             )
-            stats["audit_routes"][route.complexity] = (
-                stats["audit_routes"].get(route.complexity, 0) + 1
-            )
+            if not audit_decision.would_audit_under_risk_policy:
+                stats["audit_policy_would_skip"] += 1
+            if audit_decision.sampled:
+                stats["audit_policy_sampled"] += 1
+            if not audit_decision.should_audit:
+                persisted = _persist_version(connection, primary_values)
+                stats["audits_skipped_low_risk"] += 1
+                stats["input_tokens"] += int(
+                    primary_values.get("input_tokens") or 0
+                )
+                stats["output_tokens"] += int(
+                    primary_values.get("output_tokens") or 0
+                )
+                stats["total_tokens"] += int(
+                    primary_values.get("total_tokens") or 0
+                )
+                if version_is_deployable_gpt(persisted):
+                    stats["accepted"] += 1
+                elif version_is_pending_validator_warning(persisted):
+                    stats["pending_review"] += 1
+                else:
+                    record_fallback(effective_fallback_reason(persisted))
+                if primary_values.get("estimated_cost_usd") is not None:
+                    total_cost += _decimal_or_zero(
+                        primary_values["estimated_cost_usd"]
+                    )
+                continue
+
             try:
                 candidate_payload = json.loads(
                     str(primary_values.get("output_json") or "{}")
@@ -2497,6 +2957,50 @@ def run_gpt_unification(
                 route=route,
                 config=config,
             )
+            gated_generator.release_capacity(audit_capacity_report)
+            fitted_audit_request = gated_generator.fit_request_to_budget(
+                audit_request,
+                minimum_output_tokens=AUDIT_CAPACITY_MIN_OUTPUT_TOKENS,
+            )
+            if fitted_audit_request is None:
+                budget_route = _budget_safe_audit_route(
+                    route,
+                    config=config,
+                )
+                if budget_route is not None:
+                    budget_audit_request = build_autonomous_audit_request(
+                        contract_input=identity.contract_input,
+                        candidate=(
+                            candidate_payload
+                            if isinstance(candidate_payload, Mapping)
+                            else {}
+                        ),
+                        validation=(
+                            validation_payload
+                            if isinstance(validation_payload, Mapping)
+                            else {}
+                        ),
+                        route=budget_route,
+                        config=config,
+                    )
+                    fitted_audit_request = (
+                        gated_generator.fit_request_to_budget(
+                            budget_audit_request,
+                            minimum_output_tokens=(
+                                AUDIT_CAPACITY_MIN_OUTPUT_TOKENS
+                            ),
+                        )
+                    )
+                    if fitted_audit_request is not None:
+                        route = budget_route
+                        used_budget_safe_audit_route = True
+            if fitted_audit_request is not None:
+                audit_request = fitted_audit_request
+            stats["audit_routes"][route.complexity] = (
+                stats["audit_routes"].get(route.complexity, 0) + 1
+            )
+            if used_budget_safe_audit_route:
+                stats["audit_budget_safe_routes"] += 1
             try:
                 audit_result = gated_generator.generate(audit_request)
             except Exception as error:
@@ -2520,6 +3024,7 @@ def run_gpt_unification(
                             {
                                 "audit_version": AUTONOMOUS_AUDIT_VERSION,
                                 "complexity": route.complexity,
+                                "risk_tier": route.risk_tier,
                                 "reasons": list(route.reasons),
                                 "model": route.model,
                                 "reasoning_effort": route.reasoning_effort,
@@ -2546,6 +3051,7 @@ def run_gpt_unification(
                         primary_values.get("estimated_cost_usd")
                     )
                 stats["audit_failed"] += 1
+                stats["audit_provider_failed"] += 1
                 record_fallback("autonomous_audit_provider_error")
                 continue
 
@@ -2581,31 +3087,172 @@ def run_gpt_unification(
                     total_cost += _decimal_or_zero(
                         primary_values.get("estimated_cost_usd")
                     )
-                stats["audit_failed"] += 1
+                stats["audit_skipped_budget"] += 1
                 record_fallback(str(failed["fallback_reason"]))
                 continue
 
             stats["audit_calls"] += 1
             stats["provider_calls"] += 1
+            try:
+                audit_assessment = _parse_autonomous_audit_response(
+                    audit_result.generation.response
+                )
+            except (ValidationError, ValueError, TypeError):
+                audit_assessment = None
             audit_base = dict(base)
             audit_base.update(
                 {
                     "model_name": route.model,
                     "reasoning_effort": route.reasoning_effort,
-                    "max_output_tokens": config.gpt_audit_max_output_tokens,
+                    "max_output_tokens": audit_request.max_output_tokens,
                 }
             )
+            if (
+                audit_assessment is not None
+                and audit_assessment.cluster_coherence
+                == "partition_required"
+                and correction_requirements_by_story is None
+            ):
+                source_article_ids = {
+                    int(article.article_id)
+                    for article in identity.contract_input.articles
+                }
+                try:
+                    validated_groups = validate_semantic_partition(
+                        source_article_ids,
+                        audit_assessment.article_groups,
+                    )
+                    partition_result = apply_semantic_partition(
+                        connection,
+                        cluster_key=str(cluster["cluster_key"]),
+                        groups=validated_groups,
+                        audit_version=AUTONOMOUS_AUDIT_VERSION,
+                    )
+                except (TypeError, ValueError, sqlite3.DatabaseError) as error:
+                    logger.warning(
+                        "Rejected invalid semantic partition for cluster %s: %s",
+                        cluster.get("cluster_key"),
+                        error,
+                    )
+                    audit_assessment = None
+                else:
+                    audited_values = _fallback_values(
+                        audit_base,
+                        reason="semantic_partition_applied",
+                        validation_status="semantic_partition_applied",
+                        preflight=audit_result.preflight,
+                        response=audit_result.generation.response,
+                        attempts=audit_result.generation.attempts,
+                        output=audit_assessment.model_dump(mode="json"),
+                    )
+                    values = _combined_provider_values(
+                        primary=primary_values,
+                        audited=audited_values,
+                        route=route,
+                        audit_assessment=audit_assessment,
+                        audit_decision=audit_decision,
+                    )
+                    values["autonomous_audit_status"] = "partitioned"
+                    _persist_version(
+                        connection,
+                        values,
+                        allow_status_demotion=True,
+                    )
+                    usage_values = (
+                        audited_values if audit_only_cached else values
+                    )
+                    stats["input_tokens"] += int(
+                        usage_values.get("input_tokens") or 0
+                    )
+                    stats["output_tokens"] += int(
+                        usage_values.get("output_tokens") or 0
+                    )
+                    stats["total_tokens"] += int(
+                        usage_values.get("total_tokens") or 0
+                    )
+                    if usage_values.get("estimated_cost_usd") is not None:
+                        total_cost += _decimal_or_zero(
+                            usage_values["estimated_cost_usd"]
+                        )
+                    stats["semantic_partitions_applied"] += 1
+                    stats["semantic_partition_groups"] += (
+                        partition_result.group_count
+                    )
+                    stats["semantic_partition_multi_groups"] += len(
+                        partition_result.multi_article_cluster_keys
+                    )
+                    stats["semantic_partition_singletons"] += (
+                        partition_result.singleton_count
+                    )
+                    stats["semantic_partition_cluster_keys"].append(
+                        partition_result.old_cluster_key
+                    )
+                    stats["semantic_partition_followup_keys"].extend(
+                        partition_result.multi_article_cluster_keys
+                    )
+                    stats["audit_change_levels"]["material"] = (
+                        stats["audit_change_levels"].get("material", 0) + 1
+                    )
+                    tier_changes = stats[
+                        "audit_change_levels_by_risk"
+                    ].setdefault(route.risk_tier, {})
+                    tier_changes["material"] = (
+                        tier_changes.get("material", 0) + 1
+                    )
+                    logger.info(
+                        "Semantic audit partitioned cluster %s into %s groups "
+                        "(%s multi-article, %s singleton)",
+                        partition_result.old_cluster_key,
+                        partition_result.group_count,
+                        len(partition_result.multi_article_cluster_keys),
+                        partition_result.singleton_count,
+                    )
+                    continue
             audited_values = _interpret_generation(
                 base=audit_base,
                 identity=identity,
                 preflight=audit_result.preflight,
                 generation=audit_result.generation,
+                structured_output_override=(
+                    audit_assessment.corrected_story
+                    if audit_assessment is not None
+                    else None
+                ),
             )
             values = _combined_provider_values(
                 primary=primary_values,
                 audited=audited_values,
                 route=route,
+                audit_assessment=audit_assessment,
+                audit_decision=audit_decision,
             )
+            change_level = (
+                audit_assessment.change_level
+                if audit_assessment is not None
+                else "unknown"
+            )
+            stats["audit_change_levels"][change_level] = (
+                stats["audit_change_levels"].get(change_level, 0) + 1
+            )
+            tier_changes = stats["audit_change_levels_by_risk"].setdefault(
+                route.risk_tier,
+                {},
+            )
+            tier_changes[change_level] = tier_changes.get(change_level, 0) + 1
+            if (
+                audit_policy_config.gpt_audit_policy_mode == "shadow"
+                and not audit_decision.would_audit_under_risk_policy
+            ):
+                stats["shadow_avoidable_audit_calls"] += 1
+                avoidable_cost = _decimal_or_zero(
+                    stats["shadow_avoidable_audit_cost_usd"]
+                ) + _decimal_or_zero(
+                    audited_values.get("estimated_cost_usd")
+                )
+                stats["shadow_avoidable_audit_cost_usd"] = format(
+                    avoidable_cost,
+                    "f",
+                )
             persisted = _persist_version(
                 connection,
                 values,
@@ -2628,6 +3275,7 @@ def run_gpt_unification(
                 stats["pending_review"] += 1
             else:
                 stats["audit_failed"] += 1
+                stats["audit_rejected"] += 1
                 record_fallback(effective_fallback_reason(persisted))
             if usage_values.get("estimated_cost_usd") is not None:
                 total_cost += _decimal_or_zero(
@@ -2637,15 +3285,51 @@ def run_gpt_unification(
         connection.close()
 
     stats["estimated_cost_usd"] = format(total_cost, "f")
+    logger.info("Unification summary:")
     logger.info(
-        "GPT unification: %s accepted (%s cache hits), %s pending review, "
-        "%s fallbacks, %s primary calls, %s audit calls, %s deferred",
+        "  Unified multi-article stories ready to publish: %s",
         stats["accepted"],
+    )
+    logger.info(
+        "  Cached outcomes reused: %s total (%s cached fallbacks)",
         stats["cache_hits"],
+        stats["cached_fallbacks"],
+    )
+    logger.info(
+        "  Stories awaiting review: %s",
         stats["pending_review"],
+    )
+    logger.info(
+        "  New safe fallbacks: %s (a source article is used instead)",
         stats["fallbacks"],
+    )
+    logger.info(
+        "  GPT calls made: %s generation | %s audit",
         stats["generation_calls"],
         stats["audit_calls"],
+    )
+    logger.info(
+        "  Candidates left for a later run by the run limit: %s",
         stats["deferred_provider_candidates"],
     )
+    followup_keys = tuple(
+        sorted(set(stats["semantic_partition_followup_keys"]))
+    )
+    remaining_provider_candidates = max(
+        0,
+        provider_candidates_remaining
+        - int(stats.get("provider_request_candidates") or 0),
+    )
+    if followup_keys and remaining_provider_candidates > 0:
+        followup_stats = run_gpt_unification(
+            no_gpt=no_gpt,
+            force=False,
+            config=config,
+            generator=generator,
+            preflight=preflight,
+            cluster_keys=followup_keys,
+            correction_requirements_by_story=None,
+            _provider_candidates_remaining=remaining_provider_candidates,
+        )
+        stats = _merge_unification_pass_stats(stats, followup_stats)
     return stats

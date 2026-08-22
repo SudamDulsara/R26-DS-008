@@ -14,10 +14,11 @@ from news_pipeline.unification.gpt_preflight import (
     DEFAULT_PROVIDER_FRAMING_TOKEN_ALLOWANCE,
     MODEL_PRICING,
     OfflineRequestSizePreflight,
+    token_usage_cost_usd,
 )
 
 
-POLICY_VERSION = "autonomous_generation_budget_policy_v2"
+POLICY_VERSION = "autonomous_generation_budget_policy_v3"
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class OngoingPolicyGate:
     day_actual_cost_usd: Decimal
     month_actual_cost_usd: Decimal
     maximum_cost_per_day_usd: Decimal
+    effective_run_cap_usd: Decimal
     preflight: OfflineRequestSizePreflight
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +46,10 @@ class OngoingPolicyGate:
                 self.maximum_cost_per_day_usd,
                 "f",
             ),
+            "effective_run_cap_usd": format(
+                self.effective_run_cap_usd,
+                "f",
+            ),
             "input_token_count_calls": 0,
             "automatic_retries": 0,
         }
@@ -57,51 +63,72 @@ def _actual_costs(config: PipelineConfig) -> tuple[Decimal, Decimal]:
     now = datetime.now()
     day_prefix = now.strftime("%Y-%m-%d")
     month_prefix = now.strftime("%Y-%m")
+    day_cost = Decimal("0")
+    month_cost = Decimal("0")
     connection = get_connection(config)
     try:
-        row = connection.execute(
+        rows = connection.execute(
             """
-            SELECT
-                COALESCE(SUM(CASE
-                    WHEN primary_estimated_cost_usd IS NULL
-                         AND substr(created_at, 1, 10) = ?
-                    THEN CAST(estimated_cost_usd AS REAL)
-                    WHEN primary_estimated_cost_usd IS NOT NULL
-                         AND substr(created_at, 1, 10) = ?
-                    THEN CAST(primary_estimated_cost_usd AS REAL)
-                    ELSE 0 END), 0)
-                + COALESCE(SUM(CASE
-                    WHEN substr(autonomous_audit_created_at, 1, 10) = ?
-                    THEN CAST(autonomous_audit_estimated_cost_usd AS REAL)
-                    ELSE 0 END), 0) AS day_cost,
-                COALESCE(SUM(CASE
-                    WHEN primary_estimated_cost_usd IS NULL
-                         AND substr(created_at, 1, 7) = ?
-                    THEN CAST(estimated_cost_usd AS REAL)
-                    WHEN primary_estimated_cost_usd IS NOT NULL
-                         AND substr(created_at, 1, 7) = ?
-                    THEN CAST(primary_estimated_cost_usd AS REAL)
-                    ELSE 0 END), 0)
-                + COALESCE(SUM(CASE
-                    WHEN substr(autonomous_audit_created_at, 1, 7) = ?
-                    THEN CAST(autonomous_audit_estimated_cost_usd AS REAL)
-                    ELSE 0 END), 0) AS month_cost
+            SELECT created_at, model_name, input_tokens, output_tokens,
+                   primary_model_name, primary_input_tokens,
+                   primary_output_tokens, autonomous_audit_created_at,
+                   autonomous_audit_model, autonomous_audit_input_tokens,
+                   autonomous_audit_output_tokens
             FROM unified_story_versions
             WHERE response_id IS NOT NULL
-              AND estimated_cost_usd IS NOT NULL
             """,
-            (
-                day_prefix,
-                day_prefix,
-                day_prefix,
-                month_prefix,
-                month_prefix,
-                month_prefix,
-            ),
-        ).fetchone()
+        ).fetchall()
     finally:
         connection.close()
-    return Decimal(str(row["day_cost"])), Decimal(str(row["month_cost"]))
+
+    def add_usage(
+        *,
+        created_at: Any,
+        model: Any,
+        input_tokens: Any,
+        output_tokens: Any,
+    ) -> None:
+        nonlocal day_cost, month_cost
+        if not created_at or not model:
+            return
+        try:
+            cost = token_usage_cost_usd(
+                model_name=str(model),
+                input_tokens=int(input_tokens or 0),
+                output_tokens=int(output_tokens or 0),
+            )
+        except (TypeError, ValueError):
+            return
+        if cost is None:
+            return
+        timestamp = str(created_at)
+        if timestamp.startswith(month_prefix):
+            month_cost += cost
+        if timestamp.startswith(day_prefix):
+            day_cost += cost
+
+    for row in rows:
+        if row["primary_model_name"]:
+            add_usage(
+                created_at=row["created_at"],
+                model=row["primary_model_name"],
+                input_tokens=row["primary_input_tokens"],
+                output_tokens=row["primary_output_tokens"],
+            )
+        else:
+            add_usage(
+                created_at=row["created_at"],
+                model=row["model_name"],
+                input_tokens=row["input_tokens"],
+                output_tokens=row["output_tokens"],
+            )
+        add_usage(
+            created_at=row["autonomous_audit_created_at"],
+            model=row["autonomous_audit_model"],
+            input_tokens=row["autonomous_audit_input_tokens"],
+            output_tokens=row["autonomous_audit_output_tokens"],
+        )
+    return day_cost, month_cost
 
 
 def _configuration_sha256(config: PipelineConfig) -> str:
@@ -109,6 +136,28 @@ def _configuration_sha256(config: PipelineConfig) -> str:
         "policy_version": POLICY_VERSION,
         "primary_model": config.gpt_model,
         "audit_enabled": config.gpt_autonomous_audit_enabled,
+        "audit_policy_mode": config.gpt_audit_policy_mode,
+        "low_risk_audit_sample_rate": (
+            config.gpt_low_risk_audit_sample_rate
+        ),
+        "audit_circuit_min_evaluated": (
+            config.gpt_audit_circuit_min_evaluated
+        ),
+        "audit_circuit_max_material_rate": (
+            config.gpt_audit_circuit_max_material_rate
+        ),
+        "audit_high_risk_article_count": (
+            config.gpt_audit_high_risk_article_count
+        ),
+        "audit_high_risk_source_count": (
+            config.gpt_audit_high_risk_source_count
+        ),
+        "audit_high_risk_evidence_chars": (
+            config.gpt_audit_high_risk_evidence_chars
+        ),
+        "audit_medium_risk_evidence_chars": (
+            config.gpt_audit_medium_risk_evidence_chars
+        ),
         "audit_model": config.gpt_audit_model,
         "audit_complex_model": config.gpt_audit_complex_model,
         "max_clusters_per_run": config.gpt_max_clusters_per_run,
@@ -147,10 +196,14 @@ def enforce_ongoing_generation_policy(
     run_cap = Decimal(str(config.gpt_max_cost_per_run_usd))
     day_cap = Decimal(str(config.gpt_max_cost_per_day_usd))
     month_cap = Decimal(str(config.gpt_max_cost_per_month_usd))
-    if day_cost + run_cap > day_cap:
-        raise ValueError("daily autonomous GPT budget would be exceeded")
-    if month_cost + run_cap > month_cap:
-        raise ValueError("monthly autonomous GPT budget would be exceeded")
+    effective_run_cap = max(
+        Decimal("0"),
+        min(
+            run_cap,
+            day_cap - day_cost,
+            month_cap - month_cost,
+        ),
+    )
 
     return OngoingPolicyGate(
         policy_dir=policy_directory(config),
@@ -159,9 +212,10 @@ def enforce_ongoing_generation_policy(
         day_actual_cost_usd=day_cost,
         month_actual_cost_usd=month_cost,
         maximum_cost_per_day_usd=day_cap,
+        effective_run_cap_usd=effective_run_cap,
         preflight=OfflineRequestSizePreflight(
             max_cost_per_story_usd=config.gpt_max_cost_per_story_usd,
-            max_cost_per_run_usd=config.gpt_max_cost_per_run_usd,
+            max_cost_per_run_usd=effective_run_cap,
             provider_framing_token_allowance=(
                 DEFAULT_PROVIDER_FRAMING_TOKEN_ALLOWANCE
             ),

@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from news_pipeline.cleaner.sinhala_cleaner import run_cleaner
+from news_pipeline.cleaner.sinhala_cleaner import run_cleaner_with_recovery
 from news_pipeline.clustering.event_clusterer import run_event_clustering
 from news_pipeline.config import load_config
 from news_pipeline.crawler.rss_crawler import run_discovery
@@ -8,7 +8,7 @@ from news_pipeline.dataset.current_exporter import (
     export_current_publication,
 )
 from news_pipeline.deduplicator.exact_deduper import run_exact_dedup
-from news_pipeline.extractor.article_extractor import extract_articles
+from news_pipeline.extractor.article_extractor import extract_articles_with_recovery
 from news_pipeline.observability import (
     PipelineRunMetrics,
     write_pipeline_health_report,
@@ -55,12 +55,17 @@ def _run_pipeline_locked(*, config, no_gpt: bool = False):
         _log_step(logger, "STEP 2: Extract - Article Content")
         stats["extraction"] = metrics.run(
             "extraction",
-            extract_articles,
+            extract_articles_with_recovery,
+            fresh_discovered_at=stats["discovery"].get("run_started_at"),
         )
 
         logger.info("")
         _log_step(logger, "STEP 3: Clean - Sinhala Text Cleaning")
-        stats["cleaning"] = metrics.run("cleaning", run_cleaner)
+        stats["cleaning"] = metrics.run(
+            "cleaning",
+            run_cleaner_with_recovery,
+            fresh_discovered_at=stats["discovery"].get("run_started_at"),
+        )
 
         logger.info("")
         _log_step(logger, "STEP 4: Deduplicate - Exact Match Pass")
@@ -85,11 +90,10 @@ def _run_pipeline_locked(*, config, no_gpt: bool = False):
             "no_gpt": no_gpt,
             "config": _active_unification_config(config),
         }
-        changed_story_keys = stats["clustering"].get(
-            "changed_story_keys"
-        )
-        if changed_story_keys is not None:
-            unification_kwargs["cluster_keys"] = changed_story_keys
+        # Scan every multi-article story through the identity/cache gate.
+        # This does not regenerate cache hits, but it ensures candidates
+        # deferred by a prior run/budget cap are retried on later ordinary
+        # runs even when clustering itself is an incremental no-op.
         stats["unification"] = metrics.run(
             "unification",
             run_gpt_unification,

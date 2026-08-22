@@ -1,0 +1,111 @@
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+nosetests.xml
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+*.env
+
+# Streamlit
+.streamlit/
+
+# Generated data / wordlists (rebuilt by build_wordlist.py)
+data/sinhala_wordlist.json
+data/sinhala_corpus.txt
+
+# Training corpus (rebuilt by build_ocr_pairs.py — large, regenerable)
+data/training/
+
+# Evaluation set (rebuilt by build_test_set.py from AksharaOCR — third-party source)
+data/eval/
+
+# Downloaded gazette PDFs (re-fetchable by build_gazette_pairs.py)
+data/gazette_pdfs/
+
+# acts-1010 page images + transcriptions (~872 MB, CC-BY-4.0, re-downloadable
+# from HuggingFace: avishadilhara/sinhala-ocr-lk-acts-1010)
+data/acts1010/
+
+# Pipeline B: scanned Act PDFs in, generated pairs out. Both regenerable —
+# the PDFs by re-downloading, the pairs by re-running the pipeline.
+data/inbox/
+data/generated/
+
+# Fine-tuned LoRA adapter downloaded from Kaggle
+lightonocr-sinhala-acts/
+
+# SQLite database of saved pipeline runs (export to CSV for submission)
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded / processed images and OCR outputs
+uploads/
+outputs/
+*.tiff
+*.tif
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Model weights and large binary assets
+*.pt
+*.pth
+*.h5
+*.pkl
+*.pickle
+*.model
+
+# Logs
+*.log
+logs/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code
+.claude/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*~
+
+CLAUDE.md

@@ -38,7 +38,17 @@ class SentenceTransformerEmbedder:
                 "lightweight offline smoke test."
             ) from exc
 
-        self._model = SentenceTransformer(model_name, revision=model_revision)
+        try:
+            self._model = SentenceTransformer(
+                model_name,
+                revision=model_revision,
+                local_files_only=True,
+            )
+        except OSError:
+            self._model = SentenceTransformer(
+                model_name,
+                revision=model_revision,
+            )
         first_module = self._model[0]
         auto_model = getattr(first_module, "auto_model", None)
         model_config = getattr(auto_model, "config", None)
@@ -46,7 +56,9 @@ class SentenceTransformerEmbedder:
         self.model_revision = resolved_revision or model_revision or "unresolved"
 
     def encode(self, texts: list[str], batch_size: int = 16) -> list[list[float]]:
-        formatted_texts = [_format_for_model(self.model_name, text) for text in texts]
+        formatted_texts = [
+            prepare_embedding_input(self.model_name, text) for text in texts
+        ]
         embeddings = self._model.encode(
             formatted_texts,
             batch_size=batch_size,
@@ -88,10 +100,39 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _format_for_model(model_name: str, text: str) -> str:
+def embedding_norm(vector: list[float]) -> float:
+    """Compute a vector norm with the clustering scorer's exact arithmetic."""
+    if not vector:
+        return 0.0
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def cosine_similarity_with_norms(
+    left: list[float],
+    right: list[float],
+    left_norm: float,
+    right_norm: float,
+) -> float:
+    """Compute cosine similarity while reusing exact precomputed norms."""
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(left, right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+
+    return dot / (left_norm * right_norm)
+
+
+def prepare_embedding_input(model_name: str, text: str) -> str:
     if model_name.startswith("intfloat/multilingual-e5"):
         return f"passage: {text}"
     return text
+
+
+def embedding_input_fingerprint(model_name: str, text: str) -> str:
+    exact_input = prepare_embedding_input(model_name, text)
+    return hashlib.sha256(exact_input.encode("utf-8")).hexdigest()
 
 
 def _hash_text(text: str, dimensions: int) -> list[float]:

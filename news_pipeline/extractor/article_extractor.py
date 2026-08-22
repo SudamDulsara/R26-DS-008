@@ -3,6 +3,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from urllib.parse import urljoin
 
 from news_pipeline.config import load_config
 from news_pipeline.extractor.metadata_extractor import (
@@ -15,6 +16,7 @@ from news_pipeline.statuses import (
     CLEAN_STATUS_PENDING,
     DEDUPE_STATUS_PENDING,
     URL_ERROR_ARTICLE_TOO_SHORT,
+    URL_ERROR_ARTICLE_BODY_INCOMPLETE,
     URL_ERROR_EMPTY_EXTRACTION,
     URL_ERROR_HTTP_RETRYABLE,
     URL_ERROR_HTTP_TERMINAL,
@@ -39,6 +41,19 @@ logger = get_logger()
 
 RETRYABLE_HTTP_STATUSES = frozenset(
     {408, 425, 429, 500, 502, 503, 504}
+)
+
+BOILERPLATE_MARKERS = frozenset(
+    {
+        "toggle navigation",
+        "home",
+        "archive",
+        "contact us",
+        "web gossip",
+        "cartoon",
+        "most viewed stories",
+        "most viewed video stories",
+    }
 )
 
 
@@ -80,7 +95,146 @@ def extract_category_from_url(url, source):
     return metadata_category_from_url(url, source)
 
 
-def fetch_article(url):
+def _body_quality(text: str, title: str, min_length: int) -> tuple[bool, list[str]]:
+    normalized = "\n".join(
+        line.strip() for line in (text or "").splitlines() if line.strip()
+    )
+    flags = []
+    if len(normalized) < min_length:
+        flags.append("article_too_short")
+    lowered_lines = {line.lower() for line in normalized.splitlines()}
+    marker_count = len(lowered_lines & BOILERPLATE_MARKERS)
+    sinhala_letters = sum("\u0D80" <= char <= "\u0DFF" for char in normalized)
+    body_without_title = normalized
+    if title:
+        body_without_title = body_without_title.replace(title.strip(), "", 1).strip()
+    body_sinhala_letters = sum(
+        "\u0D80" <= char <= "\u0DFF" for char in body_without_title
+    )
+    sentence_marks = sum(normalized.count(mark) for mark in (".", "?", "!", "।"))
+    if "january 1, 1970" in normalized.lower():
+        flags.append("invalid_default_date")
+    if marker_count >= 3:
+        flags.append("navigation_dominated")
+    if sinhala_letters < 35 or body_sinhala_letters < 25:
+        flags.append("insufficient_article_body")
+    if marker_count >= 3 and sentence_marks == 0:
+        flags.append("no_article_sentences")
+    return not flags, flags
+
+
+def _html_extraction_candidates(html: str) -> list[tuple[str, str]]:
+    try:
+        from bs4 import BeautifulSoup
+    except ModuleNotFoundError:
+        return []
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates: list[tuple[str, str]] = []
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            value = json.loads(script.string or script.get_text())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                values.extend(node for node in graph if isinstance(node, dict))
+            body = item.get("articleBody")
+            if isinstance(body, str) and body.strip():
+                candidates.append(("json_ld_article_body", body.strip()))
+    selectors = (
+        ".news-content",
+        "article .entry-content",
+        ".entry-content",
+        ".post-content",
+        ".article-content",
+        "article",
+    )
+    seen = set()
+    for selector in selectors:
+        for node in soup.select(selector):
+            value = "\n".join(
+                part.strip()
+                for part in node.get_text("\n", strip=True).splitlines()
+                if part.strip()
+            )
+            if value and value not in seen:
+                seen.add(value)
+                candidates.append((f"html_selector:{selector}", value))
+    return candidates
+
+
+def _best_extraction(
+    *,
+    html: str,
+    extracted_json: str | None,
+    rss_title: str,
+    rss_summary: str,
+    min_length: int,
+) -> tuple[dict | None, str | None, list[str]]:
+    base_data = {}
+    candidates: list[tuple[str, str]] = []
+    if extracted_json:
+        try:
+            value = json.loads(extracted_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = None
+        if isinstance(value, dict):
+            base_data = value
+            if str(value.get("text") or "").strip():
+                candidates.append(("trafilatura", str(value["text"]).strip()))
+    candidates.extend(_html_extraction_candidates(html))
+    if len(rss_summary.strip()) >= max(800, min_length * 4):
+        candidates.append(("rss_summary", rss_summary.strip()))
+
+    best = None
+    diagnostics: list[str] = []
+    for method, text in candidates:
+        valid, flags = _body_quality(text, rss_title, min_length)
+        if valid:
+            priority = (
+                3
+                if method in {"trafilatura", "json_ld_article_body"}
+                else 2
+                if method != "rss_summary" and method != "html_selector:article"
+                else 1
+            )
+            candidate = (priority, len(text), method, text)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        else:
+            diagnostics.extend(flags)
+    if best is None:
+        return None, None, sorted(set(diagnostics or ["empty_extraction"]))
+    data = dict(base_data)
+    data["text"] = best[3]
+    return data, best[2], []
+
+
+def _alternate_document_urls(html: str, original_url: str) -> list[str]:
+    try:
+        from bs4 import BeautifulSoup
+    except ModuleNotFoundError:
+        return []
+    soup = BeautifulSoup(html or "", "html.parser")
+    urls = []
+    for rel in ("amphtml", "canonical"):
+        node = soup.select_one(f'link[rel~="{rel}"][href]')
+        if node is None:
+            continue
+        candidate = urljoin(
+            original_url,
+            str(node.get("href") or "").strip(),
+        )
+        if candidate and candidate != original_url and candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
+def fetch_article(url, *, rss_title="", rss_summary=""):
     config = load_config()
     try:
         import requests
@@ -137,6 +291,40 @@ def fetch_article(url):
                     "extracted_json": None,
                 }
 
+            extracted_json = trafilatura.extract(
+                response.text,
+                output_format="json",
+            )
+            data, method, diagnostics = _best_extraction(
+                html=response.text,
+                extracted_json=extracted_json,
+                rss_title=rss_title,
+                rss_summary=rss_summary,
+                min_length=config.min_article_length,
+            )
+            selected_html = response.text
+            if data is None:
+                for alternate_url in _alternate_document_urls(response.text, url)[:2]:
+                    request_attempts += 1
+                    alternate = requests.get(alternate_url, headers=headers, timeout=15)
+                    if alternate.status_code != 200:
+                        continue
+                    alternate_json = trafilatura.extract(
+                        alternate.text,
+                        output_format="json",
+                    )
+                    data, method, alternate_diagnostics = _best_extraction(
+                        html=alternate.text,
+                        extracted_json=alternate_json,
+                        rss_title=rss_title,
+                        rss_summary=rss_summary,
+                        min_length=config.min_article_length,
+                    )
+                    diagnostics.extend(alternate_diagnostics)
+                    if data is not None:
+                        selected_html = alternate.text
+                        method = f"alternate:{method}"
+                        break
             return {
                 "ok": True,
                 "error": None,
@@ -145,11 +333,12 @@ def fetch_article(url):
                 "fatal": False,
                 "status_code": response.status_code,
                 "request_attempts": request_attempts,
-                "html": response.text,
-                "extracted_json": trafilatura.extract(
-                    response.text,
-                    output_format="json",
+                "html": selected_html,
+                "extracted_json": (
+                    json.dumps(data, ensure_ascii=False) if data is not None else None
                 ),
+                "extraction_method": method,
+                "extraction_diagnostics": sorted(set(diagnostics)),
             }
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             if attempt == 0:
@@ -225,9 +414,10 @@ def _upsert_article(cursor, payload):
             dedupe_status,
             quality_flags,
             cleaned_at,
-            exported_at
+            exported_at,
+            extraction_method
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, '[]', NULL, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, '[]', NULL, NULL, ?)
         ON CONFLICT(url) DO UPDATE SET
             source = excluded.source,
             title = excluded.title,
@@ -252,7 +442,8 @@ def _upsert_article(cursor, payload):
             dedupe_status = excluded.dedupe_status,
             quality_flags = '[]',
             cleaned_at = NULL,
-            exported_at = NULL
+            exported_at = NULL,
+            extraction_method = excluded.extraction_method
         """,
         payload,
     )
@@ -280,7 +471,8 @@ def extract_articles(
 
     cursor.execute(
         """
-        SELECT id, url, source, fetch_attempts, rss_title, rss_published
+        SELECT id, url, source, fetch_attempts, rss_title, rss_published,
+               rss_summary
         FROM discovered_urls
         WHERE status IN (?, ?)
           AND fetch_attempts < ?
@@ -312,6 +504,7 @@ def extract_articles(
     failed = 0
     rejected = 0
     failures_by_source = {}
+    processed_url_ids = []
 
     def record_source_failure(source_name, reason):
         source_failures = failures_by_source.setdefault(source_name, {})
@@ -330,7 +523,12 @@ def extract_articles(
                 thread_name_prefix="article-fetch",
             )
             futures = [
-                executor.submit(fetch_article, row["url"])
+                executor.submit(
+                    fetch_article,
+                    row["url"],
+                    rss_title=row["rss_title"] or "",
+                    rss_summary=row["rss_summary"] or "",
+                )
                 for row in urls
             ]
             work_items = zip(
@@ -354,6 +552,8 @@ def extract_articles(
             fetch_attempts = row["fetch_attempts"] or 0
             rss_title = row["rss_title"] or ""
             rss_published = row["rss_published"] or ""
+            rss_summary = row["rss_summary"] or ""
+            processed_url_ids.append(int(url_id))
 
             attempt_number = fetch_attempts + 1
             logger.info(
@@ -365,7 +565,11 @@ def extract_articles(
             )
 
             fetch_result = (
-                fetch_article(url)
+                fetch_article(
+                    url,
+                    rss_title=rss_title,
+                    rss_summary=rss_summary,
+                )
                 if future is None
                 else future.result()
             )
@@ -443,8 +647,8 @@ def extract_articles(
                     (
                         status,
                         next_attempts,
-                        "Extractor returned no article JSON",
-                        URL_ERROR_EMPTY_EXTRACTION,
+                        "Article body unavailable after alternate extraction",
+                        URL_ERROR_ARTICLE_BODY_INCOMPLETE,
                         fetch_result["status_code"],
                         fetch_result["request_attempts"],
                         now,
@@ -452,7 +656,7 @@ def extract_articles(
                     ),
                 )
                 logger.warning(
-                    "    Failed - extractor returned no article JSON%s",
+                    "    Failed - article body unavailable%s",
                     " (exhausted retries)"
                     if status == URL_STATUS_EXHAUSTED
                     else "",
@@ -462,7 +666,7 @@ def extract_articles(
                     (
                         "exhausted"
                         if status == URL_STATUS_EXHAUSTED
-                        else "empty_extraction"
+                        else "article_body_incomplete"
                     ),
                 )
                 continue
@@ -581,6 +785,7 @@ def extract_articles(
                     now,
                     CLEAN_STATUS_PENDING,
                     DEDUPE_STATUS_PENDING,
+                    fetch_result.get("extraction_method") or "trafilatura",
                 ),
             )
 
@@ -631,6 +836,140 @@ def extract_articles(
         "fetch_failures": failed,
         "rejected_articles": rejected,
         "failures_by_source": failures_by_source,
+        "_processed_url_ids": processed_url_ids,
+    }
+
+
+def extract_articles_with_recovery(*, fresh_discovered_at: str | None = None):
+    """Run bounded recovery passes inside the ordinary extraction stage."""
+    config = load_config()
+    pass_results = []
+    processed_ids: set[int] = set()
+    for pass_number in range(config.extraction_recovery_passes):
+        result = extract_articles(workers=config.extraction_workers)
+        pass_results.append(result)
+        processed_ids.update(int(value) for value in result.get("_processed_url_ids", []))
+        if result["fetch_failures"] == 0:
+            break
+        if pass_number + 1 < config.extraction_recovery_passes:
+            logger.info(
+                "Retrying %s recoverable extraction failures in the same run",
+                result["fetch_failures"],
+            )
+            if config.retry_delay_seconds > 0:
+                time.sleep(config.retry_delay_seconds)
+
+    if not processed_ids:
+        return {
+            "extracted_articles": 0,
+            "fetch_failures": 0,
+            "rejected_articles": 0,
+            "recovered_articles": 0,
+            "recovery_passes": len(pass_results),
+            "failures_by_source": {},
+            "fresh_urls_attempted": 0,
+            "fresh_extracted_articles": 0,
+            "fresh_fetch_failures": 0,
+            "fresh_rejected_articles": 0,
+            "historical_retry_urls_attempted": 0,
+            "historical_retry_extracted_articles": 0,
+            "historical_retry_fetch_failures": 0,
+            "historical_retry_rejected_articles": 0,
+            "fresh_failures_by_source": {},
+            "historical_retry_failures_by_source": {},
+        }
+    connection = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in processed_ids)
+        rows = connection.execute(
+            f"""
+            SELECT source, status, last_error_code, discovered_at
+            FROM discovered_urls
+            WHERE id IN ({placeholders})
+            """,
+            tuple(sorted(processed_ids)),
+        ).fetchall()
+    finally:
+        connection.close()
+    extracted = sum(row["status"] == URL_STATUS_EXTRACTED for row in rows)
+    rejected = sum(row["status"] == URL_STATUS_REJECTED for row in rows)
+    failed_rows = [
+        row
+        for row in rows
+        if row["status"] in {URL_STATUS_FETCH_FAILED, URL_STATUS_EXHAUSTED}
+    ]
+    failures_by_source = {}
+    for row in failed_rows:
+        source_failures = failures_by_source.setdefault(row["source"], {})
+        reason = row["last_error_code"] or "unknown_failure"
+        source_failures[reason] = source_failures.get(reason, 0) + 1
+    first_successes = int(pass_results[0]["extracted_articles"])
+    origin_counts = _summarize_extraction_origins(
+        rows,
+        fresh_discovered_at=fresh_discovered_at,
+    )
+    return {
+        "extracted_articles": extracted,
+        "fetch_failures": len(failed_rows),
+        "rejected_articles": rejected,
+        "recovered_articles": max(0, extracted - first_successes),
+        "recovery_passes": len(pass_results),
+        "request_attempts": sum(
+            len(result.get("_processed_url_ids", [])) for result in pass_results
+        ),
+        "failures_by_source": failures_by_source,
+        **origin_counts,
+    }
+
+
+def _summarize_extraction_origins(
+    rows,
+    *,
+    fresh_discovered_at: str | None,
+) -> dict:
+    summaries = {
+        "fresh": {
+            "urls_attempted": 0,
+            "extracted_articles": 0,
+            "fetch_failures": 0,
+            "rejected_articles": 0,
+            "failures_by_source": {},
+        },
+        "historical_retry": {
+            "urls_attempted": 0,
+            "extracted_articles": 0,
+            "fetch_failures": 0,
+            "rejected_articles": 0,
+            "failures_by_source": {},
+        },
+    }
+    for row in rows:
+        origin = (
+            "fresh"
+            if fresh_discovered_at is not None
+            and str(row["discovered_at"]) == fresh_discovered_at
+            else "historical_retry"
+        )
+        summary = summaries[origin]
+        summary["urls_attempted"] += 1
+        status = row["status"]
+        if status == URL_STATUS_EXTRACTED:
+            summary["extracted_articles"] += 1
+        elif status == URL_STATUS_REJECTED:
+            summary["rejected_articles"] += 1
+        elif status in {URL_STATUS_FETCH_FAILED, URL_STATUS_EXHAUSTED}:
+            summary["fetch_failures"] += 1
+            source_failures = summary["failures_by_source"].setdefault(
+                row["source"],
+                {},
+            )
+            reason = row["last_error_code"] or "unknown_failure"
+            source_failures[reason] = source_failures.get(reason, 0) + 1
+
+    return {
+        f"{origin}_{name}": value
+        for origin, summary in summaries.items()
+        for name, value in summary.items()
     }
 
 
