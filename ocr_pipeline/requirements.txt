@@ -1,0 +1,42 @@
+# Sinhala Post-OCR Refinement Pipeline — dependencies
+#
+# Built and tested on Python 3.10.11 (Windows 11).
+# Versions are pinned exactly: these are the ones that produced the results
+# reported in the thesis, so an examiner reproducing the work gets the same
+# numbers rather than whatever the latest release happens to do.
+#
+#   python -m venv venv
+#   venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# ── Application ────────────────────────────────────────────────
+streamlit==1.57.0
+pandas==2.3.3
+python-dotenv==1.2.2
+
+# ── Evaluation ─────────────────────────────────────────────────
+jiwer==4.0.0
+
+# ── Stage 2: LLM contextual recovery via OpenRouter ────────────
+# The OpenAI client is pointed at OpenRouter's base URL; the `openai`
+# package is the client library, not the model provider.
+openai==2.53.0
+
+# ── OCR engine ─────────────────────────────────────────────────
+# Also requires the Tesseract binary installed system-wide with the `sin`
+# language pack — pip cannot supply that. See pipeline/ocr_engine.py.
+pytesseract==0.3.13
+pillow==12.2.0
+
+# ── Not required to run the app ────────────────────────────────
+# The dormant word-boundary subsystem (pipeline/word_boundary.py) needs
+# torch + transformers, and download_corpus.py needs datasets. Stage 1
+# guards its word_boundary import in a try/except, so the app runs fine
+# without them. Install only if reviving that subsystem or rebuilding the
+# Sinhala corpus — torch alone is a multi-gigabyte download.
+#
+#   torch==2.11.0
+#   transformers==5.7.0
+#   datasets==4.8.5
+#
+# These move above the line once the fine-tuned ByT5 model lands, since
+# local inference will need torch + transformers at runtime.
