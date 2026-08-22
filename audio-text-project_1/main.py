@@ -19,7 +19,7 @@ from download import download_audio
 from preprocess import preprocess_audio
 from segment import split_audio
 from transcribe_dataset import transcribe_dataset
-from dataset_writer import write_dataset
+
 
 
 # =====================================================
@@ -133,16 +133,7 @@ def main():
         f"\nTranscripts Generated: {len(results)}"
     )
 
-    # -------------------------------------------------
-    # STEP 6
-    # SAVE DATASET
-    # -------------------------------------------------
-
-    print("\nSaving dataset...")
-
-    write_dataset(
-        results
-    )
+  
 
     # -------------------------------------------------
     # FINISHED
