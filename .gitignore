@@ -94,6 +94,10 @@ desktop.ini
 # =====================================================
 
 audio-text-project_1/check_database.py
+# Local database
+data/
+import_train_v2.py
+split_v2_dataset.py
 
 # =====================================================
 # News Pipeline

@@ -11,6 +11,7 @@ from transformers import pipeline
 
 from corrections import correct_text
 
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -19,17 +20,19 @@ os.environ["HF_HOME"] = "E:/huggingface_cache"
 
 device = 0 if torch.cuda.is_available() else -1
 
+
 # =========================================================
 # MODEL
 # =========================================================
 
 model_id = os.path.join(
     "models",
-    "final_whisper_sinhala_v1"
+    "final_whisper_sinhala_v2"
 )
 
-print("Using fine-tuned Whisper V1:")
+print("Using fine-tuned Whisper V2:")
 print(os.path.abspath(model_id))
+
 
 # =========================================================
 # LOAD MODEL
@@ -42,6 +45,7 @@ transcriber = pipeline(
     chunk_length_s=15,
     stride_length_s=5
 )
+
 
 # =========================================================
 # AUDIO FILTERING
@@ -111,6 +115,7 @@ def apply_filters(input_path):
 
         return input_path
 
+
 # =========================================================
 # CLEAN TEXT
 # =========================================================
@@ -144,11 +149,14 @@ def clean_text(text):
 
     return text.strip()
 
+
 # =========================================================
 # MAIN TRANSCRIPTION FUNCTION
 # =========================================================
 
 def transcribe_audio(file_path):
+
+    clean_file = file_path
 
     try:
 
@@ -158,16 +166,22 @@ def transcribe_audio(file_path):
 
         if not os.path.exists(file_path):
 
+            print(
+                f"❌ Audio file not found: {file_path}"
+            )
+
             return ""
 
         # --------------------------------------------
         # APPLY FILTERS
         # --------------------------------------------
 
-        clean_file = apply_filters(file_path)
+        clean_file = apply_filters(
+            file_path
+        )
 
         # --------------------------------------------
-        # TRANSCRIBE
+        # TRANSCRIBE WITH V2
         # --------------------------------------------
 
         result = transcriber(
@@ -192,37 +206,59 @@ def transcribe_audio(file_path):
         # CLEAN TEXT
         # --------------------------------------------
 
-        text = clean_text(text)
+        text = clean_text(
+            text
+        )
 
         # --------------------------------------------
         # CORRECT TEXT
         # --------------------------------------------
 
-        text = correct_text(text)
+        text = correct_text(
+            text
+        )
 
         # --------------------------------------------
-        # DELETE TEMP FILE
+        # DELETE TEMP FILTERED FILE
         # --------------------------------------------
 
         if (
-
             clean_file != file_path
-
-            and
-
-            os.path.exists(clean_file)
-
+            and os.path.exists(clean_file)
         ):
 
-            os.remove(clean_file)
+            os.remove(
+                clean_file
+            )
 
         return text
 
     except Exception as e:
 
-        print(f"❌ Error: {e}")
+        print(
+            f"❌ Transcription Error: {e}"
+        )
+
+        # --------------------------------------------
+        # CLEAN TEMP FILE AFTER ERROR
+        # --------------------------------------------
+
+        if (
+            clean_file != file_path
+            and os.path.exists(clean_file)
+        ):
+
+            try:
+
+                os.remove(
+                    clean_file
+                )
+
+            except Exception:
+                pass
 
         return ""
+
 
 # =========================================================
 # CLI TEST
@@ -246,7 +282,9 @@ if __name__ == "__main__":
     print("\n⏳ Transcribing...")
     print("-" * 40)
 
-    output = transcribe_audio(args.input)
+    output = transcribe_audio(
+        args.input
+    )
 
     print("\n✅ FINAL OUTPUT:")
     print(output)

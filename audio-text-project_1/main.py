@@ -7,13 +7,14 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+
 # =====================================================
 # IMPORTS
 # =====================================================
 
 from database import create_database
-
 from collector import get_next_video
+
 from download import download_audio
 from preprocess import preprocess_audio
 from segment import split_audio
@@ -28,7 +29,7 @@ from dataset_writer import write_dataset
 def main():
 
     # -------------------------------------------------
-    # CREATE DATABASE (Creates tables if they don't exist)
+    # CREATE DATABASE
     # -------------------------------------------------
 
     create_database()
@@ -39,14 +40,20 @@ def main():
 
     # -------------------------------------------------
     # STEP 1
-    # GET NEW VIDEO
+    # AUTOMATIC VIDEO COLLECTION
     # -------------------------------------------------
+
+    print("\nSearching YouTube automatically...")
 
     video = get_next_video()
 
+    # -------------------------------------------------
+    # CHECK VIDEO
+    # -------------------------------------------------
+
     if video is None:
 
-        print("\nNo new videos found.")
+        print("\nNo new video available.")
 
         return
 
@@ -59,6 +66,12 @@ def main():
 
     audio_path = download_audio(video)
 
+    if not audio_path:
+
+        print("\n❌ Audio download failed.")
+
+        return
+
     # -------------------------------------------------
     # STEP 3
     # PREPROCESS
@@ -66,7 +79,15 @@ def main():
 
     print("\nPreprocessing audio...")
 
-    clean_audio = preprocess_audio(audio_path)
+    clean_audio = preprocess_audio(
+        audio_path
+    )
+
+    if not clean_audio:
+
+        print("\n❌ Audio preprocessing failed.")
+
+        return
 
     # -------------------------------------------------
     # STEP 4
@@ -75,7 +96,10 @@ def main():
 
     print("\nSegmenting audio...")
 
-    chunks = split_audio(clean_audio,video)
+    chunks = split_audio(
+        clean_audio,
+        video
+    )
 
     if len(chunks) == 0:
 
@@ -83,12 +107,21 @@ def main():
 
         return
 
+    print(
+        f"\nChunks Generated: {len(chunks)}"
+    )
+
     # -------------------------------------------------
     # STEP 5
     # TRANSCRIBE
     # -------------------------------------------------
 
-    results = transcribe_dataset(chunks,video)
+    print("\nTranscribing with fine-tuned Sinhala Whisper V2...")
+
+    results = transcribe_dataset(
+        chunks,
+        video
+    )
 
     if len(results) == 0:
 
@@ -96,12 +129,20 @@ def main():
 
         return
 
+    print(
+        f"\nTranscripts Generated: {len(results)}"
+    )
+
     # -------------------------------------------------
     # STEP 6
     # SAVE DATASET
     # -------------------------------------------------
 
-    write_dataset(results)
+    print("\nSaving dataset...")
+
+    write_dataset(
+        results
+    )
 
     # -------------------------------------------------
     # FINISHED
@@ -110,12 +151,29 @@ def main():
     print()
 
     print("=" * 70)
-    print("PIPELINE FINISHED SUCCESSFULLY")
+
+    print(
+        "PIPELINE FINISHED SUCCESSFULLY"
+    )
+
     print("=" * 70)
 
-    print(f"\nVideo : {video['title']}")
-    print(f"Chunks Generated : {len(chunks)}")
-    print(f"Dataset Records : {len(results)}")
+    print(
+        f"\nVideo : {video['title']}"
+    )
+
+    print(
+        f"Chunks Generated : {len(chunks)}"
+    )
+
+    print(
+        f"Dataset Records : {len(results)}"
+    )
+
+    print(
+        "\nDatabase : Video saved "
+        "(automatic collection)"
+    )
 
 
 # =====================================================
