@@ -6,30 +6,29 @@ Streamlit prototype for the Sinhala Quality Pipeline (Component 4).
 Run from the repo root with:
     streamlit run quality_pipeline/frontend/app.py
 
-What this page does
--------------------
-Two modes selectable from the sidebar:
+Three modes selectable from the sidebar:
 
-1. Single Document — paste/select Sinhala text, see the full pipeline run
-   (Unicode normalize → exact-hash dedup → morphology score) and inspect
-   verdict, score, sub-features, and per-word decomposition.
+1. Single Document — pipeline runs on one document; verdict, score, and
+   per-word breakdown. Stage 3b will show "no overlap" since there are
+   no prior docs to compare against — that's expected.
 
-2. Compare Two Documents — runs both through the same pipeline instance so
-   the deduplicator can flag near/exact duplicates between them.
+2. Compare Two Documents — runs A then B through the SAME pipeline
+   instance. Stage 2 catches byte-identical dupes; Stage 3b catches
+   semantic ones. If they're same-source it's REJECT; if different-source
+   it's REVIEW (cross-register overlap — the register-aware novelty).
 
-Both modes use *real* upstream-style Document objects flowing through the
-*real* QualityPipeline — the frontend builds Documents from the textarea
-input and feeds them through the same code path as the production pipeline.
-No mock outputs.
+3. Corpus overlap — add 3-6 documents from different sources, watch
+   Stage 3b decide which are same-source dupes vs cross-register overlap.
+   This is the mode that actually demonstrates the second novelty end-to-end.
+
+Note: first pipeline run downloads LaBSE (~470MB). Subsequent runs use
+the local cache and are fast.
 """
 
 import sys
 from pathlib import Path
 
 # Make `quality_pipeline` importable when running `streamlit run` from repo root.
-# Streamlit runs the script directly, not as a package module, so we need to
-# add the repo root to sys.path. This is a one-off acceptable hack for entry
-# points; the rest of the app uses normal package imports.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -37,16 +36,19 @@ if str(_REPO_ROOT) not in sys.path:
 import streamlit as st
 
 from quality_pipeline.linguistic.normalizer import UnicodeNormalizer
+from quality_pipeline.pipeline import QualityPipeline
 from quality_pipeline.quality.deduplicator import ExactHashDeduplicator
 from quality_pipeline.quality.morphology.scorer import MorphologyQualityScorer
-from quality_pipeline.pipeline import QualityPipeline
+from quality_pipeline.quality.semantic_overlap import CrossRegisterSemanticOverlap
 from quality_pipeline.schema import Document, Source, Verdict
 
+from quality_pipeline.frontend.components.corpus_overlap import render_corpus_overlap
 from quality_pipeline.frontend.components.feature_chart import render_feature_chart
 from quality_pipeline.frontend.components.score_display import (
     render_score_gauge,
     render_verdict_badge,
 )
+from quality_pipeline.frontend.components.stage_details import render_stage_details
 from quality_pipeline.frontend.components.word_breakdown import render_word_breakdown
 
 
@@ -61,17 +63,23 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Demo examples (curated for the supervisor demo)
+# Demo examples
 # ---------------------------------------------------------------------------
-# Each example is chosen to demonstrate a specific behaviour of the scorer.
-# Keep these short — they're loaded into the textarea so the demo doesn't
-# require typing Sinhala on the spot.
-
 DEMO_EXAMPLES = {
     "📰 Clean news (Sinhala)": (
         "ශ්‍රී ලංකා ක්‍රිකට් කණ්ඩායම අද ජයග්‍රහණය ලබා ගත්තේය. තරගය "
         "කොළඹදී පැවැත්වුණි. ක්‍රීඩකයන් 11 දෙනා හොඳින් ක්‍රීඩා කළහ. "
         "ජනාධිපතිවරයා කණ්ඩායමට සුබපැතුම් එක් කළේය."
+    ),
+    "📰 Same news, paraphrased": (
+        "ලංකා කණ්ඩායම අද කොළඹදී පැවති තරගයෙන් ජය ලැබීය. "
+        "ක්‍රීඩකයන් සියල්ල හොඳින් ක්‍රීඩා කළහ. ජනාධිපතිවරයා ජයග්‍රාහී "
+        "කණ්ඩායමට සුබපැතුම් පිරිනැමීය."
+    ),
+    "🧪 Same news with hidden junk (BOM + ZWSP + extra spaces)": (
+        "\ufeffශ්‍රී ලංකා\u200b ක්‍රිකට්   කණ්ඩායම   අද\u200b ජයග්‍රහණය ලබා ගත්තේය. "
+        "තරගය කොළඹදී    පැවැත්වුණි. ක්‍රීඩකයන් 11 දෙනා හොඳින් ක්‍රීඩා කළහ. "
+        "ජනාධිපතිවරයා කණ්ඩායමට සුබපැතුම් එක් කළේය.\ufeff"
     ),
     "📚 OCR — clean book page": (
         "ශ්‍රී ලංකාවේ ඉතිහාසය පුරාණ රාජවංශ සමයේ සිට පටන් ගනී. "
@@ -79,6 +87,10 @@ DEMO_EXAMPLES = {
     ),
     "🎙️ ASR — disfluent speech": (
         "umm... ah... හරි... ඊළඟට... අපි... කොහොමද... හරි ඉතින්..."
+    ),
+    "🎙️ ASR — same match, spoken register": (
+        "අද කොළඹදී තිබ්බ තරගේ ලංකා කණ්ඩායම දිනුවා. ක්‍රීඩකයෝ 11ම හොඳට "
+        "ක්‍රීඩා කරා. ජනාධිපතිතුමා ඒ අයට සුබපැතුම් කිව්වා."
     ),
     "🗑️ OCR garbage (low quality scan)": (
         "p@ge wi+h l0ts of OCR err0rs and garbage characters mixed in"
@@ -92,16 +104,25 @@ DEMO_EXAMPLES = {
     ),
 }
 
-DEFAULT_KEY_LEFT = "📰 Clean news (Sinhala)"
-DEFAULT_KEY_RIGHT = "🗑️ OCR garbage (low quality scan)"
+# Which examples represent which sources (for the corpus mode default sources).
+EXAMPLE_SOURCE_HINT = {
+    "📰 Clean news (Sinhala)": Source.NEWS,
+    "📰 Same news, paraphrased": Source.NEWS,
+    "🧪 Same news with hidden junk (BOM + ZWSP + extra spaces)": Source.NEWS,
+    "📚 OCR — clean book page": Source.OCR,
+    "🎙️ ASR — disfluent speech": Source.ASR,
+    "🎙️ ASR — same match, spoken register": Source.ASR,
+    "🗑️ OCR garbage (low quality scan)": Source.OCR,
+    "🌐 Mixed English / Sinhala": Source.NEWS,
+    "🔢 Math problem (low morphology by nature)": Source.OCR,
+}
 
 
 # ---------------------------------------------------------------------------
-# Pipeline construction
+# Pipeline
 # ---------------------------------------------------------------------------
-# Cached so we don't rebuild the stages on every interaction. The pipeline
-# itself is stateful (the deduplicator remembers hashes), so we explicitly
-# reset it before each run.
+# Cached so we don't rebuild the stages on every interaction. LaBSE download
+# happens on first embedding call; the pipeline object holds the loaded model.
 
 @st.cache_resource
 def get_pipeline() -> QualityPipeline:
@@ -109,6 +130,7 @@ def get_pipeline() -> QualityPipeline:
         UnicodeNormalizer(),
         ExactHashDeduplicator(),
         MorphologyQualityScorer(),
+        CrossRegisterSemanticOverlap(),
     ])
 
 
@@ -120,7 +142,6 @@ def reset_pipeline_state(pipeline: QualityPipeline) -> None:
 
 
 def make_document(doc_id: str, text: str, source: Source = Source.NEWS) -> Document:
-    """Build a Document object from raw text — same shape the loader produces."""
     return Document(
         doc_id=doc_id,
         source=source,
@@ -131,27 +152,26 @@ def make_document(doc_id: str, text: str, source: Source = Source.NEWS) -> Docum
 
 
 def finalize_verdict(doc: Document) -> None:
-    """
-    Promote PENDING → ACCEPT (placeholder, same logic as test_pipeline.py).
-    Mirrors the production pipeline's behaviour so the frontend matches the
-    Excel output for the same input.
-    """
     if doc.verdict == Verdict.PENDING:
         doc.verdict = Verdict.ACCEPT
         doc.verdict_reasons.append("tentative_accept:no_rejection_signals")
 
 
 # ---------------------------------------------------------------------------
-# Sidebar — mode selection + about
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("⚙️ Pipeline Controls")
 
     mode = st.radio(
         "Mode",
-        ["Single Document", "Compare Two Documents"],
-        help="Single: full pipeline on one document. Compare: also runs the "
-             "deduplicator across both documents to detect duplicates.",
+        ["Single Document", "Compare Two Documents", "Corpus overlap"],
+        help=(
+            "Single: full pipeline on one document.\n"
+            "Compare: A vs B through the same pipeline instance.\n"
+            "Corpus overlap: 3-6 docs from mixed sources — best mode for "
+            "demonstrating the cross-register (Stage 3b) novelty."
+        ),
     )
 
     st.markdown("---")
@@ -161,32 +181,31 @@ with st.sidebar:
         "Pipeline stages currently active:\n"
         "1. **Unicode normalization** (NFC + invisible-char cleanup)\n"
         "2. **Exact-hash deduplication** (SHA-256 of cleaned text)\n"
-        "3. **Morphology-aware quality scoring** ← *novelty*"
+        "3. **Morphology-aware quality scoring** ← *novelty 1*\n"
+        "4. **Cross-register semantic overlap** ← *novelty 2*"
     )
-    st.caption("All processing runs through the real pipeline — no mock outputs.")
+    st.caption("First run downloads LaBSE (~470MB). Cached after that.")
 
 
 # ---------------------------------------------------------------------------
-# Main page header
+# Header
 # ---------------------------------------------------------------------------
 st.title("🇱🇰 Sinhala Quality Pipeline — Prototype")
 st.caption(
-    "Paste Sinhala text or pick a demo example. The full pipeline runs end-to-end "
-    "and shows the verdict, score breakdown, and per-word morphological analysis."
+    "Paste Sinhala text or pick a demo example. The full pipeline runs "
+    "end-to-end — no mock outputs."
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers — render one document's full result block
+# Render helpers
 # ---------------------------------------------------------------------------
 def render_document_result(doc: Document, header: str | None = None) -> None:
-    """Render verdict + gauge + features + word breakdown for one document."""
     if header:
         st.subheader(header)
 
     render_verdict_badge(doc)
 
-    # Two-column layout: gauge on left, features on right.
     gauge_col, features_col = st.columns([1, 1.3])
     with gauge_col:
         render_score_gauge(doc)
@@ -195,6 +214,9 @@ def render_document_result(doc: Document, header: str | None = None) -> None:
 
     with st.expander("🔍 Per-word morphological breakdown", expanded=False):
         render_word_breakdown(doc)
+
+    with st.expander("⚙️ Pipeline stage details (Unicode, dedup, scoring, overlap)", expanded=False):
+        render_stage_details(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -227,17 +249,21 @@ if mode == "Single Document":
 
             st.markdown("---")
             st.markdown("### Result")
+            st.caption(
+                "Note: in single-doc mode, Stage 3b has no prior documents to compare "
+                "against — expected to show 'no overlap'. Try Corpus mode to see it work."
+            )
             render_document_result(doc)
 
 
 # ---------------------------------------------------------------------------
 # MODE 2 — Compare Two Documents
 # ---------------------------------------------------------------------------
-else:
+elif mode == "Compare Two Documents":
     st.markdown("### Input")
     st.caption(
-        "Both documents flow through the same pipeline instance, so the "
-        "deduplicator catches if Document B is a duplicate of Document A."
+        "Both documents flow through the same pipeline instance. The dedup stage "
+        "catches byte-identical B; the semantic-overlap stage catches paraphrases."
     )
 
     left, right = st.columns(2)
@@ -247,8 +273,16 @@ else:
         key_a = st.selectbox(
             "Pick example:",
             list(DEMO_EXAMPLES.keys()),
-            index=list(DEMO_EXAMPLES.keys()).index(DEFAULT_KEY_LEFT),
+            index=0,
             key="example_a",
+        )
+        src_a = st.selectbox(
+            "Source (A):",
+            [Source.NEWS.value, Source.OCR.value, Source.ASR.value],
+            index=[Source.NEWS.value, Source.OCR.value, Source.ASR.value].index(
+                EXAMPLE_SOURCE_HINT.get(key_a, Source.NEWS).value
+            ),
+            key="src_a",
         )
         text_a = st.text_area(
             "Document A text",
@@ -263,8 +297,16 @@ else:
         key_b = st.selectbox(
             "Pick example:",
             list(DEMO_EXAMPLES.keys()),
-            index=list(DEMO_EXAMPLES.keys()).index(DEFAULT_KEY_RIGHT),
+            index=1,  # default to the paraphrased news
             key="example_b",
+        )
+        src_b = st.selectbox(
+            "Source (B):",
+            [Source.NEWS.value, Source.OCR.value, Source.ASR.value],
+            index=[Source.NEWS.value, Source.OCR.value, Source.ASR.value].index(
+                EXAMPLE_SOURCE_HINT.get(key_b, Source.NEWS).value
+            ),
+            key="src_b",
         )
         text_b = st.text_area(
             "Document B text",
@@ -281,20 +323,34 @@ else:
             pipeline = get_pipeline()
             reset_pipeline_state(pipeline)
 
-            doc_a = pipeline.run(make_document("frontend_A", text_a))
-            doc_b = pipeline.run(make_document("frontend_B", text_b))
+            doc_a = pipeline.run(make_document("frontend_A", text_a, Source(src_a)))
+            doc_b = pipeline.run(make_document("frontend_B", text_b, Source(src_b)))
             finalize_verdict(doc_a)
             finalize_verdict(doc_b)
 
             st.markdown("---")
 
-            # Highlight if B was caught as a duplicate of A.
+            # Exact-dup callout (Stage 2)
             if doc_b.quality.get("is_duplicate") and doc_b.quality.get("duplicate_of") == doc_a.doc_id:
                 st.error(
-                    "🔁 **Document B was detected as an exact duplicate of "
-                    "Document A** by the dedup stage (after normalization). "
-                    "Try pasting the same text with different whitespace or "
-                    "BOM characters into both — normalization + dedup catches that."
+                    "🔁 **Document B was detected as an exact duplicate of Document A** "
+                    "by the exact-hash dedup stage (after normalization)."
+                )
+
+            # Semantic-overlap callout (Stage 3b) — this is the new bit
+            ov_b = doc_b.quality.get("semantic_overlap", {})
+            if ov_b.get("decision") == "reject_same_source":
+                st.error(
+                    f"🔁 **Semantic near-duplicate rejected.** Similarity "
+                    f"{ov_b['best_match_score']:.3f} ≥ threshold, and both are "
+                    f"`{src_a}` → treated as a same-source duplicate."
+                )
+            elif ov_b.get("decision") == "review_cross_register":
+                st.warning(
+                    f"⚠️ **Cross-register overlap detected.** Similarity "
+                    f"{ov_b['best_match_score']:.3f} ≥ threshold, but sources differ "
+                    f"(`{src_a}` → `{src_b}`) → routed to REVIEW, not REJECT. "
+                    f"Same content in different registers may be valuable training data."
                 )
 
             res_left, res_right = st.columns(2)
@@ -302,3 +358,93 @@ else:
                 render_document_result(doc_a, header="Document A — Result")
             with res_right:
                 render_document_result(doc_b, header="Document B — Result")
+
+
+# ---------------------------------------------------------------------------
+# MODE 3 — Corpus overlap (NEW)
+# ---------------------------------------------------------------------------
+else:
+    st.markdown("### Input — build a small corpus")
+    st.caption(
+        "Add 3-6 documents. Vary the sources to see the register-aware behaviour of Stage 3b. "
+        "Same-source semantic dupes are rejected; cross-source overlap is routed to review."
+    )
+
+    # Persist the corpus in session state so it survives between clicks.
+    if "corpus_entries" not in st.session_state:
+        # Preload a demo corpus that shows both novelty behaviours:
+        #  - news_1 + news_2 = paraphrases from same source → REJECT
+        #  - news_1 + asr_1  = same event, different register → REVIEW
+        #  - ocr_1           = distinct content → ACCEPT
+        st.session_state.corpus_entries = [
+            {"id": "news_1", "source": "news", "text": DEMO_EXAMPLES["📰 Clean news (Sinhala)"]},
+            {"id": "news_2", "source": "news", "text": DEMO_EXAMPLES["📰 Same news, paraphrased"]},
+            {"id": "asr_1",  "source": "asr",  "text": DEMO_EXAMPLES["🎙️ ASR — same match, spoken register"]},
+            {"id": "ocr_1",  "source": "ocr",  "text": DEMO_EXAMPLES["📚 OCR — clean book page"]},
+        ]
+
+    # Render editable rows for the corpus.
+    st.markdown("**Corpus documents** (edit / add / remove below)")
+    new_entries = []
+    for i, entry in enumerate(st.session_state.corpus_entries):
+        with st.container(border=True):
+            cols = st.columns([1, 1, 4, 1])
+            with cols[0]:
+                doc_id = st.text_input("ID", value=entry["id"], key=f"id_{i}")
+            with cols[1]:
+                src = st.selectbox(
+                    "Source",
+                    ["news", "ocr", "asr"],
+                    index=["news", "ocr", "asr"].index(entry["source"]),
+                    key=f"src_{i}",
+                )
+            with cols[2]:
+                text = st.text_area(
+                    "Text", value=entry["text"], height=68, key=f"text_{i}",
+                    label_visibility="collapsed",
+                )
+            with cols[3]:
+                remove = st.button("🗑️", key=f"del_{i}", help="Remove this document")
+            if not remove:
+                new_entries.append({"id": doc_id, "source": src, "text": text})
+
+    st.session_state.corpus_entries = new_entries
+
+    add_col, run_col = st.columns([1, 3])
+    with add_col:
+        if st.button("+ Add document"):
+            st.session_state.corpus_entries.append(
+                {"id": f"doc_{len(st.session_state.corpus_entries)+1}",
+                 "source": "news", "text": ""}
+            )
+            st.rerun()
+    with run_col:
+        run = st.button("Run pipeline on corpus", type="primary")
+
+    if run:
+        entries = [e for e in st.session_state.corpus_entries if e["text"].strip()]
+        if len(entries) < 2:
+            st.warning("Add at least 2 documents to see overlap behaviour.")
+        else:
+            pipeline = get_pipeline()
+            reset_pipeline_state(pipeline)
+
+            docs = [
+                make_document(e["id"], e["text"], Source(e["source"]))
+                for e in entries
+            ]
+            processed = pipeline.run_batch(docs)
+            for d in processed:
+                finalize_verdict(d)
+
+            st.markdown("---")
+            render_corpus_overlap(processed)
+
+            # Also let the user drill into any single doc's full detail.
+            st.markdown("### Per-document detail")
+            selected_id = st.selectbox(
+                "Inspect a specific document:",
+                [d.doc_id for d in processed],
+            )
+            selected = next(d for d in processed if d.doc_id == selected_id)
+            render_document_result(selected)
