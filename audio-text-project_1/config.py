@@ -90,8 +90,15 @@ VIDEOS_PER_RUN = 1
 DATABASE_NAME = r"..\data\videos.db"
 
 
+
 # =====================================================
-# GOOGLE DRIVE DESKTOP
+# GOOGLE DRIVE API
 # =====================================================
 
-GOOGLE_DRIVE_FOLDER = r"G:\My Drive\Sinhala Dataset Clips"
+
+
+GOOGLE_DRIVE_FOLDER_ID = (
+    "1t6iLP_VxdtC6xO-jJ9QaNp2ZW4PxR1L-"
+)
+
+GOOGLE_DRIVE_TOKEN = "token.json"

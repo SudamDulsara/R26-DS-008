@@ -6,12 +6,11 @@ from transcribe import transcribe_audio
 
 from database import (
     save_clip,
-    update_clip_transcript
+    update_clip_transcript,
+    update_clip_drive_file_id
 )
 
 from drive_sync import copy_to_drive
-
-from config import GOOGLE_DRIVE_FOLDER
 
 from pydub import AudioSegment
 
@@ -222,26 +221,39 @@ def transcribe_dataset(chunks, video):
 
         1. Transcribe local temporary clip
         2. Validate transcript
+
         3. If invalid:
                delete local clip
-               do not copy to Drive
+               do not upload
                do not save to database
 
         4. If valid:
-               copy clip to Google Drive
-               save metadata to database
-               save transcript to database
-               add record to dataset
+               upload clip to Google Drive
+               obtain Google Drive file ID
+               save clip metadata
+               save transcript
+               save Drive file ID
                delete local temporary clip
 
-    Google Drive is the permanent storage.
+    Google Drive is the permanent audio storage.
 
-    dataset/clips is temporary processing storage.
+    Local audio files are temporary processing files.
+
+    SQLite database stores:
+
+        - video_id
+        - clip_name
+        - duration
+        - transcript
+        - drive_file_id
+
+    No TSV file is generated.
     """
 
-    results = []
+    successful_clips = []
 
     print()
+
     print(
         "=" * 60
     )
@@ -312,6 +324,7 @@ def transcribe_dataset(chunks, video):
         except Exception as e:
 
             print()
+
             print(
                 f"Transcription failed: {e}"
             )
@@ -332,11 +345,6 @@ def transcribe_dataset(chunks, video):
 
             # ---------------------------------------------
             # INVALID CLIP
-            #
-            # DO NOT:
-            # - copy to Drive
-            # - save to database
-            # - add to dataset
             # ---------------------------------------------
 
             if os.path.exists(clip):
@@ -371,37 +379,37 @@ def transcribe_dataset(chunks, video):
         )
 
         # =================================================
-        # COPY VALID CLIP TO GOOGLE DRIVE
+        # UPLOAD TO GOOGLE DRIVE
         # =================================================
 
         print()
 
         print(
-            "Copying valid clip to Google Drive..."
+            "Uploading valid clip to Google Drive..."
         )
 
         try:
 
-            drive_success = copy_to_drive(
+            drive_file_id = copy_to_drive(
                 clip
             )
 
         except Exception as e:
 
             print(
-                f"Google Drive copy failed: {e}"
+                f"Google Drive upload failed: {e}"
             )
 
-            drive_success = False
+            drive_file_id = None
 
         # =================================================
-        # DRIVE COPY FAILED
+        # DRIVE UPLOAD FAILED
         # =================================================
 
-        if not drive_success:
+        if not drive_file_id:
 
             print(
-                "Google Drive Sync Failed."
+                "Google Drive upload failed."
             )
 
             print(
@@ -411,51 +419,67 @@ def transcribe_dataset(chunks, video):
             continue
 
         print(
-            "Google Drive Sync Completed"
+            "Google Drive upload completed."
+        )
+
+        print(
+            f"Drive File ID: {drive_file_id}"
         )
 
         # =================================================
-        # GOOGLE DRIVE PATH
-        # =================================================
-
-        drive_audio_path = os.path.join(
-
-            GOOGLE_DRIVE_FOLDER,
-
-            os.path.basename(clip)
-
-        )
-
-        # =================================================
-        # SAVE CLIP TO DATABASE
+        # SAVE TO DATABASE
         # =================================================
 
         try:
+
+            clip_name = os.path.basename(
+                clip
+            )
+
+            # ---------------------------------------------
+            # SAVE CLIP METADATA
+            # ---------------------------------------------
 
             save_clip(
 
                 video_id=video["video_id"],
 
-                clip_name=os.path.basename(
-                    clip
-                ),
+                clip_name=clip_name,
 
                 duration=duration
 
             )
 
+            # ---------------------------------------------
+            # SAVE TRANSCRIPT
+            # ---------------------------------------------
+
             update_clip_transcript(
 
-                clip_name=os.path.basename(
-                    clip
-                ),
+                clip_name=clip_name,
 
                 transcript=transcript
 
             )
 
+            # ---------------------------------------------
+            # SAVE GOOGLE DRIVE FILE ID
+            # ---------------------------------------------
+
+            update_clip_drive_file_id(
+
+                clip_name=clip_name,
+
+                drive_file_id=drive_file_id
+
+            )
+
             print(
                 "Clip metadata saved to database."
+            )
+
+            print(
+                f"Drive File ID saved: {drive_file_id}"
             )
 
         except Exception as e:
@@ -473,21 +497,16 @@ def transcribe_dataset(chunks, video):
             continue
 
         # =================================================
-        # ADD VALID RECORD TO DATASET
+        # RECORD SUCCESS
         # =================================================
 
-        results.append(
-
+        successful_clips.append(
             {
-
-                "audio_path": drive_audio_path,
-
-                "text": transcript,
-
-                "duration": duration
-
+                "clip_name": clip_name,
+                "transcript": transcript,
+                "duration": duration,
+                "drive_file_id": drive_file_id
             }
-
         )
 
         # =================================================
@@ -523,11 +542,11 @@ def transcribe_dataset(chunks, video):
     )
 
     print(
-        f"Finished {len(results)} valid transcripts"
+        f"Finished {len(successful_clips)} valid transcripts"
     )
 
     print(
         "=" * 60
     )
 
-    return results
+    return successful_clips

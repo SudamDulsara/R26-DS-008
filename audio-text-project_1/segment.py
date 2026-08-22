@@ -10,7 +10,13 @@ from silero_vad import (
     get_speech_timestamps
 )
 
-from config import GOOGLE_DRIVE_FOLDER
+from config import (
+    GOOGLE_DRIVE_FOLDER_ID,
+    GOOGLE_DRIVE_TOKEN
+)
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 import librosa
 import torch
@@ -23,27 +29,100 @@ import re
 # CONFIG
 # =========================================================
 
-# Local folder used ONLY for temporary chunks
+# Temporary local folder.
+#
+# Audio files are only stored here while being processed.
+# They are uploaded to Google Drive after successful
+# transcription and then deleted.
+#
 TEMP_CHUNK_DIR = "dataset/clips"
 
+
+# Maximum chunk duration
 CHUNK_LENGTH_MS = 10000
 
+
+# Minimum chunk duration
 MIN_CHUNK_MS = 2500
 
+
+# Silence detection
 MIN_SILENCE_LEN = 650
 
 KEEP_SILENCE = 300
 
 
 # =========================================================
+# GOOGLE DRIVE SETTINGS
+# =========================================================
+
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive"
+]
+
+
+# =========================================================
 # LOAD SILERO MODEL
 # =========================================================
 
-print("Loading Silero VAD...")
+print(
+    "Loading Silero VAD..."
+)
 
 vad_model = load_silero_vad()
 
-print("Silero VAD Loaded.")
+print(
+    "Silero VAD Loaded."
+)
+
+
+# =========================================================
+# GET GOOGLE DRIVE SERVICE
+# =========================================================
+
+def get_drive_service():
+
+    if not os.path.exists(
+        GOOGLE_DRIVE_TOKEN
+    ):
+
+        print(
+            "❌ Google Drive token not found."
+        )
+
+        return None
+
+    try:
+
+        credentials = (
+            Credentials.from_authorized_user_file(
+
+                GOOGLE_DRIVE_TOKEN,
+
+                DRIVE_SCOPES
+
+            )
+        )
+
+        service = build(
+
+            "drive",
+
+            "v3",
+
+            credentials=credentials
+
+        )
+
+        return service
+
+    except Exception as e:
+
+        print(
+            f"❌ Google Drive connection failed: {e}"
+        )
+
+        return None
 
 
 # =========================================================
@@ -52,48 +131,118 @@ print("Silero VAD Loaded.")
 
 def get_next_chunk_index():
 
-    # -----------------------------------------------------
-    # Check Google Drive folder
-    # -----------------------------------------------------
-
-    if not os.path.exists(
-        GOOGLE_DRIVE_FOLDER
-    ):
-
-        os.makedirs(
-            GOOGLE_DRIVE_FOLDER,
-            exist_ok=True
-        )
-
-        return 0
-
-    # -----------------------------------------------------
-    # Get files from Google Drive folder
-    # -----------------------------------------------------
-
-    files = os.listdir(
-        GOOGLE_DRIVE_FOLDER
+    print(
+        "\nChecking Google Drive for existing chunks..."
     )
 
-    indices = []
+    service = get_drive_service()
+
+    if service is None:
+
+        print(
+            "❌ Could not connect to Google Drive."
+        )
+
+        # IMPORTANT:
+        # Do NOT start from zero because that can create
+        # duplicate chunk names.
+        #
+        # Returning None allows the caller to stop safely.
+
+        return None
+
+    # -----------------------------------------------------
+    # Query files inside the target Google Drive folder
+    # -----------------------------------------------------
+
+    query = (
+
+        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
+
+        "and trashed = false"
+
+    )
+
+    try:
+
+        files = []
+
+        page_token = None
+
+        # -------------------------------------------------
+        # Retrieve ALL files.
+        #
+        # We do not assume there are fewer than 1000 files.
+        # -------------------------------------------------
+
+        while True:
+
+            response = service.files().list(
+
+                q=query,
+
+                spaces="drive",
+
+                fields="nextPageToken,files(id,name)",
+
+                pageSize=1000,
+
+                pageToken=page_token
+
+            ).execute()
+
+            files.extend(
+                response.get(
+                    "files",
+                    []
+                )
+            )
+
+            page_token = response.get(
+                "nextPageToken"
+            )
+
+            if not page_token:
+
+                break
+
+    except Exception as e:
+
+        print(
+            f"❌ Could not read Google Drive folder: {e}"
+        )
+
+        return None
 
     # -----------------------------------------------------
     # Find existing chunk numbers
     # -----------------------------------------------------
 
+    indices = []
+
     for file in files:
 
-        match = re.search(
-            r"chunk_(\d+)\.wav",
-            file
+        filename = file.get(
+            "name",
+            ""
+        )
+
+        match = re.match(
+
+            r"^chunk_(\d+)\.wav$",
+
+            filename
+
         )
 
         if match:
 
             indices.append(
+
                 int(
                     match.group(1)
                 )
+
             )
 
     # -----------------------------------------------------
@@ -102,20 +251,48 @@ def get_next_chunk_index():
 
     if not indices:
 
-        return 0
+        print(
+            "No existing chunk files found in Google Drive."
+        )
+
+        print(
+            "Starting chunk numbering from 1."
+        )
+
+        return 1
 
     # -----------------------------------------------------
-    # Next number after highest Drive chunk
+    # Highest existing chunk
     # -----------------------------------------------------
 
-    return max(indices) + 1
+    highest = max(
+        indices
+    )
+
+    next_index = highest + 1
+
+    print(
+        f"Found {len(indices)} existing chunk files."
+    )
+
+    print(
+        f"Highest existing chunk number: {highest}"
+    )
+
+    print(
+        f"Next chunk number: {next_index}"
+    )
+
+    return next_index
 
 
 # =========================================================
 # CHECK SPEECH USING SILERO
 # =========================================================
 
-def contains_speech(audio_path):
+def contains_speech(
+    audio_path
+):
 
     audio, sr = librosa.load(
 
@@ -147,14 +324,18 @@ def contains_speech(audio_path):
 
     )
 
-    return len(speech) > 0
+    return len(
+        speech
+    ) > 0
 
 
 # =========================================================
 # VALIDATE CHUNK
 # =========================================================
 
-def is_valid_chunk(chunk):
+def is_valid_chunk(
+    chunk
+):
 
     # -----------------------------------------------------
     # Minimum duration
@@ -197,8 +378,11 @@ def split_audio(
     # -----------------------------------------------------
 
     os.makedirs(
+
         TEMP_CHUNK_DIR,
+
         exist_ok=True
+
     )
 
     # -----------------------------------------------------
@@ -210,19 +394,29 @@ def split_audio(
     )
 
     # -----------------------------------------------------
-    # GET NEXT NUMBER FROM GOOGLE DRIVE
+    # Get next number from Google Drive
     # -----------------------------------------------------
 
     start_idx = get_next_chunk_index()
 
+    # -----------------------------------------------------
+    # SAFETY CHECK
+    # -----------------------------------------------------
+
+    if start_idx is None:
+
+        raise RuntimeError(
+
+            "Could not determine the next chunk number "
+            "from Google Drive. Pipeline stopped to "
+            "prevent duplicate chunk names."
+
+        )
+
     print()
-    print(
-        "=" * 60
-    )
 
     print(
-        f"Google Drive highest existing chunk: "
-        f"{start_idx - 1 if start_idx > 0 else 'None'}"
+        "=" * 60
     )
 
     print(
@@ -246,8 +440,10 @@ def split_audio(
     )
 
     print(
+
         f"Duration: "
         f"{len(audio) / 1000:.2f} seconds"
+
     )
 
     # =====================================================
@@ -299,7 +495,9 @@ def split_audio(
         ):
 
             chunk = segment[
+
                 j:j + CHUNK_LENGTH_MS
+
             ]
 
             # -------------------------------------------------
@@ -314,17 +512,12 @@ def split_audio(
 
             # -------------------------------------------------
             # CREATE UNIQUE CHUNK NUMBER
-            #
-            # Number comes from Google Drive.
-            #
-            # Example:
-            # Drive highest = 310
-            # First candidate = 311
-            # Next candidate = 312
             # -------------------------------------------------
 
             chunk_number = (
+
                 start_idx + i
+
             )
 
             filename = os.path.join(
@@ -336,10 +529,7 @@ def split_audio(
             )
 
             # -------------------------------------------------
-            # Increment immediately
-            #
-            # This prevents a rejected chunk from reusing
-            # the same filename.
+            # Increment number
             # -------------------------------------------------
 
             i += 1
@@ -359,6 +549,7 @@ def split_audio(
             )
 
             print()
+
             print(
                 f"Checking Speech: {filename}"
             )
@@ -370,7 +561,9 @@ def split_audio(
             try:
 
                 speech_found = contains_speech(
+
                     filename
+
                 )
 
             except Exception as e:
@@ -378,10 +571,6 @@ def split_audio(
                 print(
                     f"Silero Error: {e}"
                 )
-
-                # ---------------------------------------------
-                # Delete failed temporary chunk
-                # ---------------------------------------------
 
                 if os.path.exists(
                     filename
@@ -464,22 +653,14 @@ def split_audio(
     except Exception as e:
 
         print(
+
             f"Could not delete temporary "
             f"clean audio: {e}"
+
         )
 
     # =====================================================
     # RETURN TEMPORARY CHUNKS
-    #
-    # These are passed to transcribe_dataset.py.
-    #
-    # Valid clips will subsequently be:
-    #
-    # 1. Transcribed
-    # 2. Copied to Google Drive
-    # 3. Saved in database
-    # 4. Deleted locally
-    #
     # =====================================================
 
     return chunks
@@ -512,5 +693,8 @@ if __name__ == "__main__":
         )
 
         print(
-            f"Generated {len(chunks)} temporary chunks."
+
+            f"Generated "
+            f"{len(chunks)} temporary chunks."
+
         )

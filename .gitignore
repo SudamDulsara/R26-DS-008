@@ -98,6 +98,10 @@ audio-text-project_1/check_database.py
 data/
 import_train_v2.py
 split_v2_dataset.py
+# Google OAuth credentials
+# Google OAuth credentials
+audio-text-project_1/credentials/
+token.json
 
 # =====================================================
 # News Pipeline
