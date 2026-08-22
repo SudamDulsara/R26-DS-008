@@ -46,17 +46,46 @@ class TesseractReader:
 
     name = "tesseract"
 
+    #: Where the Windows installer puts tesseract.exe.
+    #:
+    #: pytesseract shells out to `tesseract` and therefore needs it on PATH.
+    #: The UB Mannheim installer offers to add it, the box is easy to miss,
+    #: and a terminal opened before the install will not see it regardless --
+    #: so on a fresh machine the pipeline fails at the first page with
+    #: "Tesseract is not available" even though it is installed.
+    #:
+    #: pipeline/ocr_engine.py has hunted these paths since the Streamlit demo
+    #: was written. Doing the same here means setting this up on a colleague's
+    #: laptop does not turn into a PATH debugging session.
+    WINDOWS_PATHS = (
+        r"C:\Program Files\Tesseract-OCR	esseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR	esseract.exe",
+    )
+
     def __init__(self, lang: str = "sin"):
         import pytesseract
         self._pt = pytesseract
         self.lang = lang
+
+        if os.name == "nt":
+            user_path = os.path.join(
+                os.environ.get("LOCALAPPDATA", ""),
+                "Programs", "Tesseract-OCR", "tesseract.exe",
+            )
+            for path in self.WINDOWS_PATHS + (user_path,):
+                if path and os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+
         try:
             self.version = str(pytesseract.get_tesseract_version())
-        except Exception as exc:                    # not installed / not on PATH
+        except Exception as exc:                    # not installed / not found
             raise RuntimeError(
                 "Tesseract is not available. Install it system-wide with the "
-                "'sin' language pack; see pipeline/ocr_engine.py for the "
-                "Windows install paths this project expects."
+                "'sin' language pack (the UB Mannheim installer for Windows), "
+                "then either tick 'Add to PATH' during setup or open a NEW "
+                "terminal afterwards. Looked in: PATH, "
+                + ", ".join(self.WINDOWS_PATHS)
             ) from exc
 
         langs = set(pytesseract.get_languages())
