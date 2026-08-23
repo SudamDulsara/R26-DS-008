@@ -279,13 +279,17 @@ class OpenAIInputTokenCounter:
         }
         if request.text_verbosity is not None:
             text["verbosity"] = request.text_verbosity
-        response = self._client.responses.input_tokens.count(
-            model=request.model,
-            instructions=request.instructions,
-            input=request.input,
-            reasoning={"effort": request.reasoning_effort},
-            text=text,
-        )
+        parameters: dict[str, Any] = {
+            "model": request.model,
+            "reasoning": {"effort": request.reasoning_effort},
+            "text": text,
+        }
+        if request.explicit_developer_cache_breakpoint:
+            parameters["input"] = _explicit_cache_messages(request)
+        else:
+            parameters["instructions"] = request.instructions
+            parameters["input"] = request.input
+        response = self._client.responses.input_tokens.count(**parameters)
         input_tokens = _field_value(response, "input_tokens")
         if (
             isinstance(input_tokens, bool)
@@ -564,14 +568,21 @@ def request_input_token_upper_bound(
     }
     if request.text_verbosity is not None:
         text["verbosity"] = request.text_verbosity
-    payload = {
+    payload: dict[str, Any] = {
         "model": request.model,
-        "instructions": request.instructions,
-        "input": request.input,
         "text": text,
         "max_output_tokens": request.max_output_tokens,
         "reasoning": {"effort": request.reasoning_effort},
     }
+    if request.explicit_developer_cache_breakpoint:
+        payload["input"] = _explicit_cache_messages(request)
+    else:
+        payload["instructions"] = request.instructions
+        payload["input"] = request.input
+    if request.prompt_cache_key is not None:
+        payload["prompt_cache_key"] = request.prompt_cache_key
+    if request.prompt_cache_options is not None:
+        payload["prompt_cache_options"] = dict(request.prompt_cache_options)
     supplied_utf8_bytes = len(
         json.dumps(
             payload,
@@ -581,6 +592,29 @@ def request_input_token_upper_bound(
         ).encode("utf-8")
     )
     return supplied_utf8_bytes + provider_framing_token_allowance
+
+
+def _explicit_cache_messages(
+    request: StructuredResponseRequest,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": request.instructions,
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": request.input}],
+        },
+    ]
 
 
 class OfflineRequestSizePreflight:
