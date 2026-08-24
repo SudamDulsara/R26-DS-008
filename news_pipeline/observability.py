@@ -477,6 +477,9 @@ def write_pipeline_health_report(
                 unification.get("semantic_partition_singletons")
             ),
         },
+        "unification_concurrency": dict(
+            unification.get("concurrent_unification") or {}
+        ),
         "publication": {
             "counts": dict(publication_counts),
             "reconciliation": dict(publication_reconciliation),

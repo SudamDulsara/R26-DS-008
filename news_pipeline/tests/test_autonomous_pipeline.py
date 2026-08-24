@@ -2,6 +2,8 @@ import csv
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -61,6 +63,10 @@ from news_pipeline.unification.final_publication import (
     _article_dispositions,
     materialize_gpt_only_publication,
 )
+from news_pipeline.unification.evidence_aliases import (
+    EvidenceAliases,
+    expand_provider_result,
+)
 from news_pipeline.unification.gpt_contract import (
     GPTClaimV2,
     GPTUnifiedStoryResponseV2,
@@ -76,6 +82,7 @@ from news_pipeline.unification.openai_adapter import (
     AdapterOutcome,
     AdapterResult,
     StructuredResponseRequest,
+    _create_parameters,
 )
 from news_pipeline.unification.production import (
     _audit_circuit_breaker_status,
@@ -155,6 +162,77 @@ class _TwoStageGenerator:
             response=response,
             attempts=1,
         )
+
+
+class _DelayedTwoStageGenerator(_TwoStageGenerator):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.maximum_in_flight = 0
+
+    def generate(self, request):
+        with self._lock:
+            self.in_flight += 1
+            self.maximum_in_flight = max(
+                self.maximum_in_flight, self.in_flight
+            )
+        try:
+            time.sleep(0.01)
+            return super().generate(request)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+class _RollingLookaheadGenerator(_TwoStageGenerator):
+    def __init__(self):
+        super().__init__()
+        self._start_lock = threading.Lock()
+        self.primary_starts = 0
+        self.third_primary_started = threading.Event()
+        self.first_primary_released_by_lookahead = False
+
+    def generate(self, request):
+        if request.text_format is not AutonomousAuditResponse:
+            with self._start_lock:
+                self.primary_starts += 1
+                ordinal = self.primary_starts
+            if ordinal == 3:
+                self.third_primary_started.set()
+            elif ordinal == 1:
+                self.first_primary_released_by_lookahead = (
+                    self.third_primary_started.wait(timeout=2.0)
+                )
+        return super().generate(request)
+
+
+class RateLimitError(Exception):
+    pass
+
+
+class _RateLimitedDelayedGenerator(_DelayedTwoStageGenerator):
+    def __init__(self):
+        super().__init__()
+        self._failure_lock = threading.Lock()
+        self._failed_once = False
+
+    def generate(self, request):
+        with self._failure_lock:
+            should_fail = not self._failed_once
+            if should_fail:
+                self._failed_once = True
+        if should_fail:
+            time.sleep(0.01)
+            raise RateLimitError("bounded test rate limit")
+        return super().generate(request)
+
+
+class _FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 21, 1, 0, 0)
+        return value if tz is None else value.replace(tzinfo=tz)
 
 
 class _CountingEmbedder:
@@ -328,11 +406,12 @@ class AutonomousPipelineTests(unittest.TestCase):
                 model_revision, text_variant, similarity_threshold,
                 representative_threshold, cohesion_threshold,
                 event_date_start, event_date_end, article_count,
-                source_count, confidence
+                source_count, confidence, created_at
             ) VALUES (
                 1, 'story-test', 1, 'hashing', 'builtin-v1',
                 'title_lead', 0.85, 0.90, 0.85,
-                '2026-08-13', '2026-08-13', 2, 2, 0.95
+                '2026-08-13', '2026-08-13', 2, 2, 0.95,
+                '2026-08-13T09:05:00+05:30'
             )
             """
         )
@@ -348,6 +427,75 @@ class AutonomousPipelineTests(unittest.TestCase):
         connection.commit()
         connection.close()
         return config
+
+    def _add_test_clusters(self, config, count):
+        connection = get_connection(config)
+        try:
+            for cluster_id in range(2, count + 1):
+                first_article_id = cluster_id * 2 - 1
+                second_article_id = cluster_id * 2
+                for article_id in (first_article_id, second_article_id):
+                    publisher = f"Publisher {article_id}"
+                    url = f"https://example.test/{article_id}"
+                    connection.execute(
+                        """
+                        INSERT INTO articles (
+                            id, url, source, title, published_date, clean_text,
+                            clean_status, dedupe_status, crawl_timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'cleaned', 'unique', ?)
+                        """,
+                        (
+                            article_id,
+                            url,
+                            publisher,
+                            f"Report {article_id}",
+                            "2026-08-13T09:00:00+05:30",
+                            f"Verified source report {article_id}.",
+                            "2026-08-13T09:05:00+05:30",
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO discovered_urls (
+                            url, source, status, fetched, discovery_method
+                        ) VALUES (?, ?, 'extracted', 1, 'test')
+                        """,
+                        (url, publisher),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO story_clusters (
+                        id, cluster_key, representative_article_id, model_name,
+                        model_revision, text_variant, similarity_threshold,
+                        representative_threshold, cohesion_threshold,
+                        event_date_start, event_date_end, article_count,
+                        source_count, confidence, created_at
+                    ) VALUES (?, ?, ?, 'hashing', 'builtin-v1', 'title_lead',
+                              0.85, 0.90, 0.85, '2026-08-13', '2026-08-13',
+                              2, 2, 0.95,
+                              '2026-08-13T09:05:00+05:30')
+                    """,
+                    (cluster_id, f"story-test-{cluster_id}", first_article_id),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO story_cluster_members (
+                        cluster_id, article_id, similarity_score,
+                        is_representative
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (cluster_id, first_article_id, 1.0, 1),
+                        (cluster_id, second_article_id, 0.94, 0),
+                    ],
+                )
+            connection.execute(
+                "UPDATE discovered_urls SET discovered_at = ?",
+                ("2026-08-13T09:05:00+05:30",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_validator_warning_requires_and_accepts_model_audit(self):
         candidate = {
@@ -526,6 +674,104 @@ class AutonomousPipelineTests(unittest.TestCase):
         config = load_config(load_env_file=False)
         self.assertTrue(config.cluster_allow_same_source_pairs)
         self.assertEqual(config.cluster_window_hours, 72)
+        self.assertFalse(config.gpt_concurrent_unification_enabled)
+        self.assertEqual(config.gpt_unification_workers, 2)
+        self.assertFalse(config.gpt_evidence_aliases_enabled)
+        self.assertFalse(config.gpt_audit_prompt_cache_enabled)
+
+    def test_explicit_prompt_cache_uses_developer_breakpoint_only(self):
+        request = StructuredResponseRequest(
+            model="gpt-5.6-luna",
+            instructions="Stable audit instructions.",
+            input="Candidate-specific audit input.",
+            text_format=AutonomousAuditResponse,
+            max_output_tokens=4096,
+            prompt_cache_key="np-audit-stable-key",
+            prompt_cache_options={"mode": "explicit", "ttl": "30m"},
+            explicit_developer_cache_breakpoint=True,
+        )
+        parameters = _create_parameters(request, text={"format": {}})
+        self.assertNotIn("instructions", parameters)
+        self.assertEqual(parameters["input"][0]["role"], "developer")
+        self.assertEqual(
+            parameters["input"][0]["content"][0][
+                "prompt_cache_breakpoint"
+            ],
+            {"mode": "explicit"},
+        )
+        self.assertEqual(parameters["input"][1]["role"], "user")
+        self.assertEqual(
+            parameters["prompt_cache_options"],
+            {"mode": "explicit", "ttl": "30m"},
+        )
+
+    def test_alias_expansion_wraps_real_sdk_response_output_text(self):
+        from openai.types.responses.response import Response
+
+        canonical_id = "evidence_canonical_hash"
+        payload = {
+            "display_title": "e1",
+            "claims": [{"evidence_span_ids": ["e1"]}],
+        }
+        content = SimpleNamespace(
+            type="output_text",
+            text=json.dumps(payload),
+        )
+        response = Response.model_construct(
+            id="response-sdk-shape",
+            created_at=0.0,
+            model="gpt-5.6-luna",
+            object="response",
+            output=[SimpleNamespace(type="message", content=[content])],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+        result, count = expand_provider_result(
+            AdapterResult(
+                outcome=AdapterOutcome.SUCCESS,
+                response=response,
+                attempts=1,
+            ),
+            EvidenceAliases(
+                full_to_short={canonical_id: "e1"},
+                short_to_full={"e1": canonical_id},
+            ),
+        )
+
+        expanded = json.loads(result.response.output_text)
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            expanded["claims"][0]["evidence_span_ids"],
+            [canonical_id],
+        )
+        self.assertEqual(expanded["display_title"], "e1")
+        self.assertEqual(result.response.id, response.id)
+
+    def test_invalid_alias_response_reaches_legacy_parser_unchanged(self):
+        response = SimpleNamespace(output_text="not-json")
+        original = AdapterResult(
+            outcome=AdapterOutcome.SUCCESS,
+            response=response,
+            attempts=1,
+        )
+        result, count = expand_provider_result(
+            original,
+            EvidenceAliases(
+                full_to_short={"evidence_full": "e1"},
+                short_to_full={"e1": "evidence_full"},
+            ),
+        )
+        self.assertIs(result, original)
+        self.assertEqual(count, 0)
+
+    def test_unification_worker_count_is_restricted_to_one_two_or_four(self):
+        with patch.dict(
+            os.environ,
+            {"NEWS_PIPELINE_GPT_UNIFICATION_WORKERS": "3"},
+        ):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                load_config(load_env_file=False)
 
     def test_zero_lexical_threshold_skips_unused_overlap_work(self):
         articles = [
@@ -1625,9 +1871,282 @@ class AutonomousPipelineTests(unittest.TestCase):
         self.assertEqual(len(generator.requests), 2)
         self.assertLess(float(preflight.run_reserved_cost_usd), 0.01)
 
+    def test_enabled_concurrent_alias_cache_path_persists_canonical_hashes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._prepare_cluster(Path(temp_dir)),
+                gpt_concurrent_unification_enabled=True,
+                gpt_unification_workers=2,
+                gpt_evidence_aliases_enabled=True,
+                gpt_audit_prompt_cache_enabled=True,
+            )
+            generator = _DelayedTwoStageGenerator()
+            preflight = OfflineRequestSizePreflight(
+                max_cost_per_story_usd=100,
+                max_cost_per_run_usd=100,
+            )
+            result = run_gpt_unification(
+                config=config,
+                cluster_keys=["story-test"],
+                generator=generator,
+                preflight=preflight,
+            )
+            connection = get_connection(config)
+            try:
+                version = dict(
+                    connection.execute(
+                        "SELECT * FROM unified_story_versions"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(result["generation_calls"], 1, result)
+        self.assertEqual(result["audit_calls"], 1, result)
+        self.assertEqual(result["accepted"], 1, result)
+        metrics = result["concurrent_unification"]
+        self.assertTrue(metrics["enabled"])
+        self.assertGreater(metrics["alias_expansions"], 0)
+        self.assertEqual(len(metrics["provider_call_metrics"]), 2)
+        primary_request, audit_request = generator.requests
+        self.assertIn('"evidence_span_id":"e1"', primary_request.input)
+        self.assertIsNone(primary_request.prompt_cache_key)
+        self.assertTrue(audit_request.explicit_developer_cache_breakpoint)
+        self.assertEqual(
+            audit_request.prompt_cache_options,
+            {"mode": "explicit", "ttl": "30m"},
+        )
+        persisted = json.loads(version["output_json"])
+        evidence_ids = persisted["claims"][0]["evidence_span_ids"]
+        self.assertTrue(
+            all(value.startswith("evidence_") for value in evidence_ids)
+        )
+        self.assertNotIn('"e1"', version["output_json"])
+
+    def test_concurrent_force_regenerates_cached_audit_retry_primary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._prepare_cluster(Path(temp_dir)),
+                gpt_concurrent_unification_enabled=True,
+                gpt_unification_workers=2,
+                gpt_evidence_aliases_enabled=True,
+                gpt_audit_prompt_cache_enabled=True,
+            )
+            first_generator = _TwoStageGenerator()
+            run_gpt_unification(
+                config=config,
+                cluster_keys=["story-test"],
+                generator=first_generator,
+                preflight=OfflineRequestSizePreflight(
+                    max_cost_per_story_usd=100,
+                    max_cost_per_run_usd=100,
+                ),
+            )
+            connection = get_connection(config)
+            connection.execute(
+                """
+                UPDATE unified_story_versions
+                SET generation_status = 'fallback',
+                    validation_status = 'autonomous_audit_preflight',
+                    autonomous_audit_status = 'failed'
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            forced_generator = _TwoStageGenerator()
+            result = run_gpt_unification(
+                force=True,
+                config=config,
+                cluster_keys=["story-test"],
+                generator=forced_generator,
+                preflight=OfflineRequestSizePreflight(
+                    max_cost_per_story_usd=100,
+                    max_cost_per_run_usd=100,
+                ),
+            )
+
+        self.assertEqual(result["generation_calls"], 1, result)
+        self.assertEqual(result["audit_calls"], 1, result)
+        self.assertEqual(len(forced_generator.requests), 2)
+
+    def test_rolling_lookahead_fills_slot_behind_slow_first_primary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._prepare_cluster(Path(temp_dir)),
+                gpt_concurrent_unification_enabled=True,
+                gpt_unification_workers=2,
+                gpt_evidence_aliases_enabled=True,
+                gpt_audit_prompt_cache_enabled=True,
+            )
+            self._add_test_clusters(config, 4)
+            generator = _RollingLookaheadGenerator()
+            result = run_gpt_unification(
+                config=config,
+                generator=generator,
+                preflight=OfflineRequestSizePreflight(
+                    max_cost_per_story_usd=100,
+                    max_cost_per_run_usd=100,
+                ),
+            )
+
+        self.assertTrue(generator.first_primary_released_by_lookahead)
+        self.assertEqual(generator.primary_starts, 4)
+        self.assertEqual(result["generation_calls"], 4, result)
+        self.assertEqual(result["audit_calls"], 4, result)
+        metrics = result["concurrent_unification"]
+        self.assertEqual(metrics["maximum_in_flight"], 2)
+        self.assertEqual(metrics["provider_lookahead_limit"], 4)
+        self.assertEqual(metrics["streaming_replays"], 8)
+
+    def test_rate_limit_reduces_later_concurrent_batches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._prepare_cluster(Path(temp_dir)),
+                gpt_concurrent_unification_enabled=True,
+                gpt_unification_workers=4,
+                gpt_evidence_aliases_enabled=True,
+                gpt_audit_prompt_cache_enabled=True,
+            )
+            self._add_test_clusters(config, 10)
+            result = run_gpt_unification(
+                config=config,
+                generator=_RateLimitedDelayedGenerator(),
+                preflight=OfflineRequestSizePreflight(
+                    max_cost_per_story_usd=100,
+                    max_cost_per_run_usd=100,
+                ),
+            )
+
+        metrics = result["concurrent_unification"]
+        self.assertEqual(metrics["rate_limits"], 1)
+        self.assertEqual(metrics["minimum_effective_workers"], 2)
+        self.assertEqual(metrics["final_effective_workers"], 2)
+        self.assertEqual(
+            metrics["backpressure_events"],
+            [
+                {
+                    "after_candidate_count": 8,
+                    "rate_limits": 1,
+                    "previous_workers": 4,
+                    "effective_workers": 2,
+                }
+            ],
+        )
+
+    def test_concurrency_one_two_four_have_equivalent_canonical_outcomes(self):
+        snapshots = {}
+        maximum_in_flight = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for workers in (1, 2, 4):
+                run_root = root / str(workers)
+                run_root.mkdir()
+                config = replace(
+                    self._prepare_cluster(run_root),
+                    gpt_concurrent_unification_enabled=True,
+                    gpt_unification_workers=workers,
+                    gpt_evidence_aliases_enabled=True,
+                    gpt_audit_prompt_cache_enabled=True,
+                )
+                self._add_test_clusters(config, 8)
+                generator = _DelayedTwoStageGenerator()
+                with patch(
+                    "news_pipeline.unification.production.datetime",
+                    _FrozenDateTime,
+                ):
+                    result = run_gpt_unification(
+                        config=config,
+                        generator=generator,
+                        preflight=OfflineRequestSizePreflight(
+                            max_cost_per_story_usd=Decimal("0.25"),
+                            max_cost_per_run_usd=Decimal("1.00"),
+                        ),
+                    )
+                output_dir = run_root / "publication"
+                with patch(
+                    "news_pipeline.unification.final_publication.datetime",
+                    _FrozenDateTime,
+                ):
+                    materialize_gpt_only_publication(
+                        output_dir=output_dir, config=config
+                    )
+                connection = get_connection(config)
+                try:
+                    versions = [
+                        (
+                            row["cluster_key"],
+                            row["request_fingerprint_sha256"],
+                            row["generation_status"],
+                            row["validation_status"],
+                            row["output_json"],
+                            row["resolved_output_json"],
+                            row["autonomous_audit_status"],
+                            row["autonomous_audit_route_json"],
+                        )
+                        for row in connection.execute(
+                            """
+                            SELECT * FROM unified_story_versions
+                            ORDER BY cluster_key
+                            """
+                        )
+                    ]
+                    memberships = [
+                        tuple(row)
+                        for row in connection.execute(
+                            """
+                            SELECT c.cluster_key, m.article_id,
+                                   m.similarity_score, m.is_representative
+                            FROM story_cluster_members m
+                            JOIN story_clusters c ON c.id = m.cluster_id
+                            ORDER BY c.cluster_key, m.article_id
+                            """
+                        )
+                    ]
+                finally:
+                    connection.close()
+                artifacts = {
+                    path.name: path.read_bytes()
+                    for path in output_dir.glob("*.csv")
+                }
+                snapshots[workers] = (versions, memberships, artifacts)
+                maximum_in_flight[workers] = generator.maximum_in_flight
+                self.assertEqual(result["generation_calls"], 8, result)
+                self.assertEqual(result["audit_calls"], 8, result)
+                self.assertEqual(result["accepted"], 8, result)
+                concurrency = result["concurrent_unification"]
+                self.assertTrue(concurrency["deterministic_streaming_commit"])
+                self.assertEqual(concurrency["streaming_replays"], 16)
+                self.assertGreater(
+                    concurrency[
+                        "streaming_replays_before_provider_pass_complete"
+                    ],
+                    0,
+                )
+                self.assertLess(
+                    concurrency["maximum_buffered_provider_records"],
+                    concurrency["streaming_replays"],
+                )
+                self.assertLessEqual(
+                    concurrency["maximum_buffered_provider_records"],
+                    concurrency["provider_record_buffer_limit"],
+                )
+
+        self.assertEqual(snapshots[1], snapshots[2])
+        self.assertEqual(snapshots[1], snapshots[4])
+        self.assertEqual(maximum_in_flight[1], 1)
+        self.assertGreaterEqual(maximum_in_flight[2], 2)
+        self.assertGreaterEqual(maximum_in_flight[4], 4)
+
     def test_audit_partition_regenerates_multi_group_in_same_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = self._prepare_cluster(Path(temp_dir))
+            config = replace(
+                self._prepare_cluster(Path(temp_dir)),
+                gpt_concurrent_unification_enabled=True,
+                gpt_unification_workers=4,
+                gpt_evidence_aliases_enabled=True,
+                gpt_audit_prompt_cache_enabled=True,
+            )
             connection = get_connection(config)
             connection.execute(
                 """

@@ -16,6 +16,7 @@ from news_pipeline.unification.openai_adapter import StructuredResponseRequest
 
 
 AUTONOMOUS_AUDIT_VERSION = "autonomous_evidence_and_cohesion_audit_v4"
+AUTONOMOUS_AUDIT_CACHE_VERSION = "audit_explicit_cache_v1"
 
 AUTONOMOUS_AUDIT_INSTRUCTIONS = """
 You are the final quality-control editor for an autonomous Sinhala news
@@ -293,6 +294,25 @@ def build_autonomous_audit_request(
         output_ceiling = min(config.gpt_audit_max_output_tokens, 6144)
     else:
         output_ceiling = config.gpt_audit_max_output_tokens
+    cache_key = None
+    cache_options = None
+    explicit_breakpoint = False
+    if config.gpt_audit_prompt_cache_enabled:
+        cache_contract = {
+            "cache_version": AUTONOMOUS_AUDIT_CACHE_VERSION,
+            "audit_version": AUTONOMOUS_AUDIT_VERSION,
+            "instructions": AUTONOMOUS_AUDIT_INSTRUCTIONS,
+            "schema": AutonomousAuditResponse.model_json_schema(),
+        }
+        cache_key = "np-audit-" + hashlib.sha256(
+            json.dumps(
+                cache_contract,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        cache_options = {"mode": "explicit", "ttl": "30m"}
+        explicit_breakpoint = True
     return StructuredResponseRequest(
         model=route.model,
         instructions=AUTONOMOUS_AUDIT_INSTRUCTIONS,
@@ -310,4 +330,7 @@ def build_autonomous_audit_request(
         max_output_tokens=output_ceiling,
         reasoning_effort=route.reasoning_effort,
         text_verbosity="low",
+        prompt_cache_key=cache_key,
+        prompt_cache_options=cache_options,
+        explicit_developer_cache_breakpoint=explicit_breakpoint,
     )

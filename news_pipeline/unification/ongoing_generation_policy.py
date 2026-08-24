@@ -165,6 +165,14 @@ def _configuration_sha256(config: PipelineConfig) -> str:
         "max_cost_per_run_usd": config.gpt_max_cost_per_run_usd,
         "max_cost_per_day_usd": config.gpt_max_cost_per_day_usd,
         "max_cost_per_month_usd": config.gpt_max_cost_per_month_usd,
+        "concurrent_unification_enabled": (
+            config.gpt_concurrent_unification_enabled
+        ),
+        "unification_workers": config.gpt_unification_workers,
+        "evidence_aliases_enabled": config.gpt_evidence_aliases_enabled,
+        "audit_prompt_cache_enabled": (
+            config.gpt_audit_prompt_cache_enabled
+        ),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

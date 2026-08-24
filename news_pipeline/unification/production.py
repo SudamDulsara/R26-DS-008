@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -83,6 +85,10 @@ from news_pipeline.unification.openai_adapter import (
 
 
 logger = get_logger()
+
+_PERSISTENCE_TIMINGS: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+    "unification_persistence_timings", default=None
+)
 
 AUDIT_CAPACITY_MIN_OUTPUT_TOKENS = 2048
 AUDIT_CAPACITY_VALIDATION_ALLOWANCE_CHARS = 4096
@@ -1366,6 +1372,7 @@ def _persist_version(
     *,
     allow_status_demotion: bool = False,
 ) -> dict[str, Any]:
+    persistence_started = time.perf_counter()
     existing = load_cached_version(
         connection,
         str(values["request_fingerprint_sha256"]),
@@ -1408,6 +1415,19 @@ def _persist_version(
         raise RuntimeError("unified story version was not persisted")
     sync_gpt_unification_review_queue(connection, persisted)
     connection.commit()
+    timings = _PERSISTENCE_TIMINGS.get()
+    if timings is not None:
+        timings.append(
+            {
+                "kind": "unified_story_version",
+                "cluster_key": str(values.get("cluster_key") or ""),
+                "request_fingerprint_sha256": str(
+                    values.get("request_fingerprint_sha256") or ""
+                ),
+                "persistence_seconds": time.perf_counter()
+                - persistence_started,
+            }
+        )
     return persisted
 
 
@@ -2393,8 +2413,28 @@ def run_gpt_unification(
         Mapping[str, str]
     ] = None,
     _provider_candidates_remaining: Optional[int] = None,
+    _concurrent_internal: bool = False,
+    _disable_followups: bool = False,
+    _provider_replay_order: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     config = config or load_config()
+    if config.gpt_concurrent_unification_enabled and not _concurrent_internal:
+        from news_pipeline.unification.concurrent_unification import (
+            run_concurrent_gpt_unification,
+        )
+
+        return run_concurrent_gpt_unification(
+            no_gpt=no_gpt,
+            force=force,
+            config=config,
+            generator=generator,
+            preflight=preflight,
+            cluster_keys=cluster_keys,
+            correction_requirements_by_story=(
+                correction_requirements_by_story
+            ),
+            provider_candidates_remaining=_provider_candidates_remaining,
+        )
     connection = get_connection(config)
     try:
         candidates = _select_gpt_generation_candidates(
@@ -2579,6 +2619,36 @@ def run_gpt_unification(
             or str(candidate[0]["cluster_key"]) in selected_provider_keys
         )
     ]
+    if _provider_replay_order is not None:
+        replay_order = tuple(str(value) for value in _provider_replay_order)
+        if (
+            len(replay_order) != len(set(replay_order))
+            or set(replay_order) != selected_provider_keys
+        ):
+            connection.close()
+            raise ValueError(
+                "provider replay order must exactly cover selected provider "
+                "candidates"
+            )
+        replay_rank = {
+            cluster_key: index
+            for index, cluster_key in enumerate(replay_order)
+        }
+        provider_prepared = [
+            candidate
+            for candidate in prepared_candidates
+            if str(candidate[0]["cluster_key"]) in replay_rank
+        ]
+        provider_prepared.sort(
+            key=lambda candidate: replay_rank[
+                str(candidate[0]["cluster_key"])
+            ]
+        )
+        prepared_candidates = provider_prepared + [
+            candidate
+            for candidate in prepared_candidates
+            if str(candidate[0]["cluster_key"]) not in replay_rank
+        ]
     provider_request_count = len(selected_provider_keys)
 
     stats["provider_request_candidates"] = provider_request_count
@@ -3122,12 +3192,23 @@ def run_gpt_unification(
                         source_article_ids,
                         audit_assessment.article_groups,
                     )
+                    partition_persistence_started = time.perf_counter()
                     partition_result = apply_semantic_partition(
                         connection,
                         cluster_key=str(cluster["cluster_key"]),
                         groups=validated_groups,
                         audit_version=AUTONOMOUS_AUDIT_VERSION,
                     )
+                    timings = _PERSISTENCE_TIMINGS.get()
+                    if timings is not None:
+                        timings.append(
+                            {
+                                "kind": "semantic_partition",
+                                "cluster_key": str(cluster["cluster_key"]),
+                                "persistence_seconds": time.perf_counter()
+                                - partition_persistence_started,
+                            }
+                        )
                 except (TypeError, ValueError, sqlite3.DatabaseError) as error:
                     logger.warning(
                         "Rejected invalid semantic partition for cluster %s: %s",
@@ -3320,7 +3401,11 @@ def run_gpt_unification(
         provider_candidates_remaining
         - int(stats.get("provider_request_candidates") or 0),
     )
-    if followup_keys and remaining_provider_candidates > 0:
+    if (
+        not _disable_followups
+        and followup_keys
+        and remaining_provider_candidates > 0
+    ):
         followup_stats = run_gpt_unification(
             no_gpt=no_gpt,
             force=False,

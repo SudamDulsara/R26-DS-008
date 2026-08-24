@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ class StructuredResponseRequest:
     max_output_tokens: int
     reasoning_effort: str = "low"
     text_verbosity: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_options: Optional[Mapping[str, str]] = None
+    explicit_developer_cache_breakpoint: bool = False
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -79,6 +83,14 @@ class StructuredResponseRequest:
             raise ValueError("reasoning_effort is not supported")
         if self.text_verbosity not in {None, "low", "medium", "high"}:
             raise ValueError("text_verbosity is not supported")
+        if self.prompt_cache_key is not None and not self.prompt_cache_key.strip():
+            raise ValueError("prompt_cache_key must not be blank")
+        if self.explicit_developer_cache_breakpoint and (
+            not self.prompt_cache_key or self.prompt_cache_options is None
+        ):
+            raise ValueError(
+                "an explicit cache breakpoint requires a key and options"
+            )
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,9 @@ class AdapterResult:
     response: Any
     attempts: int
     refusal: Optional[str] = None
+    provider_seconds: float = 0.0
+    retry_count: int = 0
+    rate_limit_count: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -102,12 +117,19 @@ class OpenAIConfigurationError(OpenAIAdapterError):
 
 
 class OpenAIRetryExhaustedError(OpenAIAdapterError):
-    def __init__(self, attempts: int, last_error: Exception) -> None:
+    def __init__(
+        self,
+        attempts: int,
+        last_error: Exception,
+        *,
+        rate_limit_count: int = 0,
+    ) -> None:
         super().__init__(
             f"OpenAI request failed after {attempts} bounded attempts"
         )
         self.attempts = attempts
         self.last_error = last_error
+        self.rate_limit_count = rate_limit_count
 
 
 def _is_retryable_openai_error(error: Exception) -> bool:
@@ -214,6 +236,8 @@ class OpenAIResponsesAdapter:
     def generate(self, request: StructuredResponseRequest) -> AdapterResult:
         maximum_attempts = self._max_retries + 1
 
+        rate_limit_count = 0
+        started = time.perf_counter()
         for attempt in range(1, maximum_attempts + 1):
             try:
                 text = {
@@ -224,20 +248,18 @@ class OpenAIResponsesAdapter:
                 if request.text_verbosity is not None:
                     text["verbosity"] = request.text_verbosity
                 response = self._client.responses.create(
-                    model=request.model,
-                    instructions=request.instructions,
-                    input=request.input,
-                    text=text,
-                    max_output_tokens=request.max_output_tokens,
-                    reasoning={"effort": request.reasoning_effort},
+                    **_create_parameters(request, text=text)
                 )
             except Exception as error:
+                if type(error).__name__ == "RateLimitError":
+                    rate_limit_count += 1
                 if not self._is_retryable(error):
                     raise
                 if attempt >= maximum_attempts:
                     raise OpenAIRetryExhaustedError(
                         attempts=attempt,
                         last_error=error,
+                        rate_limit_count=rate_limit_count,
                     ) from error
 
                 delay_seconds = self._retry_base_delay_seconds * (
@@ -253,11 +275,133 @@ class OpenAIResponsesAdapter:
                     response=response,
                     attempts=attempt,
                     refusal=refusal,
+                    provider_seconds=time.perf_counter() - started,
+                    retry_count=attempt - 1,
+                    rate_limit_count=rate_limit_count,
                 )
             return AdapterResult(
                 outcome=AdapterOutcome.SUCCESS,
                 response=response,
                 attempts=attempt,
+                provider_seconds=time.perf_counter() - started,
+                retry_count=attempt - 1,
+                rate_limit_count=rate_limit_count,
             )
 
+        raise AssertionError("bounded retry loop ended without a result")
+
+
+def _create_parameters(
+    request: StructuredResponseRequest,
+    *,
+    text: Mapping[str, Any],
+) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "model": request.model,
+        "text": text,
+        "max_output_tokens": request.max_output_tokens,
+        "reasoning": {"effort": request.reasoning_effort},
+    }
+    if request.explicit_developer_cache_breakpoint:
+        parameters["input"] = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": request.instructions,
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": request.input}],
+            },
+        ]
+    else:
+        parameters["instructions"] = request.instructions
+        parameters["input"] = request.input
+    if request.prompt_cache_key is not None:
+        parameters["prompt_cache_key"] = request.prompt_cache_key
+    if request.prompt_cache_options is not None:
+        parameters["prompt_cache_options"] = dict(request.prompt_cache_options)
+    return parameters
+
+
+class AsyncOpenAIResponsesAdapter(OpenAIResponsesAdapter):
+    """Async Responses adapter with the same bounded retry contract."""
+
+    @classmethod
+    def from_config(
+        cls,
+        config: PipelineConfig,
+        *,
+        client_factory: Optional[ClientFactory] = None,
+    ) -> "AsyncOpenAIResponsesAdapter":
+        if not config.gpt_enabled:
+            raise OpenAIConfigurationError(
+                "GPT generation is disabled by configuration"
+            )
+        if not config.openai_api_key:
+            raise OpenAIConfigurationError(
+                "OPENAI_API_KEY is required when GPT generation is enabled"
+            )
+        if client_factory is None:
+            from openai import AsyncOpenAI
+
+            client_factory = AsyncOpenAI
+        client = client_factory(
+            api_key=config.openai_api_key,
+            max_retries=0,
+            timeout=config.gpt_timeout_seconds,
+        )
+        return cls(client, max_retries=config.gpt_max_retries)
+
+    async def generate_async(
+        self, request: StructuredResponseRequest
+    ) -> AdapterResult:
+        maximum_attempts = self._max_retries + 1
+        rate_limit_count = 0
+        started = time.perf_counter()
+        for attempt in range(1, maximum_attempts + 1):
+            try:
+                text = {"format": self._text_format_converter(request.text_format)}
+                if request.text_verbosity is not None:
+                    text["verbosity"] = request.text_verbosity
+                response = await self._client.responses.create(
+                    **_create_parameters(request, text=text)
+                )
+            except Exception as error:
+                if type(error).__name__ == "RateLimitError":
+                    rate_limit_count += 1
+                if not self._is_retryable(error):
+                    raise
+                if attempt >= maximum_attempts:
+                    raise OpenAIRetryExhaustedError(
+                        attempt,
+                        error,
+                        rate_limit_count=rate_limit_count,
+                    ) from error
+                delay_seconds = self._retry_base_delay_seconds * (
+                    2 ** (attempt - 1)
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+            refusal = _extract_refusal(response)
+            return AdapterResult(
+                outcome=(
+                    AdapterOutcome.REFUSAL
+                    if refusal is not None
+                    else AdapterOutcome.SUCCESS
+                ),
+                response=response,
+                attempts=attempt,
+                refusal=refusal,
+                provider_seconds=time.perf_counter() - started,
+                retry_count=attempt - 1,
+                rate_limit_count=rate_limit_count,
+            )
         raise AssertionError("bounded retry loop ended without a result")

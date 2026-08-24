@@ -10,6 +10,7 @@ from dotenv import dotenv_values
 
 GPT_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 GPT_AUDIT_POLICY_MODES = ("all", "shadow", "risk_tiered")
+GPT_UNIFICATION_WORKER_COUNTS = (1, 2, 4)
 
 SETTING_SPECS: dict[str, tuple[str, str]] = {
     "data_dir": ("NEWS_PIPELINE_DATA_DIR", "path"),
@@ -143,6 +144,22 @@ SETTING_SPECS: dict[str, tuple[str, str]] = {
         "NEWS_PIPELINE_GPT_MAX_CLUSTERS_PER_RUN",
         "positive_int",
     ),
+    "gpt_concurrent_unification_enabled": (
+        "NEWS_PIPELINE_GPT_CONCURRENT_UNIFICATION_ENABLED",
+        "bool",
+    ),
+    "gpt_unification_workers": (
+        "NEWS_PIPELINE_GPT_UNIFICATION_WORKERS",
+        "unification_workers_choice",
+    ),
+    "gpt_evidence_aliases_enabled": (
+        "NEWS_PIPELINE_GPT_EVIDENCE_ALIASES_ENABLED",
+        "bool",
+    ),
+    "gpt_audit_prompt_cache_enabled": (
+        "NEWS_PIPELINE_GPT_AUDIT_PROMPT_CACHE_ENABLED",
+        "bool",
+    ),
     "gpt_autonomous_audit_enabled": (
         "NEWS_PIPELINE_GPT_AUTONOMOUS_AUDIT_ENABLED",
         "bool",
@@ -243,6 +260,10 @@ class PipelineConfig:
     gpt_max_cost_per_day_usd: float
     gpt_max_cost_per_month_usd: float
     gpt_max_clusters_per_run: int
+    gpt_concurrent_unification_enabled: bool
+    gpt_unification_workers: int
+    gpt_evidence_aliases_enabled: bool
+    gpt_audit_prompt_cache_enabled: bool
     gpt_autonomous_audit_enabled: bool
     gpt_audit_policy_mode: str
     gpt_low_risk_audit_sample_rate: float
@@ -387,6 +408,13 @@ def _parse_setting(
         if normalized not in GPT_AUDIT_POLICY_MODES:
             raise ValueError(f"{name} must be one of {GPT_AUDIT_POLICY_MODES}")
         return normalized
+    if kind == "unification_workers_choice":
+        parsed = int(value)
+        if parsed not in GPT_UNIFICATION_WORKER_COUNTS:
+            raise ValueError(
+                f"{name} must be one of {GPT_UNIFICATION_WORKER_COUNTS}"
+            )
+        return parsed
     if kind == "string":
         parsed = value.strip()
         if not parsed:
