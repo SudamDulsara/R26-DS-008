@@ -96,6 +96,31 @@ MODEL_NAME = "google/byt5-small"
 EVAL_MARKERS = ("test", "eval")
 
 
+def _in_retired_folder(path: str) -> bool:
+    """
+    True if any FOLDER in the path starts with an underscore.
+
+    data/ carries live corpora next to retired ones, and the sweep below is
+    recursive, so without this it silently trains on both. As of 2026-08-23
+    that meant 12.8 MB of the synthetic gazette pairs this project retired in
+    August, plus 90 rows whose corrected side is a copy of the raw side --
+    every resulting number would have been meaningless, and nothing would
+    have looked wrong.
+
+    Underscore-prefixed folders are this project's convention for "kept for
+    reference, not part of the live path": data/_synthetic_degradation,
+    data/_trial. Naming them was not enough on its own; the sweep had to
+    honour the convention too.
+
+    FOLDERS only, deliberately. data/acts1010/_tesseract_test_split.jsonl is
+    a leading-underscore FILE holding real Tesseract output on the held-out
+    split, and it is legitimate evaluation data.
+    """
+    parts = path.replace("\\", "/").split("/")[:-1]
+    return any(part.startswith("_") for part in parts)
+
+
+
 def find_data_files():
     """
     Locate the .jsonl pairs wherever this happens to be running, and split
@@ -107,7 +132,9 @@ def find_data_files():
     """
     found = sorted(glob.glob("/kaggle/input/**/*.jsonl", recursive=True))
     if not found:
-        found = sorted(glob.glob(os.path.join("data", "**", "*.jsonl"), recursive=True))
+        found = sorted(glob.glob(os.path.join("data", "**", "*.jsonl"),
+                                 recursive=True))
+        found = [p for p in found if not _in_retired_folder(p)]
 
     train, evaluation = [], []
     for path in found:
@@ -434,7 +461,7 @@ result = evaluate_on_test_set(EVAL_FILES)
 
 if result is None:
     print("\nNo test set attached, so the question 'did it help' is unanswered.")
-    print("Attach data/eval/test_set.jsonl to the Kaggle dataset and re-run")
+    print("Attach the held-out test pairs to the Kaggle dataset and re-run")
     print("this section, or score the downloaded model locally.")
 else:
     print(f"\n── HELD-OUT TEST SET ({result['n']:,} real scanned lines) ──")

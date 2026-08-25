@@ -6,7 +6,7 @@ Turns AksharaOCR's (scanned image -> correct text) annotations into the
 
     python build_test_set.py
 
-Output : data/eval/test_set.jsonl
+Output : data/_synthetic_degradation/eval/test_set.jsonl
 Runtime: a few minutes
 
 
@@ -62,7 +62,7 @@ AKSHARA_ROOT = r"D:\Work\data sets\AksharaOCR_v1.0\Sinhala"
 ANNOTATIONS = os.path.join(AKSHARA_ROOT, "annotation.csv")
 IMAGE_DIR = os.path.join(AKSHARA_ROOT, "selected")
 
-OUT_PATH = os.path.join("data", "eval", "test_set.jsonl")
+OUT_PATH = os.path.join("data", "_synthetic_degradation", "eval", "test_set.jsonl")
 
 # Same settings the live pipeline uses, so the errors measured here are the
 # errors the deployed system actually produces. psm 7 = one line per image.
