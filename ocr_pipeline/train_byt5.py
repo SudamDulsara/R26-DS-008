@@ -461,7 +461,7 @@ result = evaluate_on_test_set(EVAL_FILES)
 
 if result is None:
     print("\nNo test set attached, so the question 'did it help' is unanswered.")
-    print("Attach data/eval/test_set.jsonl to the Kaggle dataset and re-run")
+    print("Attach the held-out test pairs to the Kaggle dataset and re-run")
     print("this section, or score the downloaded model locally.")
 else:
     print(f"\n── HELD-OUT TEST SET ({result['n']:,} real scanned lines) ──")

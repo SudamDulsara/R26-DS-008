@@ -73,7 +73,7 @@ import pytesseract
 from pipeline.normalize import normalize
 
 OUT_PATH = os.path.join("data", "_synthetic_degradation", "training", "gazette_pairs.jsonl")
-PDF_CACHE = os.path.join("data", "gazette_pdfs")
+PDF_CACHE = os.path.join("data", "_synthetic_degradation", "gazette_pdfs")
 
 URL_TEMPLATE = "https://www.gazette.lk/dl/Gazette/{mm}/Gazette-{yyyy}-{mm}-{dd}-Sii.pdf"
 
