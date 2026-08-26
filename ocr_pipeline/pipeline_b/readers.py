@@ -58,8 +58,8 @@ class TesseractReader:
     #: was written. Doing the same here means setting this up on a colleague's
     #: laptop does not turn into a PATH debugging session.
     WINDOWS_PATHS = (
-        r"C:\Program Files\Tesseract-OCR	esseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR	esseract.exe",
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
     )
 
     def __init__(self, lang: str = "sin"):
