@@ -221,6 +221,63 @@ def rows_from_jsonl(path):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Optional SQLite output, for reading the pairs by eye
+# ══════════════════════════════════════════════════════════════
+#
+# The JSONL is what train_byt5.py consumes and what gets published. This is
+# purely for looking at: a page pair in DB Browser is two 2,000-character
+# blobs side by side, which nobody can actually compare. One row per LINE,
+# with `raw` and `corrected` in adjacent columns, is readable at a glance --
+# and it is what to put in front of a supervisor or a panel.
+#
+# Rebuilt from scratch on every run, so re-running never duplicates rows.
+
+LINE_SCHEMA = """
+DROP TABLE IF EXISTS line_pairs;
+CREATE TABLE line_pairs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file     TEXT,
+    page_num        INTEGER,
+    line_num        INTEGER,
+
+    -- kept adjacent on purpose: this is the comparison
+    raw             TEXT,
+    corrected       TEXT,
+
+    changed         INTEGER,   -- 1 when the corrector altered the line
+    similarity      REAL,      -- 1.0 = identical, floor is MIN_SIMILARITY
+    raw_chars       INTEGER,
+    corrected_chars INTEGER,
+    doc_id          TEXT,
+    corrected_is    TEXT       -- the standing "not human-verified" label
+);
+DROP VIEW IF EXISTS corrections;
+CREATE VIEW corrections AS
+    SELECT source_file, page_num, line_num, raw, corrected, similarity
+    FROM line_pairs WHERE changed = 1
+    ORDER BY source_file, page_num, line_num;
+"""
+
+
+def write_sqlite(rows, path):
+    """Write the line pairs to a browsable table plus a `corrections` view."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    db = sqlite3.connect(path)
+    db.executescript(LINE_SCHEMA)
+    db.executemany(
+        "INSERT INTO line_pairs (source_file, page_num, line_num, raw, "
+        "corrected, changed, similarity, raw_chars, corrected_chars, doc_id, "
+        "corrected_is) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        [(r["source_file"], r["page_num"], r["line_num"], r["raw"],
+          r["corrected"], int(r["raw"] != r["corrected"]), r["similarity"],
+          len(r["raw"]), len(r["corrected"]), r["doc_id"], r["corrected_is"])
+         for r in rows],
+    )
+    db.commit()
+    db.close()
+
+
+# ══════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════
 
@@ -239,6 +296,11 @@ def main():
     p.add_argument("--out", default=os.path.join(here, "data", "line_pairs",
                                                  "pairs.jsonl"),
                    help="where to write the line pairs")
+    p.add_argument("--sqlite", nargs="?", const="AUTO", default=None,
+                   metavar="PATH",
+                   help="also write a browsable SQLite table (open it in DB "
+                        "Browser). Bare --sqlite puts line_pairs.db beside "
+                        "--out; give a path to choose your own")
     p.add_argument("--keep-flagged", action="store_true",
                    help="do not skip pages carrying a disqualifying flag")
     p.add_argument("--min-similarity", type=float, default=MIN_SIMILARITY)
@@ -309,6 +371,13 @@ def main():
         for row in out_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    sqlite_path = None
+    if args.sqlite and out_rows:
+        sqlite_path = (os.path.join(os.path.dirname(os.path.abspath(args.out)),
+                                    "line_pairs.db")
+                       if args.sqlite == "AUTO" else args.sqlite)
+        write_sqlite(out_rows, sqlite_path)
+
     # ── report ────────────────────────────────────────────────
     print(f"\npages read           : {pages}")
     if skipped_pages:
@@ -349,6 +418,10 @@ def main():
               f"correction to learn from")
 
     print(f"\nwritten to {args.out}")
+    if sqlite_path:
+        print(f"browsable copy: {sqlite_path}")
+        print("  open it in DB Browser -> Browse Data -> table `line_pairs`,")
+        print("  or the `corrections` view for only the lines that changed")
     return 0
 
 
