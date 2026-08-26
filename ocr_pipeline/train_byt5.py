@@ -184,7 +184,23 @@ MAX_LENGTH = 384
 BATCH_SIZE = 4          # halved after an out-of-memory at 8
 GRAD_ACCUM = 8          # raised to match — still an effective batch of 32
 LEARNING_RATE = 1e-4    # T5's own recommended fine-tuning rate; 3e-4 diverged
-EPOCHS = 2              # fp32 costs ~2x the time per step, see FP16 below
+#: Passes over the training set. Settable so a run can be retuned from a
+#: Kaggle cell without editing this file:  os.environ["EPOCHS"] = "8"
+#:
+#: WHY THE DEFAULT MOVED FROM 2 TO 8 (2026-08-26). Two epochs was chosen for
+#: the retired 35,000-pair corpus, where it came to 1,214 optimiser steps.
+#: The live corpus is Pipeline B's own output -- about 2,400 line pairs -- and
+#: at an effective batch of 32 that is only ~75 steps per epoch. Two epochs
+#: would be 150 steps in total, which is not enough for a seq2seq model to
+#: learn a new task; the run would finish, report a number, and mean nothing.
+#:
+#: Overfitting is not the risk it looks like at this epoch count, because
+#: section 6 sets load_best_model_at_end with metric_for_best_model="cer" --
+#: whichever checkpoint scores best on the held-out CER is what gets kept,
+#: not whichever came last.
+#:
+#: fp32 costs ~2x the time per step (see FP16 below), so budget accordingly.
+EPOCHS = int(os.environ.get("EPOCHS", "8"))
 SEED = 42
 
 # CER to beat. Measured here on the 202 human-transcribed acts-1010 test
