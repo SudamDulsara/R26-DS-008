@@ -244,7 +244,18 @@ def open_store(args) -> Store:
 
 
 def run(args) -> int:
-    import fitz          # pymupdf; imported late so --status needs no deps
+    # PyMuPDF, imported late so --status needs no deps.
+    #
+    # The package renamed its module from `fitz` to `pymupdf`. Recent
+    # versions still ship `fitz` but print a deprecation warning, and newer
+    # ones drop it entirely -- which is what a fresh `pip install pymupdf`
+    # gets you on Kaggle, where this failed with ModuleNotFoundError while
+    # the local venv (an older build) was fine. Try the new name first so
+    # this works on both.
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
 
     store = open_store(args)
     pdfs = iter_pdfs(args.input)
