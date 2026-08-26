@@ -221,6 +221,65 @@ def rows_from_jsonl(path):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Overlap guard: never train on a page the exam already contains
+# ══════════════════════════════════════════════════════════════
+#
+# The corrector was fine-tuned on acts-1010's train split and will be graded
+# on its test split. Pipeline input comes from documents.gov.lk -- the same
+# source, the same years -- so some input pages ARE acts-1010 pages. Measured
+# on the first real run: 13 of 90, three of them from the TEST split.
+#
+# Two different harms:
+#
+#   test-split overlap   ByT5 would train on pages it is later graded on.
+#                        That invalidates every number, and it is invisible
+#                        unless you look for it.
+#   train-split overlap  The corrector memorised those pages during
+#                        fine-tuning, so its "correction" there is recall.
+#                        The dataset looks cleaner than the pipeline is.
+#
+# Matching is on TEXT, not filenames, because the two sources name documents
+# differently -- acts-1010 files are `year_docid_page` with no Act number.
+# A cheap token-overlap pass picks candidates, then a real order-sensitive
+# ratio decides. Order matters: difflib's quick_ratio() ignores it, and two
+# unrelated pages of Sinhala legal prose score ~0.84 on that measure alone.
+
+OVERLAP_THRESHOLD = 0.60
+
+
+def load_acts1010(path):
+    """Return [(split, filename, text, token set)] or None if not on disk."""
+    if not os.path.isdir(path):
+        return None
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return None
+    out = []
+    for split in ("train", "eval", "test"):
+        ds = load_dataset(path, split=split)
+        for i in range(len(ds)):
+            t = normalize(ds[i]["text"])
+            out.append((split, ds[i]["filename"], t, set(t.split())))
+    return out
+
+
+def overlap_of(text, corpus):
+    """(split, filename, ratio) of the closest corpus page, or None."""
+    toks = set(text.split())
+    if len(toks) < 20:
+        return None
+    scored = sorted(corpus,
+                    key=lambda c: -len(toks & c[3]) / max(1, len(toks | c[3])))
+    best = None
+    for split, name, ctext, _ in scored[:3]:
+        r = SequenceMatcher(None, text, ctext, autojunk=False).ratio()
+        if best is None or r > best[2]:
+            best = (split, name, r)
+    return best if best and best[2] >= OVERLAP_THRESHOLD else None
+
+
+# ══════════════════════════════════════════════════════════════
 #  Optional SQLite output, for reading the pairs by eye
 # ══════════════════════════════════════════════════════════════
 #
@@ -301,6 +360,12 @@ def main():
                    help="also write a browsable SQLite table (open it in DB "
                         "Browser). Bare --sqlite puts line_pairs.db beside "
                         "--out; give a path to choose your own")
+    p.add_argument("--exclude-overlap", action="store_true",
+                   help="drop pages that also appear in acts-1010. Use this "
+                        "for anything ByT5 will train on -- see the overlap "
+                        "guard above")
+    p.add_argument("--acts1010", default=os.path.join(here, "data", "acts1010"),
+                   help="where the acts-1010 parquet lives, for --exclude-overlap")
     p.add_argument("--keep-flagged", action="store_true",
                    help="do not skip pages carrying a disqualifying flag")
     p.add_argument("--min-similarity", type=float, default=MIN_SIMILARITY)
@@ -322,6 +387,16 @@ def main():
 
     print(f"reading {source}")
 
+    corpus = None
+    if args.exclude_overlap:
+        corpus = load_acts1010(args.acts1010)
+        if corpus is None:
+            sys.exit(f"--exclude-overlap needs acts-1010 at {args.acts1010!r} "
+                     "(and the `datasets` package). Point --acts1010 at it.")
+        print(f"overlap guard: comparing against {len(corpus):,} acts-1010 pages")
+
+    overlap_hits = Counter()
+    overlap_rows = []
     pages = kept_pages = skipped_pages = 0
     #: Counts flag OCCURRENCES, which is not the same as pages: one page can
     #: carry several disqualifying flags at once, and most flagged pages here
@@ -344,6 +419,16 @@ def main():
             continue
 
         raw_lines = split_lines(r["raw_text"] or "")
+
+        if corpus is not None:
+            hit = overlap_of(" ".join(raw_lines), corpus)
+            if hit:
+                split_name, fname, ratio = hit
+                overlap_hits[split_name] += 1
+                overlap_rows.append((split_name, r["source_file"],
+                                     r["page_num"], ratio, fname))
+                continue
+
         cor_lines = split_lines(r["corrected_text"] or "")
         total_raw_lines += len(raw_lines)
         total_cor_lines += len(cor_lines)
@@ -386,6 +471,18 @@ def main():
               f"more than one)")
         for flag, n in skipped_by_flag.most_common():
             print(f"    {flag:<16} {n}")
+    if overlap_rows:
+        print(f"pages dropped as acts-1010 overlap: {len(overlap_rows)}")
+        for split_name in ("test", "eval", "train"):
+            n = overlap_hits.get(split_name, 0)
+            if not n:
+                continue
+            note = "  <-- would have contaminated the evaluation" if split_name == "test" else ""
+            print(f"    {split_name:<6} {n}{note}")
+        for split_name, src, pg, ratio, fname in sorted(overlap_rows,
+                                                        key=lambda x: -x[3])[:10]:
+            print(f"      {src[:26]:<28} p{pg:<3} {ratio:.3f}  "
+                  f"= acts-1010 {split_name}/{fname}")
     print(f"pages used           : {kept_pages}")
     if not kept_pages:
         print("\nNothing was usable. If every page was skipped as "
