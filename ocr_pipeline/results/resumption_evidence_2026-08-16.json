@@ -1,0 +1,32 @@
+{
+  "source": "data/ocr_correction_pairs.db (deleted 2026-08-26)",
+  "what_it_shows": "pipeline resumes after interruption and never reprocesses or duplicates a page",
+  "total_pages": 90,
+  "duplicate_doc_page_rows": 0,
+  "runs": [
+    {
+      "run_id": "d28e14cc4e51",
+      "started_at": "2026-08-16T06:17:54+00:00",
+      "finished_at": "2026-08-16T06:18:01+00:00",
+      "input_dir": "data/inbox",
+      "corrector": "passthrough",
+      "pages_written": 6,
+      "pages_skipped": 0,
+      "pages_flagged": 6,
+      "documents_seen": 13,
+      "note": "first real Act PDFs, Tesseract only"
+    },
+    {
+      "run_id": "302d512e1bae",
+      "started_at": "2026-08-16T06:18:18+00:00",
+      "finished_at": "2026-08-16T06:20:04+00:00",
+      "input_dir": "data/inbox",
+      "corrector": "passthrough",
+      "pages_written": 84,
+      "pages_skipped": 0,
+      "pages_flagged": 84,
+      "documents_seen": 13,
+      "note": "all scanned Acts, Tesseract only"
+    }
+  ]
+}

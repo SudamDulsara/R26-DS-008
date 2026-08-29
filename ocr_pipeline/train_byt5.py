@@ -29,8 +29,22 @@ conjunct-and-diacritic structure.
 
 THE ONE NUMBER TO BEAT
 ----------------------
-Tesseract alone scores 0.0921 CER on the evaluation set. Anything above
-that means the model is making the text worse.
+Tesseract scores 0.1079 CER on the 202 human-transcribed acts-1010 test
+pages -- the only gold text in this project. Anything above that means the
+model is making the text worse.
+
+The old 0.0921 figure came from a retired synthetic test set and is void.
+Do not compare against it, and do not compare a line-level score against a
+page-level one: they are different denominators.
+
+INPUT MUST BE LINE-LEVEL
+------------------------
+This is a byte-level model reading MAX_LENGTH bytes at a time. A whole
+acts-1010 page is ~1,600 characters, which is ~4,800 bytes in Sinhala UTF-8
+-- twelve times the window. Pipeline B writes PAGE pairs, so they must be
+split into lines before they reach this script. Section 3 refuses to train
+on over-long pairs rather than truncating them, because truncation here
+produces a plausible-looking number from mutilated data.
 """
 
 # ══════════════════════════════════════════════════════════════
@@ -51,6 +65,7 @@ for _pkg in ("jiwer",):
 
 import glob
 import json
+import math
 import os
 import random
 
@@ -96,6 +111,31 @@ MODEL_NAME = "google/byt5-small"
 EVAL_MARKERS = ("test", "eval")
 
 
+def _in_retired_folder(path: str) -> bool:
+    """
+    True if any FOLDER in the path starts with an underscore.
+
+    data/ carries live corpora next to retired ones, and the sweep below is
+    recursive, so without this it silently trains on both. As of 2026-08-23
+    that meant 12.8 MB of the synthetic gazette pairs this project retired in
+    August, plus 90 rows whose corrected side is a copy of the raw side --
+    every resulting number would have been meaningless, and nothing would
+    have looked wrong.
+
+    Underscore-prefixed folders are this project's convention for "kept for
+    reference, not part of the live path": data/_synthetic_degradation,
+    data/_trial. Naming them was not enough on its own; the sweep had to
+    honour the convention too.
+
+    FOLDERS only, deliberately. data/acts1010/_tesseract_test_split.jsonl is
+    a leading-underscore FILE holding real Tesseract output on the held-out
+    split, and it is legitimate evaluation data.
+    """
+    parts = path.replace("\\", "/").split("/")[:-1]
+    return any(part.startswith("_") for part in parts)
+
+
+
 def find_data_files():
     """
     Locate the .jsonl pairs wherever this happens to be running, and split
@@ -107,7 +147,9 @@ def find_data_files():
     """
     found = sorted(glob.glob("/kaggle/input/**/*.jsonl", recursive=True))
     if not found:
-        found = sorted(glob.glob(os.path.join("data", "**", "*.jsonl"), recursive=True))
+        found = sorted(glob.glob(os.path.join("data", "**", "*.jsonl"),
+                                 recursive=True))
+        found = [p for p in found if not _in_retired_folder(p)]
 
     train, evaluation = [], []
     for path in found:
@@ -142,10 +184,32 @@ MAX_LENGTH = 384
 BATCH_SIZE = 4          # halved after an out-of-memory at 8
 GRAD_ACCUM = 8          # raised to match — still an effective batch of 32
 LEARNING_RATE = 1e-4    # T5's own recommended fine-tuning rate; 3e-4 diverged
-EPOCHS = 2              # fp32 costs ~2x the time per step, see FP16 below
+#: Passes over the training set. Settable so a run can be retuned from a
+#: Kaggle cell without editing this file:  os.environ["EPOCHS"] = "8"
+#:
+#: WHY THE DEFAULT MOVED FROM 2 TO 8 (2026-08-26). Two epochs was chosen for
+#: the retired 35,000-pair corpus, where it came to 1,214 optimiser steps.
+#: The live corpus is Pipeline B's own output -- about 2,400 line pairs -- and
+#: at an effective batch of 32 that is only ~75 steps per epoch. Two epochs
+#: would be 150 steps in total, which is not enough for a seq2seq model to
+#: learn a new task; the run would finish, report a number, and mean nothing.
+#:
+#: Overfitting is not the risk it looks like at this epoch count, because
+#: section 6 sets load_best_model_at_end with metric_for_best_model="cer" --
+#: whichever checkpoint scores best on the held-out CER is what gets kept,
+#: not whichever came last.
+#:
+#: fp32 costs ~2x the time per step (see FP16 below), so budget accordingly.
+EPOCHS = int(os.environ.get("EPOCHS", "8"))
 SEED = 42
 
-TESSERACT_BASELINE = 0.0921   # CER to beat, measured by build_test_set.py
+# CER to beat. Measured here on the 202 human-transcribed acts-1010 test
+# pages and independently reported as 0.1069 by the corpus authors -- two
+# separate measurements agreeing to 0.001. Per-page mean, both sides NFC.
+#
+# Replaced 0.0921 on 2026-08-26. That number came from the retired synthetic
+# test set and cannot be compared with anything now in the live path.
+TESSERACT_BASELINE = 0.1079
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -176,9 +240,23 @@ def _is_trivial(ocr: str, gold: str) -> bool:
     return squash(ocr) == squash(gold)
 
 
+def _read_pair(r):
+    """
+    Pull (wrong text, right text) out of a row under either naming scheme.
+
+    The retired corpora used `ocr`/`gold`. Pipeline B writes `raw`/`corrected`
+    because on production input there IS no gold -- the corrected column is
+    model output, and calling it `gold` in the file would be a lie that
+    outlives this project. Accept both rather than rewriting either.
+    """
+    if "ocr" in r or "gold" in r:
+        return r.get("ocr", "").strip(), r.get("gold", "").strip()
+    return r.get("raw", "").strip(), r.get("corrected", "").strip()
+
+
 def load_pairs(paths):
     """Read the JSONL files and keep only pairs worth learning from."""
-    rows, skipped, trimmed = [], 0, 0
+    rows, skipped, trimmed, oversize = [], 0, 0, 0
     for p in paths:
         if not os.path.exists(p):
             print(f"  missing, skipping: {p}")
@@ -186,7 +264,7 @@ def load_pairs(paths):
         with open(p, encoding="utf-8") as f:
             for line in f:
                 r = json.loads(line)
-                ocr, gold = r.get("ocr", "").strip(), r.get("gold", "").strip()
+                ocr, gold = _read_pair(r)
 
                 # Drop pairs that teach nothing or teach the wrong thing:
                 #   empty            - no signal
@@ -197,6 +275,13 @@ def load_pairs(paths):
                 #                      teaches the model to invent Sinhala
                 if not ocr or not gold:
                     skipped += 1
+                elif (len(ocr.encode("utf-8")) > MAX_LENGTH
+                      or len(gold.encode("utf-8")) > MAX_LENGTH):
+                    # Too long for the window. Counted and reported rather
+                    # than truncated -- see the header. A page pair lands
+                    # here every time, which is the signal that the input
+                    # was never split into lines.
+                    oversize += 1
                 elif ocr == gold:
                     skipped += 1
                 elif cer(gold, ocr) > 0.6:
@@ -209,6 +294,19 @@ def load_pairs(paths):
     print(f"usable pairs: {len(rows):,}")
     print(f"  skipped (empty / identical / unrecoverable): {skipped:,}")
     print(f"  trimmed (trivial invisible-character pairs): {trimmed:,}")
+    print(f"  oversize (longer than {MAX_LENGTH} bytes): {oversize:,}")
+
+    # Stop rather than train on the leftovers. If most of the input is too
+    # long, it is page-level and the run would silently be measuring a
+    # handful of unusually short pages instead of the corpus.
+    seen = len(rows) + skipped + trimmed + oversize
+    if seen and oversize > 0.3 * seen:
+        sys.exit(
+            f"\n{100 * oversize / seen:.0f}% of pairs exceed {MAX_LENGTH} bytes.\n"
+            "That is what page-level input looks like: an acts-1010 page is\n"
+            "~4,800 bytes in Sinhala UTF-8 and this model reads 384 at a time.\n"
+            "Split the pages into aligned lines first, then run this again."
+        )
     return rows
 
 
@@ -277,6 +375,29 @@ def compute_metrics(eval_pred):
 #  6. Train
 # ══════════════════════════════════════════════════════════════
 
+# Schedule sized from the actual corpus, not from a fixed guess.
+#
+# WHY THIS IS NOT `warmup_steps=500` ANY MORE. The run killed on 2026-08-15
+# had 1,214 total steps, so 500 warmup meant 41% of training was spent
+# ramping the learning rate up, and it decayed to zero the moment it peaked.
+# The convention is 5-10%. At step 500 that run scored CER 0.1451 against a
+# do-nothing baseline of 0.0940 -- it was actively making text worse.
+#
+# The fixed 500 for eval_steps/save_steps was the same trap from the other
+# side. This corpus is far smaller than the retired one: ~90 pages of line
+# pairs is a few hundred steps in total, so a 500-step evaluation interval
+# would never fire even once, `metric_for_best_model="cer"` would have
+# nothing to compare, and load_best_model_at_end would fail at the end of a
+# completed run. Both intervals are now derived from the real step count.
+_STEPS_PER_EPOCH = math.ceil(len(train_ds) / (BATCH_SIZE * GRAD_ACCUM))
+_TOTAL_STEPS = max(1, _STEPS_PER_EPOCH * EPOCHS)
+WARMUP_STEPS = max(10, round(_TOTAL_STEPS * 0.06))
+CHECK_EVERY = max(10, _TOTAL_STEPS // 8)
+
+print(f"\nschedule: {_TOTAL_STEPS} steps over {EPOCHS} epoch(s) "
+      f"({_STEPS_PER_EPOCH}/epoch), warmup {WARMUP_STEPS} "
+      f"({100 * WARMUP_STEPS / _TOTAL_STEPS:.0f}%), evaluating every {CHECK_EVERY}")
+
 args = Seq2SeqTrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
@@ -284,7 +405,7 @@ args = Seq2SeqTrainingArguments(
     gradient_accumulation_steps=GRAD_ACCUM,
     learning_rate=LEARNING_RATE,
     num_train_epochs=EPOCHS,
-    warmup_steps=500,
+    warmup_steps=WARMUP_STEPS,
 
     # Recompute intermediate values during the backward pass instead of
     # holding all of them. Roughly 30% slower per step, but it is the
@@ -292,9 +413,9 @@ args = Seq2SeqTrainingArguments(
     gradient_checkpointing=True,
 
     eval_strategy="steps",
-    eval_steps=500,
+    eval_steps=CHECK_EVERY,
     save_strategy="steps",
-    save_steps=500,
+    save_steps=CHECK_EVERY,
     save_total_limit=2,
 
     # Keep whichever checkpoint scored best, not whichever came last —
@@ -351,16 +472,19 @@ print(f"\nSaved to {OUTPUT_DIR}/ — download this folder.")
 # This must be measured on the held-out test set, not on the validation
 # split. They are not the same yardstick and cannot be compared:
 #
-#   validation split  1,022 lines carved out of the gazette + Ransaka
-#                     corpus, AFTER load_pairs() removed the already-correct
-#                     pairs and thinned the easy invisible-character ones.
-#                     What is left is deliberately the hard remainder.
-#   test set          1,078 real scanned pages, human-transcribed, nothing
-#                     filtered, and carrying the Tesseract CER for each row.
+#   validation split  5% carved out of the pipeline's own generated pairs,
+#                     AFTER load_pairs() removed the already-correct ones
+#                     and thinned the easy invisible-character ones. What is
+#                     left is deliberately the hard remainder. Its corrected
+#                     side is MODEL OUTPUT, not human-verified truth.
+#   test set          the 202 human-transcribed acts-1010 pages, nothing
+#                     filtered, carrying Tesseract's CER for each page in
+#                     data/acts1010/_tesseract_test_split.jsonl.
 #
-# The 0.0921 baseline was measured on the second. Scoring the model on the
-# first and comparing the two numbers is how a model that is helping gets
-# thrown away, or a model that is hurting gets shipped.
+# The 0.1079 baseline was measured on the second, and the second is the only
+# gold text in this project. Scoring the model on the first and comparing
+# the two numbers is how a model that is helping gets thrown away, or one
+# that is hurting gets shipped.
 
 model.eval()
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -387,8 +511,8 @@ def evaluate_on_test_set(paths):
     """
     # Keep every row that has gold text — including the 23 where Tesseract
     # returned nothing at all. Those score CER 1.0 and are part of the
-    # recorded 0.0921 baseline; dropping them would quietly move the
-    # goalposts to 0.0723 and flatter the model by comparison.
+    # recorded baseline; dropping them would quietly move the goalposts and
+    # flatter the model by comparison.
     rows = []
     for p in paths:
         with open(p, encoding="utf-8") as f:
@@ -399,14 +523,38 @@ def evaluate_on_test_set(paths):
     if not rows:
         return None
 
-    print(f"\nscoring {len(rows):,} held-out lines (this takes a few minutes) ...")
+    print(f"\nscoring {len(rows):,} held-out pages (this takes a few minutes) ...")
 
-    preds = []
-    for i in range(0, len(rows), EVAL_BATCH):
-        chunk = rows[i:i + EVAL_BATCH]
-        preds.extend(correct_batch([r["ocr"] for r in chunk]))
-        if i % (EVAL_BATCH * 20) == 0:
-            print(f"  {i:,}/{len(rows):,}")
+    # CORRECT LINE BY LINE, THEN REASSEMBLE THE PAGE.
+    #
+    # A test row is a whole page -- roughly twelve times this model's byte
+    # window. Feeding it in whole would truncate it, so the model would be
+    # scored on the first 8% of each page against the whole of the gold
+    # text: a number that looks real and means nothing.
+    #
+    # Splitting, correcting and rejoining keeps the final CER page-level,
+    # which is what makes it comparable to Tesseract's 0.1079 on these same
+    # pages. Blank lines pass through untouched so the page's line structure
+    # survives reassembly.
+    flat, owner = [], []
+    for n, r in enumerate(rows):
+        for ln in r["ocr"].split("\n"):
+            flat.append(ln)
+            owner.append(n)
+
+    out = list(flat)
+    todo = [i for i, ln in enumerate(flat) if ln.strip()]
+    for i in range(0, len(todo), EVAL_BATCH):
+        idxs = todo[i:i + EVAL_BATCH]
+        for j, fixed in zip(idxs, correct_batch([flat[j] for j in idxs])):
+            out[j] = fixed
+        if i % (EVAL_BATCH * 50) == 0:
+            print(f"  {i:,}/{len(todo):,} lines")
+
+    rebuilt = [[] for _ in rows]
+    for line_out, n in zip(out, owner):
+        rebuilt[n].append(line_out)
+    preds = ["\n".join(parts) for parts in rebuilt]
 
     cer_raw = [cer(r["gold"], r["ocr"]) for r in rows]
     cer_model = [cer(r["gold"], p) for r, p in zip(rows, preds)]
@@ -434,13 +582,19 @@ result = evaluate_on_test_set(EVAL_FILES)
 
 if result is None:
     print("\nNo test set attached, so the question 'did it help' is unanswered.")
-    print("Attach data/eval/test_set.jsonl to the Kaggle dataset and re-run")
+    print("Attach the held-out test pairs to the Kaggle dataset and re-run")
     print("this section, or score the downloaded model locally.")
 else:
-    print(f"\n── HELD-OUT TEST SET ({result['n']:,} real scanned lines) ──")
+    # PAGES, not lines. The unit changed on 2026-08-27 and the labels did
+    # not follow: the model corrects line by line, but each row scored here
+    # is a whole page reassembled from those lines, compared against the
+    # gold page. That is what makes the figure comparable to Tesseract's
+    # 0.1079, which is also a per-page mean. Reporting it as a line-level
+    # score would be a different measurement with a different denominator.
+    print(f"\n── HELD-OUT TEST SET ({result['n']:,} held-out pages) ──")
     print(f"Tesseract alone : {result['tesseract']:.4f} CER")
     print(f"With the model  : {result['model']:.4f} CER   (WER {result['model_wer']:.4f})")
-    print(f"Lines made worse by correction: {result['worse']:,} "
+    print(f"Pages made worse by correction: {result['worse']:,} "
           f"({100 * result['worse'] / result['n']:.1f}%)")
 
     # Cross-check against the value recorded when the test set was built. A

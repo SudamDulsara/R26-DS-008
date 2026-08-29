@@ -87,11 +87,26 @@ def find_repo_root(start: str = COMPONENT, levels: int = 4) -> str:
 #: Override with --data-dir (see generate.py) or OCR_DATA_DIR.
 REPO_ROOT = find_repo_root()
 
-#: The database goes directly in data/ ; everything else in a subfolder.
-#: Group convention -- see the module docstring.
-DEFAULT_DATA = os.environ.get("OCR_DATA_DIR") or os.path.join(REPO_ROOT, "data")
+#: Where the group collects finished databases. Set by the group leader
+#: 2026-08-22, revising the earlier "directly in data/" instruction.
+#:
+#: ONLY the .db belongs here -- his words. So the JSONL and anything else this
+#: pipeline emits goes to a sibling folder, not into the collection point.
+#:
+#: NAME WARNING. `inbox` here means the group's INBOX: finished artefacts
+#: arriving from the three components. This project already uses `inbox` for
+#: the opposite thing -- ocr_pipeline/data/inbox is the folder of scanned Act
+#: PDFs waiting to be READ. Two folders, same name, opposite direction:
+#:
+#:     R26-DS-008/data/inbox/          <- OUTPUT lands here (group's)
+#:     R26-DS-008/ocr_pipeline/data/inbox/   <- INPUT read from here (ours)
+#:
+#: Different paths, so nothing breaks. But do not "tidy" one into the other,
+#: and say which you mean whenever you write `inbox` in a commit or a report.
+GROUP_DATA = os.environ.get("OCR_DATA_DIR") or os.path.join(REPO_ROOT, "data")
+DEFAULT_DATA = os.path.join(GROUP_DATA, "inbox")
 DEFAULT_DB_NAME = "ocr_correction_pairs.db"
-DEFAULT_SUPPORT = os.path.join(DEFAULT_DATA, "generated")
+DEFAULT_SUPPORT = os.path.join(GROUP_DATA, "generated")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
