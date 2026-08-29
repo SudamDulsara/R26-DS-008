@@ -585,10 +585,16 @@ if result is None:
     print("Attach the held-out test pairs to the Kaggle dataset and re-run")
     print("this section, or score the downloaded model locally.")
 else:
-    print(f"\n── HELD-OUT TEST SET ({result['n']:,} real scanned lines) ──")
+    # PAGES, not lines. The unit changed on 2026-08-27 and the labels did
+    # not follow: the model corrects line by line, but each row scored here
+    # is a whole page reassembled from those lines, compared against the
+    # gold page. That is what makes the figure comparable to Tesseract's
+    # 0.1079, which is also a per-page mean. Reporting it as a line-level
+    # score would be a different measurement with a different denominator.
+    print(f"\n── HELD-OUT TEST SET ({result['n']:,} held-out pages) ──")
     print(f"Tesseract alone : {result['tesseract']:.4f} CER")
     print(f"With the model  : {result['model']:.4f} CER   (WER {result['model_wer']:.4f})")
-    print(f"Lines made worse by correction: {result['worse']:,} "
+    print(f"Pages made worse by correction: {result['worse']:,} "
           f"({100 * result['worse'] / result['n']:.1f}%)")
 
     # Cross-check against the value recorded when the test set was built. A

@@ -246,10 +246,150 @@ class LightOnCorrector:
         return normalize(text), elapsed
 
 
-def build_corrector(kind: str, adapter_dir=None, **kwargs):
+class ByT5Corrector:
+    """
+    The ByT5 trained on this pipeline's own output, used as the corrector.
+
+    This one is different in kind from LightOnCorrector, and the difference
+    matters: LightOnOCR reads the IMAGE again, ByT5 repairs the TEXT. It never
+    looks at the page. That makes it far cheaper -- no vision encoder, ~300M
+    parameters, and it runs on a CPU if it has to -- and it is the model this
+    project actually contributed, trained on pairs this pipeline generated.
+
+    Measured on the 202 human-transcribed acts-1010 test pages: Tesseract
+    alone 0.1079 CER, Tesseract + this model 0.0891. 17.4% fewer character
+    errors. 156 of 202 pages improved, 46 got worse.
+
+    LINE BY LINE, because that is how it was trained. The training pairs are
+    aligned lines, not pages, so feeding it a whole page asks it for something
+    it has never seen. The page is split on newlines, each line is corrected
+    on its own, and the page is put back together with the same line breaks.
+    Blank lines are preserved untouched and never sent to the model.
+
+    OVERLONG LINES ARE PASSED THROUGH, NOT TRUNCATED. ByT5 counts BYTES, and
+    Sinhala costs about 3 bytes per character, so the 384-byte window holds
+    roughly 128 characters. Anything longer would be silently cut in half and
+    the tail lost -- which in a published dataset is invisible and permanent.
+    The project rule is skip, split or flag, never truncate quietly, so such
+    lines are returned exactly as Tesseract read them and counted in
+    `lines_too_long`.
+    """
+
+    name = "byt5"
+
+    def __init__(
+        self,
+        model_dir: str,
+        max_length: int = 384,
+        batch_size: int = 8,
+        precision: str = "auto",
+        **_ignored,                 # generate.py passes max_image_edge
+    ):
+        import torch
+        from transformers import AutoTokenizer, T5ForConditionalGeneration
+
+        self._torch = torch
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.model_dir = model_dir
+
+        # Counters for the run summary. lines_too_long is the one to watch:
+        # if it is large the window is wrong for this corpus, and on acts-1010
+        # nothing exceeded 384 bytes, so it should be near zero.
+        self.lines_seen = 0
+        self.lines_too_long = 0
+        self.lines_changed = 0
+
+        if precision == "auto":
+            # Same reasoning as LightOnCorrector, plus one of this project's
+            # own scars: T5-family models are pretrained in bfloat16 and their
+            # activations overflow fp16's exponent range. A fp16 ByT5 run here
+            # reached training loss 14,344,448 and nan. fp16 is never correct
+            # for this model, on any card.
+            if not torch.cuda.is_available():
+                precision = "fp32"
+            elif torch.cuda.get_device_capability()[0] >= 8:
+                precision = "bf16"
+            else:
+                precision = "fp32"
+        self.precision = precision
+        dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[precision]
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[corrector] loading ByT5 from {model_dir} ({precision}) on {device}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        model = T5ForConditionalGeneration.from_pretrained(model_dir, dtype=dtype)
+        model = model.to(device)
+        model.eval()
+        model.config.use_cache = True
+        self.model = model
+        self.device = device
+
+    def _correct_batch(self, lines):
+        torch = self._torch
+        enc = self.tokenizer(
+            lines, return_tensors="pt", padding=True,
+            truncation=True, max_length=self.max_length,
+        ).to(self.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **enc,
+                max_length=self.max_length,
+                num_beams=1,          # greedy: repairing a line is not creative
+            )
+        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
+
+    def read(self, image, raw_text: str = "") -> tuple:
+        """
+        Return (text, seconds). `image` is accepted and ignored -- this
+        corrector works from Tesseract's text, which is the whole point of it.
+        """
+        t0 = time.time()
+        lines = raw_text.split("\n")
+
+        # Which lines actually go to the model. Blank lines keep their place
+        # in the page; overlong ones are passed through and counted.
+        todo = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            self.lines_seen += 1
+            if len(line.encode("utf-8")) > self.max_length:
+                self.lines_too_long += 1
+                continue
+            todo.append(i)
+
+        out = list(lines)
+        for start in range(0, len(todo), self.batch_size):
+            idxs = todo[start:start + self.batch_size]
+            fixed = self._correct_batch([lines[i] for i in idxs])
+            for i, new in zip(idxs, fixed):
+                if new != lines[i]:
+                    self.lines_changed += 1
+                out[i] = new
+
+        # LightOnCorrector sets this because it generates a whole page and can
+        # run out of room. Here every line is capped independently and long
+        # lines are passed through instead, so the page is never a fragment.
+        self.hit_cap = False
+        return normalize("\n".join(out)), time.time() - t0
+
+
+def build_corrector(kind: str, adapter_dir=None, model_dir=None, **kwargs):
     """Factory so generate.py does not import torch unless it has to."""
     if kind == "none":
         return PassthroughCorrector()
     if kind == "lighton":
         return LightOnCorrector(adapter_dir=adapter_dir, **kwargs)
-    raise ValueError(f"unknown corrector {kind!r}; use 'none' or 'lighton'")
+    if kind == "byt5":
+        target = model_dir or adapter_dir
+        if not target:
+            raise ValueError(
+                "--corrector byt5 needs --model pointing at the trained ByT5 "
+                "folder (the one holding config.json and model.safetensors)"
+            )
+        return ByT5Corrector(model_dir=target, **kwargs)
+    raise ValueError(
+        f"unknown corrector {kind!r}; use 'none', 'lighton' or 'byt5'"
+    )
