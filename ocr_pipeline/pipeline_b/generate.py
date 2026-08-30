@@ -40,6 +40,7 @@ measurement on 202 human-transcribed pages that this pipeline never touches.
 import argparse
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -470,8 +471,64 @@ def run(args) -> int:
     if written:
         print(f"  per page       : {elapsed / written:.1f}s")
 
+    if written and not args.no_lines:
+        derive_line_pairs(store)
+
     show_status(store)
     return 0
+
+
+def derive_line_pairs(store) -> None:
+    """
+    Turn the page pairs just written into aligned line pairs.
+
+    Pages are the primary record: they are exactly what the two readers
+    produced, and they need no alignment to exist. Lines are DERIVED from
+    them, and derived fresh each time rather than appended to, so the line
+    file always describes whatever the page database currently holds. Stop a
+    run at 40 pages and finish it tomorrow, and the lines regenerate to cover
+    all of them.
+
+    Run as a separate process on purpose. By the time this is called every
+    page is already safely on disk, so nothing here can put the dataset at
+    risk -- and isolating it means a failure in alignment costs a convenience
+    file rather than the run. build_line_pairs.py only ever READS the page
+    database; it writes to its own file.
+    """
+    script = os.path.join(HERE, "build_line_pairs.py")
+    if not os.path.exists(script):
+        return
+
+    lines_db = os.path.splitext(store.db_path)[0] + "_lines.db"
+    lines_jsonl = os.path.join(os.path.dirname(store.jsonl_path),
+                               "line_pairs.jsonl")
+
+    print(f"\nderiving line pairs -> {lines_db}")
+    try:
+        proc = subprocess.run(
+            [sys.executable, script,
+             "--db", store.db_path,
+             "--out", lines_jsonl,
+             "--sqlite", lines_db],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as exc:                     # noqa: BLE001
+        print(f"  skipped: {type(exc).__name__}: {exc}")
+        print("  the page pairs are unaffected -- run build_line_pairs.py "
+              "by hand if you want them")
+        return
+
+    if proc.returncode != 0:
+        print("  FAILED -- the page pairs are unaffected")
+        for line in (proc.stderr or "").strip().splitlines()[-4:]:
+            print("   ", line)
+        return
+
+    for line in (proc.stdout or "").splitlines():
+        t = line.strip()
+        if t.startswith(("aligned pairs", "match rate", "identical pairs")):
+            print("  " + t)
 
 
 def show_status(store: Store = None):
@@ -516,6 +573,9 @@ def main():
     p.add_argument("--lang", default="sin", help="Tesseract language")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N pages this run (0 = no limit)")
+    p.add_argument("--no-lines", action="store_true",
+                   help="skip deriving the line-level database at the end of "
+                        "the run; pages are written either way")
     p.add_argument("--note", default=None, help="free text stored with the run")
     p.add_argument("--allow-digital", action="store_true",
                    help="process born-digital PDFs too. OFF by default: OCRing "
