@@ -6,11 +6,11 @@ from transcribe import transcribe_audio
 
 from database import (
     save_clip,
-    update_clip_transcript,
-    update_clip_drive_file_id
 )
 
-from drive_sync import copy_to_drive
+from topic_classifier import (
+    classify_topic_from_video
+)
 
 from pydub import AudioSegment
 
@@ -46,7 +46,10 @@ def is_sinhala(text):
     if total_chars == 0:
         return False
 
-    ratio = sinhala_chars / total_chars
+    ratio = (
+        sinhala_chars /
+        total_chars
+    )
 
     return ratio >= 0.60
 
@@ -60,7 +63,6 @@ def contains_music_tags(text):
     text = text.lower()
 
     tags = [
-
         "music",
         "applause",
         "laughter",
@@ -72,7 +74,6 @@ def contains_music_tags(text):
         "[music]",
         "[applause]",
         "[laughter]"
-
     ]
 
     return any(
@@ -92,30 +93,34 @@ def is_hallucination(text):
     if len(text) == 0:
         return True
 
-    # ---------------------------------------------
-    # SAME CHARACTER REPEATED
-    # ---------------------------------------------
+    characters = text.replace(
+        " ",
+        ""
+    )
 
-    characters = text.replace(" ", "")
-
-    unique = set(characters)
+    unique = set(
+        characters
+    )
 
     if len(unique) == 1:
         return True
-
-    # ---------------------------------------------
-    # SAME WORD REPEATED
-    # ---------------------------------------------
 
     words = text.split()
 
     if len(words) >= 4:
 
-        counts = Counter(words)
+        counts = Counter(
+            words
+        )
 
-        most_common = counts.most_common(1)[0][1]
+        most_common = (
+            counts
+            .most_common(1)[0][1]
+        )
 
-        if most_common >= len(words) * 0.8:
+        if most_common >= (
+            len(words) * 0.8
+        ):
             return True
 
     return False
@@ -208,45 +213,113 @@ def get_clip_duration(audio_path):
 
 
 # =====================================================
+# READ AUDIO BYTES
+# =====================================================
+
+def read_audio_bytes(audio_path):
+
+    with open(
+        audio_path,
+        "rb"
+    ) as audio_file:
+
+        return audio_file.read()
+
+
+# =====================================================
+# FORMAT WORD TIMESTAMPS
+# =====================================================
+
+def format_word_timestamps(
+    word_timestamps
+):
+
+    lines = []
+
+    for item in word_timestamps:
+
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+        word = str(
+            item.get(
+                "word",
+                ""
+            )
+        ).strip()
+
+        start = item.get(
+            "start"
+        )
+
+        end = item.get(
+            "end"
+        )
+
+        if not word:
+            continue
+
+        if start is None or end is None:
+            continue
+
+        try:
+
+            start = float(
+                start
+            )
+
+            end = float(
+                end
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+        lines.append(
+            f"{word} - {start:.2f}s-{end:.2f}s"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# =====================================================
 # TRANSCRIBE DATASET
 # =====================================================
 
-def transcribe_dataset(chunks, video):
+def transcribe_dataset(
+    chunks,
+    video
+):
 
     """
-    Transcribes ONLY the chunks generated
+    Transcribes only the chunks generated
     from the current video.
 
     Processing order:
 
         1. Transcribe local temporary clip
-        2. Validate transcript
+        2. Obtain word-level timestamps
+        3. Validate transcript
+        4. Classify topic
+        5. Read audio bytes
+        6. Format word timestamps
+        7. Save audio + transcript +
+           timestamps + topic + duration to SQLite
+        8. Delete local temporary clip
 
-        3. If invalid:
-               delete local clip
-               do not upload
-               do not save to database
+    SQLite is the permanent storage location
+    for the generated audio clips and metadata.
 
-        4. If valid:
-               upload clip to Google Drive
-               obtain Google Drive file ID
-               save clip metadata
-               save transcript
-               save Drive file ID
-               delete local temporary clip
-
-    Google Drive is the permanent audio storage.
-
-    Local audio files are temporary processing files.
-
-    SQLite database stores:
-
-        - video_id
-        - clip_name
-        - duration
-        - transcript
-        - drive_file_id
-
+    No Google Drive is used.
     No TSV file is generated.
     """
 
@@ -266,7 +339,9 @@ def transcribe_dataset(chunks, video):
         "=" * 60
     )
 
-    total = len(chunks)
+    total = len(
+        chunks
+    )
 
     # =====================================================
     # PROCESS EACH CHUNK
@@ -291,7 +366,9 @@ def transcribe_dataset(chunks, video):
         # CHECK LOCAL FILE
         # =================================================
 
-        if not os.path.exists(clip):
+        if not os.path.exists(
+            clip
+        ):
 
             print(
                 "Skipped - local audio file not found."
@@ -312,13 +389,15 @@ def transcribe_dataset(chunks, video):
         )
 
         # =================================================
-        # TRANSCRIBE
+        # TRANSCRIBE + WORD TIMESTAMPS
         # =================================================
 
         try:
 
-            transcript = transcribe_audio(
-                clip
+            transcription_result = (
+                transcribe_audio(
+                    clip
+                )
             )
 
         except Exception as e:
@@ -335,6 +414,32 @@ def transcribe_dataset(chunks, video):
 
             continue
 
+        if not transcription_result:
+
+            print(
+                "Transcription returned no result."
+            )
+
+            print(
+                "Keeping local clip for retry."
+            )
+
+            continue
+
+        transcript = (
+            transcription_result.get(
+                "text",
+                ""
+            )
+        )
+
+        word_timestamps = (
+            transcription_result.get(
+                "word_timestamps",
+                []
+            )
+        )
+
         # =================================================
         # VALIDATE TRANSCRIPT
         # =================================================
@@ -343,11 +448,9 @@ def transcribe_dataset(chunks, video):
             transcript
         ):
 
-            # ---------------------------------------------
-            # INVALID CLIP
-            # ---------------------------------------------
-
-            if os.path.exists(clip):
+            if os.path.exists(
+                clip
+            ):
 
                 try:
 
@@ -369,6 +472,31 @@ def transcribe_dataset(chunks, video):
             continue
 
         # =================================================
+        # REQUIRE WORD TIMESTAMPS
+        # =================================================
+
+        if not word_timestamps:
+
+            print(
+                "Skipped - no word-level timestamps."
+            )
+
+            if os.path.exists(
+                clip
+            ):
+
+                try:
+
+                    os.remove(
+                        clip
+                    )
+
+                except Exception:
+                    pass
+
+            continue
+
+        # =================================================
         # VALID TRANSCRIPT
         # =================================================
 
@@ -379,37 +507,58 @@ def transcribe_dataset(chunks, video):
         )
 
         # =================================================
-        # UPLOAD TO GOOGLE DRIVE
+        # FORMAT WORD TIMESTAMPS
         # =================================================
+
+        formatted_word_timestamps = (
+            format_word_timestamps(
+                word_timestamps
+            )
+        )
 
         print()
 
         print(
-            "Uploading valid clip to Google Drive..."
+            "Word timestamps:"
         )
+
+        print(
+            formatted_word_timestamps
+        )
+
+        # =================================================
+        # TOPIC CLASSIFICATION
+        # =================================================
+
+        topic = (
+            classify_topic_from_video(
+                video,
+                transcript=transcript
+            )
+        )
+
+        print()
+
+        print(
+            f"Topic : {topic}"
+        )
+
+        # =================================================
+        # READ AUDIO
+        # =================================================
 
         try:
 
-            drive_file_id = copy_to_drive(
-                clip
+            audio_bytes = (
+                read_audio_bytes(
+                    clip
+                )
             )
 
         except Exception as e:
 
             print(
-                f"Google Drive upload failed: {e}"
-            )
-
-            drive_file_id = None
-
-        # =================================================
-        # DRIVE UPLOAD FAILED
-        # =================================================
-
-        if not drive_file_id:
-
-            print(
-                "Google Drive upload failed."
+                f"Could not read audio: {e}"
             )
 
             print(
@@ -418,68 +567,48 @@ def transcribe_dataset(chunks, video):
 
             continue
 
-        print(
-            "Google Drive upload completed."
-        )
+        # =================================================
+        # CLIP NAME
+        # =================================================
 
-        print(
-            f"Drive File ID: {drive_file_id}"
-        )
+        clip_name = os.path.splitext(
+            os.path.basename(
+                clip
+            )
+        )[0]
 
         # =================================================
-        # SAVE TO DATABASE
+        # SAVE EVERYTHING TO DATABASE
         # =================================================
 
         try:
 
-            clip_name = os.path.basename(
-                clip
-            )
-
-            # ---------------------------------------------
-            # SAVE CLIP METADATA
-            # ---------------------------------------------
-
             save_clip(
 
-                video_id=video["video_id"],
+                clip_id=clip_name,
 
-                clip_name=clip_name,
+                video_id=video[
+                    "video_id"
+                ],
+
+                audio=audio_bytes,
+
+                topic=topic,
+
+                transcription=transcript,
+
+                word_timestamps=(
+                    formatted_word_timestamps
+                ),
 
                 duration=duration
 
             )
 
-            # ---------------------------------------------
-            # SAVE TRANSCRIPT
-            # ---------------------------------------------
-
-            update_clip_transcript(
-
-                clip_name=clip_name,
-
-                transcript=transcript
-
-            )
-
-            # ---------------------------------------------
-            # SAVE GOOGLE DRIVE FILE ID
-            # ---------------------------------------------
-
-            update_clip_drive_file_id(
-
-                clip_name=clip_name,
-
-                drive_file_id=drive_file_id
-
-            )
-
             print(
-                "Clip metadata saved to database."
-            )
-
-            print(
-                f"Drive File ID saved: {drive_file_id}"
+                "Audio + transcript + "
+                "timestamps + topic + duration "
+                "saved to database."
             )
 
         except Exception as e:
@@ -504,8 +633,11 @@ def transcribe_dataset(chunks, video):
             {
                 "clip_name": clip_name,
                 "transcript": transcript,
+                "topic": topic,
                 "duration": duration,
-                "drive_file_id": drive_file_id
+                "word_timestamps": (
+                    word_timestamps
+                )
             }
         )
 
@@ -513,7 +645,9 @@ def transcribe_dataset(chunks, video):
         # DELETE LOCAL TEMPORARY CLIP
         # =================================================
 
-        if os.path.exists(clip):
+        if os.path.exists(
+            clip
+        ):
 
             try:
 

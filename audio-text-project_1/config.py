@@ -16,14 +16,11 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 # =====================================================
 
 SEARCH_QUERIES = [
-
     # Interviews
     "සිංහල සම්මුඛ සාකච්ඡාව",
-  
 
     # Discussions
     "සිංහල සාකච්ඡාව",
-   
 
     # Lectures
     "සිංහල දේශනය",
@@ -31,7 +28,6 @@ SEARCH_QUERIES = [
 
     # Educational
     "සිංහල අධ්‍යාපනික වැඩසටහන",
-    
 
     # Podcasts
     "සිංහල පොඩ්කාස්ට්",
@@ -39,7 +35,6 @@ SEARCH_QUERIES = [
 
     # University
     "සිංහල විශ්වවිද්‍යාල දේශනය",
-    
 
     # News discussions
     "සිංහල ප්‍රවෘත්ති සාකච්ඡාව",
@@ -54,13 +49,9 @@ SEARCH_QUERIES = [
 
     # Science
     "සිංහල විද්‍යාත්මක දේශනය"
-
 ]
 
-
 CHANNEL_IDS = [
-
-   
     "UCGoPNaJqz0fMH7vcGzq_2xw",
 
     # Ada Derana
@@ -69,36 +60,18 @@ CHANNEL_IDS = [
     # Hiru News
     "UCckltLEhFLv8Xz_lQhYfwmg",
 
-    
-
     # Swarnavahini
     "UCaIc6SgS90ud_RgMSC6hW_w",
-
+    
+    "UCS-iMBivVAfN2oPRQaCUhJQ"
+    
 ]
-# Number of search results retrieved
+
 MAX_RESULTS = 25
-
-# Maximum duration (seconds)
-MAX_VIDEO_DURATION = 180
-
-# Number of videos downloaded per pipeline run
+MAX_VIDEO_DURATION = 1200
 VIDEOS_PER_RUN = 1
 
 # =====================================================
 # DATABASE
 # =====================================================
-DATABASE_NAME = r"..\data\videos.db"
-
-
-
-# =====================================================
-# GOOGLE DRIVE API
-# =====================================================
-
-
-
-GOOGLE_DRIVE_FOLDER_ID = (
-    "1t6iLP_VxdtC6xO-jJ9QaNp2ZW4PxR1L-"
-)
-
-GOOGLE_DRIVE_TOKEN = "token.json"
+DATABASE_NAME = r"..\data\inbox\videos.db"

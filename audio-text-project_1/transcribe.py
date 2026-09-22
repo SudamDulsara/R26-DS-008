@@ -6,24 +6,19 @@ import os
 import torch
 import subprocess
 import re
+import traceback
 
 from transformers import pipeline
-
 from corrections import correct_text
 
 
 # =========================================================
-# CONFIG
+# CONFIGURATION
 # =========================================================
 
 os.environ["HF_HOME"] = "E:/huggingface_cache"
 
 device = 0 if torch.cuda.is_available() else -1
-
-
-# =========================================================
-# MODEL
-# =========================================================
 
 model_id = os.path.join(
     "models",
@@ -35,15 +30,13 @@ print(os.path.abspath(model_id))
 
 
 # =========================================================
-# LOAD MODEL
+# HUGGING FACE WHISPER
 # =========================================================
 
 transcriber = pipeline(
     "automatic-speech-recognition",
     model=model_id,
-    device=device,
-    chunk_length_s=15,
-    stride_length_s=5
+    device=device
 )
 
 
@@ -53,19 +46,14 @@ transcriber = pipeline(
 
 def apply_filters(input_path):
 
-    # --------------------------------------------
-    # TEMP FOLDER
-    # --------------------------------------------
+    os.makedirs(
+        "temp",
+        exist_ok=True
+    )
 
-    os.makedirs("temp", exist_ok=True)
-
-    # --------------------------------------------
-    # CREATE TEMP FILE NAME
-    # --------------------------------------------
-
-    filename = os.path.basename(input_path)
-
-    filename = filename.replace(
+    filename = os.path.basename(
+        input_path
+    ).replace(
         ".wav",
         "_filtered.wav"
     )
@@ -76,26 +64,17 @@ def apply_filters(input_path):
     )
 
     command = [
-
         "ffmpeg",
-
         "-y",
-
         "-i",
         input_path,
-
         "-af",
-
         "highpass=f=100,lowpass=f=7000",
-
         "-ar",
         "16000",
-
         "-ac",
         "1",
-
         filtered_path
-
     ]
 
     try:
@@ -111,13 +90,15 @@ def apply_filters(input_path):
 
     except Exception as e:
 
-        print(f"❌ Filter Error: {e}")
+        print(
+            f"❌ Filter Error: {e}"
+        )
 
         return input_path
 
 
 # =========================================================
-# CLEAN TEXT
+# TEXT CLEANING
 # =========================================================
 
 def clean_text(text):
@@ -151,7 +132,146 @@ def clean_text(text):
 
 
 # =========================================================
-# MAIN TRANSCRIPTION FUNCTION
+# WORD CLEANING
+# =========================================================
+
+def clean_timestamp_word(word):
+
+    word = str(
+        word or ""
+    )
+
+    word = re.sub(
+        r"<\|.*?\|>",
+        "",
+        word
+    )
+
+    word = word.replace(
+        "�",
+        ""
+    )
+
+    return word.strip()
+
+
+# =========================================================
+# EXTRACT WORD TIMESTAMPS
+# =========================================================
+
+def extract_word_timestamps(result):
+
+    chunks = result.get(
+        "chunks",
+        []
+    )
+
+    word_timestamps = []
+
+    for chunk in chunks:
+
+        word = clean_timestamp_word(
+            chunk.get(
+                "text",
+                ""
+            )
+        )
+
+        timestamp = chunk.get(
+            "timestamp"
+        )
+
+        if not word:
+            continue
+
+        if not timestamp:
+            continue
+
+        if len(timestamp) != 2:
+            continue
+
+        start, end = timestamp
+
+        if start is None:
+            start = 0.0
+
+        if end is None:
+            continue
+
+        try:
+
+            start = float(start)
+            end = float(end)
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+        if end < start:
+            continue
+
+        word_timestamps.append(
+            {
+                "word": word,
+                "start": round(
+                    start,
+                    3
+                ),
+                "end": round(
+                    end,
+                    3
+                )
+            }
+        )
+
+    return word_timestamps
+
+
+# =========================================================
+# FORMAT WORD TIMESTAMPS
+# =========================================================
+
+def format_word_timestamps(word_timestamps):
+
+    lines = []
+
+    for item in word_timestamps:
+
+        word = item.get(
+            "word",
+            ""
+        ).strip()
+
+        start = item.get(
+            "start"
+        )
+
+        end = item.get(
+            "end"
+        )
+
+        if not word:
+            continue
+
+        if start is None or end is None:
+            continue
+
+        lines.append(
+            f"{word} - "
+            f"{start:.2f}s-"
+            f"{end:.2f}s"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# =========================================================
+# TRANSCRIBE AUDIO
 # =========================================================
 
 def transcribe_audio(file_path):
@@ -160,92 +280,137 @@ def transcribe_audio(file_path):
 
     try:
 
-        # --------------------------------------------
-        # CHECK FILE
-        # --------------------------------------------
+        # -------------------------------------------------
+        # Check input
+        # -------------------------------------------------
 
-        if not os.path.exists(file_path):
+        if not os.path.exists(
+            file_path
+        ):
 
             print(
                 f"❌ Audio file not found: {file_path}"
             )
 
-            return ""
+            return None
 
-        # --------------------------------------------
-        # APPLY FILTERS
-        # --------------------------------------------
+        # -------------------------------------------------
+        # Apply audio filtering
+        # -------------------------------------------------
 
         clean_file = apply_filters(
             file_path
         )
 
-        # --------------------------------------------
-        # TRANSCRIBE WITH V2
-        # --------------------------------------------
+        # -------------------------------------------------
+        # HUGGING FACE WHISPER
+        # WORD-LEVEL TIMESTAMPS
+        # -------------------------------------------------
 
-        result = transcriber(
-
-            clean_file,
-
-            generate_kwargs={
-
-                "language": "si",
-
-                "task": "transcribe",
-
-                "do_sample": False
-
-            }
-
+        print(
+            "\n🔍 Generating transcript with word timestamps..."
         )
 
-        text = result["text"]
+        try:
 
-        # --------------------------------------------
-        # CLEAN TEXT
-        # --------------------------------------------
+            result = transcriber(
+                clean_file,
+                return_timestamps="word",
+                generate_kwargs={
+                    "language": "si",
+                    "task": "transcribe",
+                    "eos_token_id": 50257
+                }
+            )
 
-        text = clean_text(
-            text
+        except Exception:
+
+            print(
+                "\n❌ FULL HUGGING FACE ERROR:"
+            )
+
+            print(
+                "=" * 70
+            )
+
+            traceback.print_exc()
+
+            print(
+                "=" * 70
+            )
+
+            raise
+
+        # -------------------------------------------------
+        # Get transcript
+        # -------------------------------------------------
+
+        raw_text = result.get(
+            "text",
+            ""
         )
 
-        # --------------------------------------------
-        # CORRECT TEXT
-        # --------------------------------------------
+        raw_text = clean_text(
+            raw_text
+        )
+
+        # -------------------------------------------------
+        # Get word timestamps
+        # -------------------------------------------------
+
+        word_timestamps = extract_word_timestamps(
+            result
+        )
+
+        if not word_timestamps:
+
+            raise RuntimeError(
+                "Whisper did not return word-level timestamps."
+            )
+
+        # -------------------------------------------------
+        # Existing correction system
+        # -------------------------------------------------
 
         text = correct_text(
-            text
+            raw_text
         )
 
-        # --------------------------------------------
-        # DELETE TEMP FILTERED FILE
-        # --------------------------------------------
+        # -------------------------------------------------
+        # Remove temporary filtered file
+        # -------------------------------------------------
 
         if (
             clean_file != file_path
-            and os.path.exists(clean_file)
+            and os.path.exists(
+                clean_file
+            )
         ):
 
             os.remove(
                 clean_file
             )
 
-        return text
+        # -------------------------------------------------
+        # Return result
+        # -------------------------------------------------
+
+        return {
+            "text": text,
+            "word_timestamps": word_timestamps
+        }
 
     except Exception as e:
 
         print(
-            f"❌ Transcription Error: {e}"
+            f"\n❌ Transcription Error: {e}"
         )
-
-        # --------------------------------------------
-        # CLEAN TEMP FILE AFTER ERROR
-        # --------------------------------------------
 
         if (
             clean_file != file_path
-            and os.path.exists(clean_file)
+            and os.path.exists(
+                clean_file
+            )
         ):
 
             try:
@@ -255,13 +420,14 @@ def transcribe_audio(file_path):
                 )
 
             except Exception:
+
                 pass
 
-        return ""
+        return None
 
 
 # =========================================================
-# CLI TEST
+# TEST MODE
 # =========================================================
 
 if __name__ == "__main__":
@@ -279,12 +445,44 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print("\n⏳ Transcribing...")
-    print("-" * 40)
+    print(
+        "\n⏳ Transcribing..."
+    )
+
+    print(
+        "-" * 40
+    )
 
     output = transcribe_audio(
         args.input
     )
 
-    print("\n✅ FINAL OUTPUT:")
-    print(output)
+    print(
+        "\n✅ FINAL OUTPUT:"
+    )
+
+    if output:
+
+        print(
+            "\nTranscript:"
+        )
+
+        print(
+            output["text"]
+        )
+
+        print(
+            "\nWord timestamps:"
+        )
+
+        print(
+            format_word_timestamps(
+                output["word_timestamps"]
+            )
+        )
+
+    else:
+
+        print(
+            "❌ Transcription failed."
+        )
