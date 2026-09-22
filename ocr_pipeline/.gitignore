@@ -59,6 +59,10 @@ data/acts1010/
 # Pipeline B: scanned Act PDFs in, generated pairs out. Both regenerable —
 # the PDFs by re-downloading, the pairs by re-running the pipeline.
 data/inbox/
+# Acts the model never saw in training -- input to the real
+# generation run, kept apart from data/inbox/ which is the set the
+# training pairs were built from.
+data/unseen_acts/
 data/generated/
 
 # Fine-tuned LoRA adapter downloaded from Kaggle
@@ -109,3 +113,5 @@ desktop.ini
 *~
 
 CLAUDE.md
+# Trained models -- 1.2 GB, must never enter git
+models/

@@ -7,7 +7,7 @@ Harvests the Sinhala Government Gazette and turns each issue into
     python build_gazette_pairs.py --weeks 8      # last 8 issues
     python build_gazette_pairs.py --latest       # just this week's
 
-Output : data/training/gazette_pairs.jsonl
+Output : data/_synthetic_degradation/training/gazette_pairs.jsonl
 Resume : safe to interrupt; already-processed issues are skipped
 
 
@@ -72,8 +72,8 @@ import pytesseract
 
 from pipeline.normalize import normalize
 
-OUT_PATH = os.path.join("data", "training", "gazette_pairs.jsonl")
-PDF_CACHE = os.path.join("data", "gazette_pdfs")
+OUT_PATH = os.path.join("data", "_synthetic_degradation", "training", "gazette_pairs.jsonl")
+PDF_CACHE = os.path.join("data", "_synthetic_degradation", "gazette_pdfs")
 
 URL_TEMPLATE = "https://www.gazette.lk/dl/Gazette/{mm}/Gazette-{yyyy}-{mm}-{dd}-Sii.pdf"
 

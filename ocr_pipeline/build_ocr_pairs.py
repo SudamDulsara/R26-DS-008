@@ -9,7 +9,7 @@ labelling, no guessing.
 
     python build_ocr_pairs.py
 
-Output : data/training/ocr_pairs.jsonl  (one JSON record per line)
+Output : data/_synthetic_degradation/training/ocr_pairs.jsonl  (one JSON record per line)
 Runtime: ~35 minutes for all 6,969 images (~0.29s each)
 
 Safe to interrupt and re-run — it resumes from wherever it stopped.
@@ -44,7 +44,7 @@ from jiwer import cer
 from pipeline.normalize import normalize
 
 DATASET  = "Ransaka/sinhala_synthetic_ocr-large"
-OUT_PATH = os.path.join("data", "training", "ocr_pairs.jsonl")
+OUT_PATH = os.path.join("data", "_synthetic_degradation", "training", "ocr_pairs.jsonl")
 
 # Same configuration as pipeline/ocr_engine.py, so the error distribution
 # measured here matches what the live pipeline produces.

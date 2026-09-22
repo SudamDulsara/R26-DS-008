@@ -39,6 +39,8 @@ measurement on 202 human-transcribed pages that this pipeline never touches.
 
 import argparse
 import os
+import re
+import subprocess
 import sys
 import time
 import uuid
@@ -68,8 +70,47 @@ LENGTH_RATIO_LOW = 0.60
 LENGTH_RATIO_HIGH = 1.60
 
 
+#: Sinhala legal text is dense with numbers that ARE the content -- Act
+#: numbers, years, section and subsection references. The ByT5 corrector was
+#: trained on lines whose leading token is nearly always a clause marker
+#: ("(1)", "(අ)"), and years at the start of a line were rare, so it rewrites
+#: one into the other: "1984 අංක 69 දරන" comes back as "(1) අංක 69 දරන".
+#: Measured at 30% of changed lines on the first two pages generated.
+#:
+#: Every other guard here is blind to it. The length is right, the script is
+#: right, there is no markup and no repetition loop -- the page scores
+#: flags: (none) while its numbers are being quietly rewritten. Of the
+#: failure modes seen on this project that is the dangerous shape: LightOnOCR
+#: emitting Kannada is obvious, this is not.
+#:
+#: The project rule is that when correction makes something worse, the row is
+#: flagged and the rate reported per run. This is the flag; main() prints the
+#: rate.
+_DIGITS = re.compile("[0-9]+")
+
+
+def digit_line_stats(raw: str, corrected: str) -> tuple:
+    """
+    Return (lines_changed, lines_whose_digits_changed).
+
+    Compared by position, which is exact here and only here: the corrector
+    works line by line and puts the page back together with the same line
+    breaks, so the two sides cannot drift. Page-level comparison between two
+    different readers needs real sequence alignment -- see build_line_pairs.py
+    -- because there the line counts disagree.
+    """
+    changed = digits = 0
+    for a, b in zip(raw.split("\n"), corrected.split("\n")):
+        if not a.strip() or a == b:
+            continue
+        changed += 1
+        if _DIGITS.findall(a) != _DIGITS.findall(b):
+            digits += 1
+    return changed, digits
+
+
 def quality_flags(raw: str, corrected: str, corrector_name: str,
-                  hit_cap: bool) -> list:
+                  hit_cap: bool, page_num: int = 0) -> list:
     """
     Cheap checks that a row is worth publishing.
 
@@ -86,10 +127,23 @@ def quality_flags(raw: str, corrected: str, corrector_name: str,
     if corrector_name == "passthrough":
         flags.append("no_corrector")
 
+    # Page 1 of an Act is a cover page -- coat of arms, centred title, date,
+    # printing notice. Nothing in the training data looks like it, so both
+    # correctors misbehave there and in different ways: LightOnOCR returned
+    # Kannada wrapped in HTML, ByT5 rewrites the year into a clause marker.
+    # Flagging is the right response to input a model was never taught, and
+    # it lets anyone using the dataset drop these rows in one filter.
+    if page_num == 1:
+        flags.append("cover_page")
+
     if not raw.strip():
         flags.append("empty_raw")
     if not corrected.strip():
         flags.append("empty_corrected")
+
+    _, digits_changed = digit_line_stats(raw, corrected)
+    if digits_changed:
+        flags.append("digits_changed")
 
     if hit_cap:
         # The model ran out of room mid-page. The corrected side is a
@@ -244,7 +298,18 @@ def open_store(args) -> Store:
 
 
 def run(args) -> int:
-    import fitz          # pymupdf; imported late so --status needs no deps
+    # PyMuPDF, imported late so --status needs no deps.
+    #
+    # The package renamed its module from `fitz` to `pymupdf`. Recent
+    # versions still ship `fitz` but print a deprecation warning, and newer
+    # ones drop it entirely -- which is what a fresh `pip install pymupdf`
+    # gets you on Kaggle, where this failed with ModuleNotFoundError while
+    # the local venv (an older build) was fine. Try the new name first so
+    # this works on both.
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
 
     store = open_store(args)
     pdfs = iter_pdfs(args.input)
@@ -256,7 +321,8 @@ def run(args) -> int:
     print(f"input      : {args.input}")
     print(f"documents  : {len(pdfs)}")
     print(f"corrector  : {args.corrector}"
-          + (f" (adapter: {args.adapter})" if args.adapter else ""))
+          + (f" (adapter: {args.adapter})" if args.adapter else "")
+          + (f" (model: {args.model})" if args.model else ""))
     print(f"output     : {store.jsonl_path}")
     print(f"             {store.db_path}")
 
@@ -266,6 +332,7 @@ def run(args) -> int:
     corrector = build_corrector(
         args.corrector,
         adapter_dir=args.adapter,
+        model_dir=args.model,
         max_image_edge=args.image_edge,
     ) if args.corrector != "none" else build_corrector("none")
 
@@ -274,6 +341,7 @@ def run(args) -> int:
     print(f"run id     : {run_id}\n")
 
     written = skipped = flagged = 0
+    run_lines_changed = run_lines_digits = 0
     rejected = rejected_pages = 0
     interrupted = False
     started = time.time()
@@ -333,7 +401,11 @@ def run(args) -> int:
                     corrected, corr_s = corrector.read(image, raw_text=raw)
                     hit_cap = getattr(corrector, "hit_cap", False)
 
-                    flags = quality_flags(raw, corrected, corrector.name, hit_cap)
+                    flags = quality_flags(raw, corrected, corrector.name,
+                                          hit_cap, page_num)
+                    n_chg, n_dig = digit_line_stats(raw, corrected)
+                    run_lines_changed += n_chg
+                    run_lines_digits += n_dig
                     ratio = (len(corrected) / len(raw)) if raw else None
 
                     ok = store.save_pair({
@@ -376,12 +448,87 @@ def run(args) -> int:
               f"-- born-digital, not scans")
     print(f"  pages flagged  : {flagged}"
           + (f"   ({100 * flagged / written:.0f}% of written)" if written else ""))
+    # The project rule is that a line is never truncated silently -- skip,
+    # split or flag, and log every occurrence. ByT5Corrector passes overlong
+    # lines through untouched; this is where that gets reported. A large
+    # number means the byte window is wrong for this corpus.
+    # The rate the project rule asks for. It is a proxy, not an error count:
+    # some of these are the corrector FIXING a number (4989 -> 1989 was one).
+    # It says how much of the numeric content the corrector touched, which is
+    # what a reader of the dataset needs in order to trust it or not.
+    if run_lines_changed:
+        print(f"  digits altered : {run_lines_digits} of "
+              f"{run_lines_changed} corrected lines "
+              f"({100 * run_lines_digits / run_lines_changed:.0f}%)")
+
+    too_long = getattr(corrector, "lines_too_long", 0)
+    if getattr(corrector, "lines_seen", 0):
+        print(f"  lines corrected: {corrector.lines_changed}"
+              f" of {corrector.lines_seen}")
+        print(f"  lines too long : {too_long}   "
+              "(passed through uncorrected, never truncated)")
     print(f"  elapsed        : {elapsed / 60:.1f} min")
     if written:
         print(f"  per page       : {elapsed / written:.1f}s")
 
+    if written and not args.no_lines:
+        derive_line_pairs(store)
+
     show_status(store)
     return 0
+
+
+def derive_line_pairs(store) -> None:
+    """
+    Turn the page pairs just written into aligned line pairs.
+
+    Pages are the primary record: they are exactly what the two readers
+    produced, and they need no alignment to exist. Lines are DERIVED from
+    them, and derived fresh each time rather than appended to, so the line
+    file always describes whatever the page database currently holds. Stop a
+    run at 40 pages and finish it tomorrow, and the lines regenerate to cover
+    all of them.
+
+    Run as a separate process on purpose. By the time this is called every
+    page is already safely on disk, so nothing here can put the dataset at
+    risk -- and isolating it means a failure in alignment costs a convenience
+    file rather than the run. build_line_pairs.py only ever READS the page
+    database; it writes to its own file.
+    """
+    script = os.path.join(HERE, "build_line_pairs.py")
+    if not os.path.exists(script):
+        return
+
+    lines_db = os.path.splitext(store.db_path)[0] + "_lines.db"
+    lines_jsonl = os.path.join(os.path.dirname(store.jsonl_path),
+                               "line_pairs.jsonl")
+
+    print(f"\nderiving line pairs -> {lines_db}")
+    try:
+        proc = subprocess.run(
+            [sys.executable, script,
+             "--db", store.db_path,
+             "--out", lines_jsonl,
+             "--sqlite", lines_db],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as exc:                     # noqa: BLE001
+        print(f"  skipped: {type(exc).__name__}: {exc}")
+        print("  the page pairs are unaffected -- run build_line_pairs.py "
+              "by hand if you want them")
+        return
+
+    if proc.returncode != 0:
+        print("  FAILED -- the page pairs are unaffected")
+        for line in (proc.stderr or "").strip().splitlines()[-4:]:
+            print("   ", line)
+        return
+
+    for line in (proc.stdout or "").splitlines():
+        t = line.strip()
+        if t.startswith(("aligned pairs", "match rate", "identical pairs")):
+            print("  " + t)
 
 
 def show_status(store: Store = None):
@@ -409,19 +556,26 @@ def main():
     )
     p.add_argument("--input", default=DEFAULT_INBOX,
                    help="folder of PDFs to process (searched recursively)")
-    p.add_argument("--corrector", default="none", choices=["none", "lighton"],
+    p.add_argument("--corrector", default="none",
+                   choices=["none", "lighton", "byt5"],
                    help="'none' runs Tesseract only and flags every row "
                         "no_corrector; use it to test the pipeline without a GPU")
     p.add_argument("--adapter", default=None,
                    help="LoRA folder from train_lighton_ocr.py. Omit to use the "
                         "untuned base model -- useful for measurement, but the "
                         "thesis ships the fine-tune")
+    p.add_argument("--model", default=None,
+                   help="folder holding the trained ByT5 (config.json + "
+                        "model.safetensors). Required by --corrector byt5")
     p.add_argument("--image-edge", type=int, default=1536,
                    help="longest image edge given to the corrector; must match "
                         "what it was fine-tuned at")
     p.add_argument("--lang", default="sin", help="Tesseract language")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N pages this run (0 = no limit)")
+    p.add_argument("--no-lines", action="store_true",
+                   help="skip deriving the line-level database at the end of "
+                        "the run; pages are written either way")
     p.add_argument("--note", default=None, help="free text stored with the run")
     p.add_argument("--allow-digital", action="store_true",
                    help="process born-digital PDFs too. OFF by default: OCRing "
