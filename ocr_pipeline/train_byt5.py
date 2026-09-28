@@ -159,7 +159,10 @@ def find_data_files():
 
 
 TRAIN_FILES, EVAL_FILES = find_data_files()
-OUTPUT_DIR = "byt5-sinhala-ocr"
+# v2 deliberately, NOT the name the running model uses. If this run comes
+# out worse than v1 -- more data does not always help -- the model Pipeline
+# B is using must still be there to fall back to.
+OUTPUT_DIR = "byt5-sinhala-ocr-v2"
 
 if not TRAIN_FILES:
     sys.exit("No .jsonl training files found. On Kaggle: right panel -> Add Input.")
@@ -563,12 +566,37 @@ def evaluate_on_test_set(paths):
     # belongs in the thesis regardless of which way the average goes.
     worse = sum(m > b for m, b in zip(cer_model, cer_raw))
 
+    # SPLIT BY ERA. A single mean hides the thing most worth knowing about
+    # this corpus. Tesseract is 2.4x worse on 1980s scans (0.1650) than on
+    # 2000s print (0.0688), and the LightOnOCR fine-tune on this project
+    # improved the old era by 61% while making modern print 20% WORSE -- an
+    # inversion the overall average completely concealed until it was split.
+    # Whatever this model does, report both halves.
+    eras = {}
+    for r, b, m in zip(rows, cer_raw, cer_model):
+        try:
+            y = int(r.get("year", 0))
+        except (TypeError, ValueError):
+            continue
+        if not y:
+            continue
+        k = ("1981-1989" if y < 1990 else
+             "1990-1999" if y < 2000 else "2000-2019")
+        eras.setdefault(k, []).append((b, m))
+    era_rows = {
+        k: {"pages": len(v),
+            "tesseract": float(np.mean([b for b, _ in v])),
+            "model": float(np.mean([m for _, m in v]))}
+        for k, v in sorted(eras.items())
+    }
+
     return {
         "n": len(rows),
         "tesseract": float(np.mean(cer_raw)),
         "model": float(np.mean(cer_model)),
         "model_wer": float(np.mean([wer(r["gold"], p) for r, p in zip(rows, preds)])),
         "worse": worse,
+        "eras": era_rows,
     }
 
 
@@ -602,6 +630,16 @@ else:
     if abs(result["tesseract"] - TESSERACT_BASELINE) > 0.005:
         print(f"  note: measured baseline differs from the recorded "
               f"{TESSERACT_BASELINE:.4f} — the test set has changed.")
+
+    if result.get("eras"):
+        print("\nBY ERA — where the gain actually comes from:")
+        print(f"  {'era':<12} {'pages':>6} {'tesseract':>10} {'model':>8} {'change':>9}")
+        for era, v in result["eras"].items():
+            d = 100 * (v["tesseract"] - v["model"]) / v["tesseract"] if v["tesseract"] else 0
+            print(f"  {era:<12} {v['pages']:>6} {v['tesseract']:>10.4f} "
+                  f"{v['model']:>8.4f} {d:>8.1f}%")
+        print("  A negative change means the model is worse than Tesseract on")
+        print("  that era. That is a finding, not a failure -- report it.")
 
     if result["model"] < result["tesseract"]:
         drop = 100 * (result["tesseract"] - result["model"]) / result["tesseract"]
