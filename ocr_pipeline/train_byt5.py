@@ -399,7 +399,9 @@ CHECK_EVERY = max(10, _TOTAL_STEPS // 8)
 
 print(f"\nschedule: {_TOTAL_STEPS} steps over {EPOCHS} epoch(s) "
       f"({_STEPS_PER_EPOCH}/epoch), warmup {WARMUP_STEPS} "
-      f"({100 * WARMUP_STEPS / _TOTAL_STEPS:.0f}%), evaluating every {CHECK_EVERY}")
+      f"({100 * WARMUP_STEPS / _TOTAL_STEPS:.0f}%), "
+      + (f"evaluating every {CHECK_EVERY}" if EPOCHS > 1 else
+         "no mid-training evaluation (single epoch)"))
 
 args = Seq2SeqTrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -415,15 +417,28 @@ args = Seq2SeqTrainingArguments(
     # single largest saving available and it is what makes this fit.
     gradient_checkpointing=True,
 
-    eval_strategy="steps",
-    eval_steps=CHECK_EVERY,
-    save_strategy="steps",
-    save_steps=CHECK_EVERY,
-    save_total_limit=2,
+    # MID-TRAINING EVALUATION IS OFF FOR A SINGLE-EPOCH RUN, and that is a
+    # measured decision rather than a preference.
+    #
+    # The 2026-09-29 run on 37,016 pairs was killed by Kaggle's 12-hour cap
+    # having reached step 432 of 1157 in 5h 49m. Training itself accounted
+    # for about 31 minutes of that at 4.34s/step; the rest went on eight
+    # validation passes, eight 1.2 GB checkpoint writes, and two stalls the
+    # log shows plainly -- one step reported 2,746s/it, another produced no
+    # output for 1h 40m. The overhead was roughly ten times the training.
+    #
+    # Checkpoint selection exists to catch overfitting, which needs more than
+    # one pass over the data. At EPOCHS=1 the model sees each pair once, so
+    # the last checkpoint IS the best one and there is nothing to choose
+    # between. Above one epoch that stops being true, hence the condition.
+    eval_strategy="steps" if EPOCHS > 1 else "no",
+    save_strategy="steps" if EPOCHS > 1 else "no",
+    **({"eval_steps": CHECK_EVERY, "save_steps": CHECK_EVERY,
+        "save_total_limit": 2} if EPOCHS > 1 else {}),
 
     # Keep whichever checkpoint scored best, not whichever came last —
     # training loss keeps falling after real quality starts degrading.
-    load_best_model_at_end=True,
+    load_best_model_at_end=EPOCHS > 1,
     metric_for_best_model="cer",
     greater_is_better=False,
 
