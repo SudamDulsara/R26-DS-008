@@ -77,12 +77,14 @@ CREATE TABLE line_scores (
     PRIMARY KEY (source_file, page_num, line_num)
 );
 DROP VIEW IF EXISTS scored;
+-- `improved` and `reference` stay in line_scores -- the run summary counts
+-- one and the other records where the reference came from -- but neither
+-- belongs in the browsing view, which is for reading the comparison itself.
 CREATE VIEW scored AS
     SELECT p.source_file, p.page_num, p.line_num,
            p.raw, p.corrected, s.ref_text,
            ROUND(s.cer_raw, 4)       AS cer_raw,
-           ROUND(s.cer_corrected, 4) AS cer_corrected,
-           s.improved, s.reference
+           ROUND(s.cer_corrected, 4) AS cer_corrected
     FROM line_pairs p
     JOIN line_scores s
       ON p.source_file = s.source_file
