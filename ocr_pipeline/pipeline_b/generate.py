@@ -471,7 +471,10 @@ def run(args) -> int:
     if written:
         print(f"  per page       : {elapsed / written:.1f}s")
 
-    if written and not args.no_lines:
+    # Not in Tesseract-only mode. Every row is flagged no_corrector there, so
+    # build_line_pairs drops all of them and exits 1 -- correct behaviour that
+    # would print "FAILED" in the middle of a demo and look like a defect.
+    if written and not args.no_lines and args.corrector != "none":
         derive_line_pairs(store)
 
     show_status(store)
@@ -585,6 +588,16 @@ def main():
                    help="write the database and JSONL somewhere other than "
                         "data/ . Use a scratch folder to trial a corrector "
                         "without touching the real dataset")
+    p.add_argument("--fetch", type=int, default=0, metavar="N",
+                   help="download up to N new Acts from documents.gov.lk "
+                        "before each pass AND KEEP RUNNING. Without this the "
+                        "pipeline processes the folder once and exits")
+    p.add_argument("--interval", type=int, default=1800, metavar="SECS",
+                   help="seconds to wait between passes when --fetch is on "
+                        "(default 1800)")
+    p.add_argument("--cycles", type=int, default=0, metavar="N",
+                   help="stop after N passes instead of running forever. For "
+                        "demonstrating the loop without leaving it running")
     p.add_argument("--status", action="store_true",
                    help="print what has been generated so far and exit")
     args = p.parse_args()
@@ -592,7 +605,56 @@ def main():
     if args.status:
         show_status(open_store(args))
         return 0
-    return run(args)
+
+    if not args.fetch:
+        return run(args)
+
+    # CONTINUOUS MODE. Fetch, process, wait, repeat.
+    #
+    # Everything that makes one pass safe makes the loop safe: a page already
+    # in the database is skipped, doc_id is a hash of the file's bytes so a
+    # re-downloaded PDF is recognised as the same document, and the database
+    # row is written before the JSONL line. So a cycle that dies halfway costs
+    # the remainder of that cycle and nothing else.
+    #
+    # The fetch is deliberately inside the loop rather than a separate
+    # script. The pipeline's claim is that it keeps producing pairs without
+    # supervision; splitting the feeder out would mean two things to start and
+    # a claim that depends on someone remembering to run both.
+    from pipeline_b import fetch as feeder
+
+    cycle = 0
+    print(f"continuous mode: up to {args.fetch} new Acts per pass, "
+          f"{args.interval}s between passes"
+          + (f", stopping after {args.cycles}" if args.cycles else
+             ", Ctrl+C to stop"))
+    try:
+        while True:
+            cycle += 1
+            print(f"\n{'=' * 58}\npass {cycle}  "
+                  f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 58}")
+            got, held, failed = feeder.fetch_new(
+                args.input, args.fetch, HERE)
+            if got or failed:
+                print(f"  [feeder] {got} downloaded, {failed} failed, "
+                      f"{held} held back as training documents")
+
+            rc = run(args)
+            if rc != 0:
+                print(f"pass {cycle} returned {rc}; stopping")
+                return rc
+
+            if args.cycles and cycle >= args.cycles:
+                print(f"\nstopped after {cycle} pass(es) as asked")
+                return 0
+
+            print(f"\nwaiting {args.interval}s for the next pass "
+                  "(Ctrl+C to stop)")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"\n\nstopped after {cycle} pass(es). "
+              "Everything written is safe; run again to carry on.")
+        return 0
 
 
 if __name__ == "__main__":
