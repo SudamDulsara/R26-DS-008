@@ -46,13 +46,14 @@ API_ENDPOINT = "http://gvp-api:4500/website-data/act/get-all"
 
 UA = "Mozilla/5.0"
 
-#: Acts whose pages trained a corrector used in this pipeline. Generating
-#: pairs from them would be asking the model to correct text it was fitted
-#: on, which flatters the output and is invisible in the result. The
-#: SinhaLegal set is read from its cache; these seven are v1's training
-#: documents, which predate it.
-V1_TRAINING = {(2, 1982), (4, 1982), (6, 1982), (7, 1982),
-               (75, 1981), (76, 1981), (78, 1981)}
+#: Acts held back from fetching are read from the SinhaLegal cache -- see
+#: _trained_on(). Nothing is hard-coded here any more.
+#:
+#: Seven Acts used to be listed: 2, 4, 6 and 7 of 1982 and 75, 76 and 78 of
+#: 1981, which trained the retired v1 corrector. The current corrector was
+#: trained on SinhaLegal and never saw them, so holding them back was denying
+#: the pipeline seven documents it is free to read. Removed when v1 was
+#: deleted on 2026-09-30.
 
 
 def _get(url, timeout=90):
@@ -106,7 +107,7 @@ def _trained_on(repo_root):
     contributed nothing. Holding those back would deny the pipeline input it
     is free to take, so the row count decides, not the filename.
     """
-    used = set(V1_TRAINING)
+    used = set()
     cache = os.path.join(repo_root, "data", "sinhalegal", "_cache")
     if os.path.isdir(cache):
         for name in os.listdir(cache):
