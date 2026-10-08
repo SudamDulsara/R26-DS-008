@@ -26,6 +26,24 @@ gives nothing away:
     this stops working. That is a real fragility and the reason the folder,
     not this file, remains Pipeline B's interface: when this breaks, the
     pipeline keeps running on whatever a person puts in the folder.
+
+THE FRAGILITY IS NOT HYPOTHETICAL. It happened on 2026-10-08, eight days
+after this file was written: the site was redeployed, the old action id
+started returning 404 "Server action not found", and the feeder stopped
+finding anything. Everything else kept working -- the site served 200, the
+file proxy still returned PDFs by path, and the pipeline still ran on the
+folder. Only *discovery* broke.
+
+Recovering it took one pass: fetch /web/acts, read the script chunks it
+names, and look for the 40-hex action ids in whichever chunk mentions
+"website-data/act/get-all". Two candidates appeared and the listing one
+answered 200 with 1,736 Acts; the other answered 500. If the feeder goes
+quiet again, repeat that -- and expect to, because an undocumented action
+id is not a contract.
+
+Rotation log:
+    2026-09-28  7f679bcdf1c679caa0f2356b97387098c39c41312a  1,733 Acts
+    2026-10-08  40f4893d604b59b307fb0473d42e9ac093be1e1655  1,736 Acts
 """
 
 import io
@@ -40,8 +58,9 @@ ACTS_PAGE = BASE + "/web/acts"
 FILE_PROXY = BASE + "/api/content-file-proxy?file=/"
 
 #: The server action behind the Acts listing. Lifted from the page's own
-#: JavaScript bundle, where it is registered as "TableDataAction".
-ACTION_ID = "7f679bcdf1c679caa0f2356b97387098c39c41312a"
+#: JavaScript bundle, where it is registered as "TableDataAction". Rotates
+#: whenever the site is redeployed -- see the rotation log in the docstring.
+ACTION_ID = "40f4893d604b59b307fb0473d42e9ac093be1e1655"
 API_ENDPOINT = "http://gvp-api:4500/website-data/act/get-all"
 
 UA = "Mozilla/5.0"
@@ -69,7 +88,8 @@ def catalogue(cache_path, max_age_hours=24):
     re-fetching it on every cycle would be rude to a government server for no
     benefit.
     """
-    fresh = (os.path.exists(cache_path)
+    have_cache = os.path.exists(cache_path)
+    fresh = (have_cache
              and time.time() - os.path.getmtime(cache_path) < max_age_hours * 3600)
     if not fresh:
         body = json.dumps([{
@@ -82,9 +102,29 @@ def catalogue(cache_path, max_age_hours=24):
                      "Content-Type": "text/plain;charset=UTF-8",
                      "Referer": ACTS_PAGE},
         )
-        raw = urllib.request.urlopen(req, timeout=120).read().decode("utf-8")
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        io.open(cache_path, "w", encoding="utf-8").write(raw)
+        try:
+            raw = urllib.request.urlopen(req, timeout=120).read().decode("utf-8")
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            io.open(cache_path, "w", encoding="utf-8").write(raw)
+        except Exception as exc:                              # noqa: BLE001
+            # A FAILED REFRESH MUST NOT COST US THE LISTING WE ALREADY HAVE.
+            # The Act list changes a few times a year, so a cache from last
+            # week is worth far more than an exception. Before this, one
+            # rotated action id took the whole feeder down even though a
+            # perfectly usable listing was sitting on disk.
+            code = getattr(exc, "code", None)
+            if code == 404:
+                print("  [feeder] the site's server action id has rotated "
+                      "again (404 'Server action not found').")
+                print("  [feeder] re-extract it: fetch /web/acts, read the "
+                      "/_next/static/chunks/*.js it names, and take the "
+                      "40-hex id from the chunk mentioning "
+                      "'website-data/act/get-all'. See this file's docstring.")
+            if not have_cache:
+                raise
+            age = (time.time() - os.path.getmtime(cache_path)) / 86400
+            print(f"  [feeder] refresh failed ({type(exc).__name__}); using "
+                  f"the cached listing from {age:.0f} days ago.")
 
     raw = io.open(cache_path, encoding="utf-8").read()
     line = next(l for l in raw.split("\n") if l.startswith("1:"))
