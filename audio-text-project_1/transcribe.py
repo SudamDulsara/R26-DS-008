@@ -27,7 +27,8 @@ device = 0 if torch.cuda.is_available() else -1
 
 model_id = os.path.join(
     "models",
-    "final_whisper_sinhala_v2"
+    "final_whisper_sinhala_v2",
+    "checkpoint-72"
 )
 
 print("Using fine-tuned Whisper V2:")

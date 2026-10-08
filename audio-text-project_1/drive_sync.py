@@ -13,6 +13,10 @@ from config import (
     GOOGLE_DRIVE_TOKEN
 )
 
+from network_utils import force_ipv4
+
+force_ipv4()
+
 
 # =====================================================
 # GOOGLE DRIVE SETTINGS
