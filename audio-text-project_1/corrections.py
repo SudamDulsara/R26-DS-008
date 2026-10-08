@@ -136,10 +136,13 @@ COMMON_CORRECTIONS = {
     # MIXED LANGUAGE NORMALIZATION
     # -------------------------------------------------
 
-    "ඇන්ඩ්රොයිඩ්": "Android",
-    "ඇන්ඩ්‍රොයිඩ්": "Android",
-    "මැගසින්ස්": "Magazines",
-    "මැගසීන්ස්": "Magazines",
+    # Keep these in Sinhala script.  The dataset is intended
+    # to contain Sinhala speech/text, so English spellings are
+    # not introduced by the correction stage.
+    "ඇන්ඩ්රොයිඩ්": "ඇන්ඩ්රොයිඩ්",
+    "ඇන්ඩ්‍රොයිඩ්": "ඇන්ඩ්‍රොයිඩ්",
+    "මැගසින්ස්": "මැගසින්ස්",
+    "මැගසීන්ස්": "මැගසීන්ස්",
 
     # -------------------------------------------------
     # SPACE NORMALIZATION
@@ -407,20 +410,21 @@ def normalize_suffixes(word):
 
 def normalize_english_terms(word):
 
-    english_map = {
+    # -------------------------------------------------
+    # PURE-SINHALA DATASET POLICY
+    # -------------------------------------------------
+    #
+    # Earlier versions converted English terms such as
+    # "youtube" -> "YouTube".  That is unsuitable for the
+    # Sinhala audio-text dataset because it preserves English
+    # content instead of filtering it.
+    #
+    # English content is now rejected by the validation stage.
+    # This function therefore never introduces English text.
+    # -------------------------------------------------
 
-        "android": "Android",
-        "magazines": "Magazines",
-        "youtube": "YouTube",
-        "facebook": "Facebook"
-    }
+    return word
 
-    lower = word.lower()
-
-    return english_map.get(
-        lower,
-        word
-    )
 
 # =====================================================
 # APPLY WORD CORRECTIONS
@@ -467,6 +471,145 @@ def apply_dictionary_corrections(text):
         )
 
     return " ".join(corrected_words)
+
+# =====================================================
+# SINHALA QUALITY / ENGLISH DETECTION
+# =====================================================
+
+def get_sinhala_quality(text):
+    """
+    Return Sinhala/English statistics for quality control.
+
+    The dataset policy is intentionally strict: English words
+    are treated as mixed-language noise rather than being
+    deleted from an otherwise valid sentence.
+    """
+
+    if not text:
+        return {
+            "sinhala_ratio": 0.0,
+            "english_ratio": 0.0,
+            "english_tokens": [],
+            "sinhala_chars": 0,
+            "english_chars": 0,
+            "other_letter_chars": 0,
+            "letter_chars": 0,
+        }
+
+    sinhala_chars = len(
+        re.findall(r"[\u0D80-\u0DFF]", text)
+    )
+
+    english_chars = len(
+        re.findall(r"[A-Za-z]", text)
+    )
+
+    other_letter_chars = 0
+
+    for char in text:
+        if not unicodedata.category(char).startswith("L"):
+            continue
+
+        if re.match(r"[\u0D80-\u0DFF]", char):
+            continue
+
+        if re.match(r"[A-Za-z]", char):
+            continue
+
+        other_letter_chars += 1
+
+    letter_chars = (
+        sinhala_chars
+        + english_chars
+        + other_letter_chars
+    )
+
+    english_tokens = re.findall(
+        r"(?<![A-Za-z])[A-Za-z]+(?:'[A-Za-z]+)?(?![A-Za-z])",
+        text
+    )
+
+    if letter_chars == 0:
+        sinhala_ratio = 0.0
+        english_ratio = 0.0
+    else:
+        sinhala_ratio = sinhala_chars / letter_chars
+        english_ratio = english_chars / letter_chars
+
+    return {
+        "sinhala_ratio": sinhala_ratio,
+        "english_ratio": english_ratio,
+        "english_tokens": english_tokens,
+        "sinhala_chars": sinhala_chars,
+        "english_chars": english_chars,
+        "other_letter_chars": other_letter_chars,
+        "letter_chars": letter_chars,
+    }
+
+
+def validate_sinhala_text(
+    text,
+    min_sinhala_ratio=0.82,
+    allow_english_tokens=0,
+):
+    """
+    Strict Sinhala validation for dataset admission.
+
+    IMPORTANT:
+        Mixed-language audio is rejected as a whole clip.
+        English words are NOT removed from the transcript because
+        doing so would make the text no longer match the audio.
+    """
+
+    metrics = get_sinhala_quality(text)
+
+    if metrics["sinhala_chars"] == 0:
+        return False, metrics
+
+    if metrics["english_tokens"]:
+        if len(metrics["english_tokens"]) > allow_english_tokens:
+            return False, metrics
+
+    # Reject other writing systems as well (for example Tamil).
+    if metrics["other_letter_chars"] > 0:
+        return False, metrics
+
+    if metrics["sinhala_ratio"] < min_sinhala_ratio:
+        return False, metrics
+
+    return True, metrics
+
+
+# =====================================================
+# CORRECT ONE WORD WITHOUT CHANGING TIMESTAMP COUNT
+# =====================================================
+
+def correct_word_preserving_alignment(word):
+    """
+    Correct a single ASR word while preserving one word = one
+    timestamp entry.
+
+    If a correction would split one word into multiple words,
+    the original word is retained so word-level timestamps do
+    not become misaligned.
+    """
+
+    if word is None:
+        return ""
+
+    original = str(word).strip()
+    if not original:
+        return ""
+
+    corrected = normalize_english_terms(original)
+    corrected = normalize_suffixes(corrected)
+    corrected = phonetic_similarity_correction(corrected)
+
+    if not corrected or len(corrected.split()) != 1:
+        return original
+
+    return corrected
+
 
 # =====================================================
 # REMOVE SHORT NOISE TOKENS
@@ -564,6 +707,9 @@ def correct_text(text):
         text
     )
 
+    # Do not let the correction stage introduce English into
+    # a Sinhala-only dataset.  The caller decides whether to
+    # reject the complete clip based on validation.
     return text
 
 # =====================================================

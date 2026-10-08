@@ -10,13 +10,7 @@ from silero_vad import (
     get_speech_timestamps
 )
 
-from config import (
-    GOOGLE_DRIVE_FOLDER_ID,
-    GOOGLE_DRIVE_TOKEN
-)
-
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
+from database import get_next_chunk_index
 
 import librosa
 import torch
@@ -31,9 +25,10 @@ import re
 
 # Temporary local folder.
 #
-# Audio files are only stored here while being processed.
-# They are uploaded to Google Drive after successful
-# transcription and then deleted.
+# Audio files are stored here only while being processed.
+# After successful transcription, the actual audio is
+# stored as a BLOB in SQLite and the temporary file is
+# deleted.
 #
 TEMP_CHUNK_DIR = "dataset/clips"
 
@@ -53,237 +48,10 @@ KEEP_SILENCE = 300
 
 
 # =========================================================
-# GOOGLE DRIVE SETTINGS
+# LOAD SILERO VAD
 # =========================================================
-
-DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive"
-]
-
-
-# =========================================================
-# LOAD SILERO MODEL
-# =========================================================
-
-print(
-    "Loading Silero VAD..."
-)
 
 vad_model = load_silero_vad()
-
-print(
-    "Silero VAD Loaded."
-)
-
-
-# =========================================================
-# GET GOOGLE DRIVE SERVICE
-# =========================================================
-
-def get_drive_service():
-
-    if not os.path.exists(
-        GOOGLE_DRIVE_TOKEN
-    ):
-
-        print(
-            "❌ Google Drive token not found."
-        )
-
-        return None
-
-    try:
-
-        credentials = (
-            Credentials.from_authorized_user_file(
-
-                GOOGLE_DRIVE_TOKEN,
-
-                DRIVE_SCOPES
-
-            )
-        )
-
-        service = build(
-
-            "drive",
-
-            "v3",
-
-            credentials=credentials
-
-        )
-
-        return service
-
-    except Exception as e:
-
-        print(
-            f"❌ Google Drive connection failed: {e}"
-        )
-
-        return None
-
-
-# =========================================================
-# GET NEXT CHUNK INDEX FROM GOOGLE DRIVE
-# =========================================================
-
-def get_next_chunk_index():
-
-    print(
-        "\nChecking Google Drive for existing chunks..."
-    )
-
-    service = get_drive_service()
-
-    if service is None:
-
-        print(
-            "❌ Could not connect to Google Drive."
-        )
-
-        # IMPORTANT:
-        # Do NOT start from zero because that can create
-        # duplicate chunk names.
-        #
-        # Returning None allows the caller to stop safely.
-
-        return None
-
-    # -----------------------------------------------------
-    # Query files inside the target Google Drive folder
-    # -----------------------------------------------------
-
-    query = (
-
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
-
-        "and trashed = false"
-
-    )
-
-    try:
-
-        files = []
-
-        page_token = None
-
-        # -------------------------------------------------
-        # Retrieve ALL files.
-        #
-        # We do not assume there are fewer than 1000 files.
-        # -------------------------------------------------
-
-        while True:
-
-            response = service.files().list(
-
-                q=query,
-
-                spaces="drive",
-
-                fields="nextPageToken,files(id,name)",
-
-                pageSize=1000,
-
-                pageToken=page_token
-
-            ).execute()
-
-            files.extend(
-                response.get(
-                    "files",
-                    []
-                )
-            )
-
-            page_token = response.get(
-                "nextPageToken"
-            )
-
-            if not page_token:
-
-                break
-
-    except Exception as e:
-
-        print(
-            f"❌ Could not read Google Drive folder: {e}"
-        )
-
-        return None
-
-    # -----------------------------------------------------
-    # Find existing chunk numbers
-    # -----------------------------------------------------
-
-    indices = []
-
-    for file in files:
-
-        filename = file.get(
-            "name",
-            ""
-        )
-
-        match = re.match(
-
-            r"^chunk_(\d+)\.wav$",
-
-            filename
-
-        )
-
-        if match:
-
-            indices.append(
-
-                int(
-                    match.group(1)
-                )
-
-            )
-
-    # -----------------------------------------------------
-    # No existing chunks
-    # -----------------------------------------------------
-
-    if not indices:
-
-        print(
-            "No existing chunk files found in Google Drive."
-        )
-
-        print(
-            "Starting chunk numbering from 1."
-        )
-
-        return 1
-
-    # -----------------------------------------------------
-    # Highest existing chunk
-    # -----------------------------------------------------
-
-    highest = max(
-        indices
-    )
-
-    next_index = highest + 1
-
-    print(
-        f"Found {len(indices)} existing chunk files."
-    )
-
-    print(
-        f"Highest existing chunk number: {highest}"
-    )
-
-    print(
-        f"Next chunk number: {next_index}"
-    )
-
-    return next_index
 
 
 # =========================================================
@@ -394,24 +162,10 @@ def split_audio(
     )
 
     # -----------------------------------------------------
-    # Get next number from Google Drive
+    # Get next number from SQLite database
     # -----------------------------------------------------
 
     start_idx = get_next_chunk_index()
-
-    # -----------------------------------------------------
-    # SAFETY CHECK
-    # -----------------------------------------------------
-
-    if start_idx is None:
-
-        raise RuntimeError(
-
-            "Could not determine the next chunk number "
-            "from Google Drive. Pipeline stopped to "
-            "prevent duplicate chunk names."
-
-        )
 
     print()
 

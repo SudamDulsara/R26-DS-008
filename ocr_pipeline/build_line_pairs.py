@@ -82,6 +82,19 @@ from pipeline.normalize import normalize          # noqa: E402
 BAD_FLAGS = {
     "no_corrector", "empty_raw", "empty_corrected",
     "wrong_script", "markup", "repetition", "hit_token_cap",
+
+    # Page 1 of an Act: coat of arms, centred title, date, printing notice.
+    # Nothing the corrector was trained on looks like it, and both correctors
+    # misbehave there in their own way -- LightOnOCR returned Kannada wrapped
+    # in HTML, ByT5 rewrites the year into a clause marker. These are the
+    # least trustworthy rows in the corpus.
+    #
+    # Dropped HERE and not in the pipeline, on purpose. The page database is
+    # the primary record and stays lossless: cover pages are written, flagged
+    # cover_page, and remain available to anyone who wants them. This file is
+    # the derived, training-ready view, and a training set is exactly where
+    # rows the model handles badly do the most damage.
+    "cover_page",
 }
 
 #: Below this similarity, two lines are probably not the same line.

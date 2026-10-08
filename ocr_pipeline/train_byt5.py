@@ -159,7 +159,10 @@ def find_data_files():
 
 
 TRAIN_FILES, EVAL_FILES = find_data_files()
-OUTPUT_DIR = "byt5-sinhala-ocr"
+# v2 deliberately, NOT the name the running model uses. If this run comes
+# out worse than v1 -- more data does not always help -- the model Pipeline
+# B is using must still be there to fall back to.
+OUTPUT_DIR = "byt5-sinhala-ocr-v2"
 
 if not TRAIN_FILES:
     sys.exit("No .jsonl training files found. On Kaggle: right panel -> Add Input.")
@@ -396,7 +399,9 @@ CHECK_EVERY = max(10, _TOTAL_STEPS // 8)
 
 print(f"\nschedule: {_TOTAL_STEPS} steps over {EPOCHS} epoch(s) "
       f"({_STEPS_PER_EPOCH}/epoch), warmup {WARMUP_STEPS} "
-      f"({100 * WARMUP_STEPS / _TOTAL_STEPS:.0f}%), evaluating every {CHECK_EVERY}")
+      f"({100 * WARMUP_STEPS / _TOTAL_STEPS:.0f}%), "
+      + (f"evaluating every {CHECK_EVERY}" if EPOCHS > 1 else
+         "no mid-training evaluation (single epoch)"))
 
 args = Seq2SeqTrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -412,15 +417,28 @@ args = Seq2SeqTrainingArguments(
     # single largest saving available and it is what makes this fit.
     gradient_checkpointing=True,
 
-    eval_strategy="steps",
-    eval_steps=CHECK_EVERY,
-    save_strategy="steps",
-    save_steps=CHECK_EVERY,
-    save_total_limit=2,
+    # MID-TRAINING EVALUATION IS OFF FOR A SINGLE-EPOCH RUN, and that is a
+    # measured decision rather than a preference.
+    #
+    # The 2026-09-29 run on 37,016 pairs was killed by Kaggle's 12-hour cap
+    # having reached step 432 of 1157 in 5h 49m. Training itself accounted
+    # for about 31 minutes of that at 4.34s/step; the rest went on eight
+    # validation passes, eight 1.2 GB checkpoint writes, and two stalls the
+    # log shows plainly -- one step reported 2,746s/it, another produced no
+    # output for 1h 40m. The overhead was roughly ten times the training.
+    #
+    # Checkpoint selection exists to catch overfitting, which needs more than
+    # one pass over the data. At EPOCHS=1 the model sees each pair once, so
+    # the last checkpoint IS the best one and there is nothing to choose
+    # between. Above one epoch that stops being true, hence the condition.
+    eval_strategy="steps" if EPOCHS > 1 else "no",
+    save_strategy="steps" if EPOCHS > 1 else "no",
+    **({"eval_steps": CHECK_EVERY, "save_steps": CHECK_EVERY,
+        "save_total_limit": 2} if EPOCHS > 1 else {}),
 
     # Keep whichever checkpoint scored best, not whichever came last —
     # training loss keeps falling after real quality starts degrading.
-    load_best_model_at_end=True,
+    load_best_model_at_end=EPOCHS > 1,
     metric_for_best_model="cer",
     greater_is_better=False,
 
@@ -563,12 +581,37 @@ def evaluate_on_test_set(paths):
     # belongs in the thesis regardless of which way the average goes.
     worse = sum(m > b for m, b in zip(cer_model, cer_raw))
 
+    # SPLIT BY ERA. A single mean hides the thing most worth knowing about
+    # this corpus. Tesseract is 2.4x worse on 1980s scans (0.1650) than on
+    # 2000s print (0.0688), and the LightOnOCR fine-tune on this project
+    # improved the old era by 61% while making modern print 20% WORSE -- an
+    # inversion the overall average completely concealed until it was split.
+    # Whatever this model does, report both halves.
+    eras = {}
+    for r, b, m in zip(rows, cer_raw, cer_model):
+        try:
+            y = int(r.get("year", 0))
+        except (TypeError, ValueError):
+            continue
+        if not y:
+            continue
+        k = ("1981-1989" if y < 1990 else
+             "1990-1999" if y < 2000 else "2000-2019")
+        eras.setdefault(k, []).append((b, m))
+    era_rows = {
+        k: {"pages": len(v),
+            "tesseract": float(np.mean([b for b, _ in v])),
+            "model": float(np.mean([m for _, m in v]))}
+        for k, v in sorted(eras.items())
+    }
+
     return {
         "n": len(rows),
         "tesseract": float(np.mean(cer_raw)),
         "model": float(np.mean(cer_model)),
         "model_wer": float(np.mean([wer(r["gold"], p) for r, p in zip(rows, preds)])),
         "worse": worse,
+        "eras": era_rows,
     }
 
 
@@ -602,6 +645,16 @@ else:
     if abs(result["tesseract"] - TESSERACT_BASELINE) > 0.005:
         print(f"  note: measured baseline differs from the recorded "
               f"{TESSERACT_BASELINE:.4f} — the test set has changed.")
+
+    if result.get("eras"):
+        print("\nBY ERA — where the gain actually comes from:")
+        print(f"  {'era':<12} {'pages':>6} {'tesseract':>10} {'model':>8} {'change':>9}")
+        for era, v in result["eras"].items():
+            d = 100 * (v["tesseract"] - v["model"]) / v["tesseract"] if v["tesseract"] else 0
+            print(f"  {era:<12} {v['pages']:>6} {v['tesseract']:>10.4f} "
+                  f"{v['model']:>8.4f} {d:>8.1f}%")
+        print("  A negative change means the model is worse than Tesseract on")
+        print("  that era. That is a finding, not a failure -- report it.")
 
     if result["model"] < result["tesseract"]:
         drop = 100 * (result["tesseract"] - result["model"]) / result["tesseract"]

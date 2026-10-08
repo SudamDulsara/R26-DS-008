@@ -40,6 +40,7 @@ measurement on 202 human-transcribed pages that this pipeline never touches.
 import argparse
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -470,8 +471,67 @@ def run(args) -> int:
     if written:
         print(f"  per page       : {elapsed / written:.1f}s")
 
+    # Not in Tesseract-only mode. Every row is flagged no_corrector there, so
+    # build_line_pairs drops all of them and exits 1 -- correct behaviour that
+    # would print "FAILED" in the middle of a demo and look like a defect.
+    if written and not args.no_lines and args.corrector != "none":
+        derive_line_pairs(store)
+
     show_status(store)
     return 0
+
+
+def derive_line_pairs(store) -> None:
+    """
+    Turn the page pairs just written into aligned line pairs.
+
+    Pages are the primary record: they are exactly what the two readers
+    produced, and they need no alignment to exist. Lines are DERIVED from
+    them, and derived fresh each time rather than appended to, so the line
+    file always describes whatever the page database currently holds. Stop a
+    run at 40 pages and finish it tomorrow, and the lines regenerate to cover
+    all of them.
+
+    Run as a separate process on purpose. By the time this is called every
+    page is already safely on disk, so nothing here can put the dataset at
+    risk -- and isolating it means a failure in alignment costs a convenience
+    file rather than the run. build_line_pairs.py only ever READS the page
+    database; it writes to its own file.
+    """
+    script = os.path.join(HERE, "build_line_pairs.py")
+    if not os.path.exists(script):
+        return
+
+    lines_db = os.path.splitext(store.db_path)[0] + "_lines.db"
+    lines_jsonl = os.path.join(os.path.dirname(store.jsonl_path),
+                               "line_pairs.jsonl")
+
+    print(f"\nderiving line pairs -> {lines_db}")
+    try:
+        proc = subprocess.run(
+            [sys.executable, script,
+             "--db", store.db_path,
+             "--out", lines_jsonl,
+             "--sqlite", lines_db],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as exc:                     # noqa: BLE001
+        print(f"  skipped: {type(exc).__name__}: {exc}")
+        print("  the page pairs are unaffected -- run build_line_pairs.py "
+              "by hand if you want them")
+        return
+
+    if proc.returncode != 0:
+        print("  FAILED -- the page pairs are unaffected")
+        for line in (proc.stderr or "").strip().splitlines()[-4:]:
+            print("   ", line)
+        return
+
+    for line in (proc.stdout or "").splitlines():
+        t = line.strip()
+        if t.startswith(("aligned pairs", "match rate", "identical pairs")):
+            print("  " + t)
 
 
 def show_status(store: Store = None):
@@ -516,6 +576,9 @@ def main():
     p.add_argument("--lang", default="sin", help="Tesseract language")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N pages this run (0 = no limit)")
+    p.add_argument("--no-lines", action="store_true",
+                   help="skip deriving the line-level database at the end of "
+                        "the run; pages are written either way")
     p.add_argument("--note", default=None, help="free text stored with the run")
     p.add_argument("--allow-digital", action="store_true",
                    help="process born-digital PDFs too. OFF by default: OCRing "
@@ -525,6 +588,16 @@ def main():
                    help="write the database and JSONL somewhere other than "
                         "data/ . Use a scratch folder to trial a corrector "
                         "without touching the real dataset")
+    p.add_argument("--fetch", type=int, default=0, metavar="N",
+                   help="download up to N new Acts from documents.gov.lk "
+                        "before each pass AND KEEP RUNNING. Without this the "
+                        "pipeline processes the folder once and exits")
+    p.add_argument("--interval", type=int, default=1800, metavar="SECS",
+                   help="seconds to wait between passes when --fetch is on "
+                        "(default 1800)")
+    p.add_argument("--cycles", type=int, default=0, metavar="N",
+                   help="stop after N passes instead of running forever. For "
+                        "demonstrating the loop without leaving it running")
     p.add_argument("--status", action="store_true",
                    help="print what has been generated so far and exit")
     args = p.parse_args()
@@ -532,7 +605,56 @@ def main():
     if args.status:
         show_status(open_store(args))
         return 0
-    return run(args)
+
+    if not args.fetch:
+        return run(args)
+
+    # CONTINUOUS MODE. Fetch, process, wait, repeat.
+    #
+    # Everything that makes one pass safe makes the loop safe: a page already
+    # in the database is skipped, doc_id is a hash of the file's bytes so a
+    # re-downloaded PDF is recognised as the same document, and the database
+    # row is written before the JSONL line. So a cycle that dies halfway costs
+    # the remainder of that cycle and nothing else.
+    #
+    # The fetch is deliberately inside the loop rather than a separate
+    # script. The pipeline's claim is that it keeps producing pairs without
+    # supervision; splitting the feeder out would mean two things to start and
+    # a claim that depends on someone remembering to run both.
+    from pipeline_b import fetch as feeder
+
+    cycle = 0
+    print(f"continuous mode: up to {args.fetch} new Acts per pass, "
+          f"{args.interval}s between passes"
+          + (f", stopping after {args.cycles}" if args.cycles else
+             ", Ctrl+C to stop"))
+    try:
+        while True:
+            cycle += 1
+            print(f"\n{'=' * 58}\npass {cycle}  "
+                  f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 58}")
+            got, held, failed = feeder.fetch_new(
+                args.input, args.fetch, HERE)
+            if got or failed:
+                print(f"  [feeder] {got} downloaded, {failed} failed, "
+                      f"{held} held back as training documents")
+
+            rc = run(args)
+            if rc != 0:
+                print(f"pass {cycle} returned {rc}; stopping")
+                return rc
+
+            if args.cycles and cycle >= args.cycles:
+                print(f"\nstopped after {cycle} pass(es) as asked")
+                return 0
+
+            print(f"\nwaiting {args.interval}s for the next pass "
+                  "(Ctrl+C to stop)")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"\n\nstopped after {cycle} pass(es). "
+              "Everything written is safe; run again to carry on.")
+        return 0
 
 
 if __name__ == "__main__":
