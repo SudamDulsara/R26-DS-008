@@ -37,9 +37,15 @@ def download_audio(video):
 
         "format": "bestaudio/best",
 
+
         "outtmpl": output_template,
 
         "quiet": False,
+
+        # YouTube needs a JS runtime to solve its
+        # challenges; deno is the only default, so
+        # enable the installed node.
+        "js_runtimes": {"node": {}},
 
         "postprocessors": [
 

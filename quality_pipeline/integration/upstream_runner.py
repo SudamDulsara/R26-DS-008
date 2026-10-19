@@ -71,7 +71,7 @@ def default_configs(repo_root: Path) -> list[UpstreamConfig]:
                 "-m", "pipeline_b.generate",
                 "--input", r"data\unseen_acts",
                 "--corrector", "byt5",
-                "--model", r"models\byt5-sinhala-ocr",
+                "--model", r"models\byt5-sinhala-ocr-v2",
             ],
             env={
                 "PYTHONIOENCODING": "utf-8",

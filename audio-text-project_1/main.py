@@ -19,7 +19,7 @@ from download import download_audio
 from preprocess import preprocess_audio
 from segment import split_audio
 from transcribe_dataset import transcribe_dataset
-from export_dataset import export_dataset
+
 
 
 # =====================================================
@@ -166,55 +166,7 @@ def main():
         "(automatic collection)"
     )
 
-    # -------------------------------------------------
-    # ASK USER TO DOWNLOAD DATASET
-    # -------------------------------------------------
-
-    print()
-
-    print("=" * 70)
-
-    print(
-        "DATASET DOWNLOAD"
-    )
-
-    print("=" * 70)
-
-    print(
-        "\nDo you want to download the generated "
-        "dataset to your PC?"
-    )
-
-    while True:
-
-        choice = input(
-            "\nEnter Y for Yes or N for No: "
-        ).strip().lower()
-
-        if choice in ("y", "yes"):
-
-            print(
-                "\nExporting dataset..."
-            )
-
-            export_dataset()
-
-            break
-
-        elif choice in ("n", "no"):
-
-            print(
-                "\nDataset download skipped."
-            )
-
-            break
-
-        else:
-
-            print(
-                "Please enter Y or N."
-            )
-
+    
 
 # =====================================================
 # ENTRY

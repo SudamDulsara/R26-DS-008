@@ -65,15 +65,4 @@ def render_feature_chart(doc: Document) -> None:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Surface the discrete diagnostic info that doesn't fit on a 0-1 axis.
-    cols = st.columns(3)
-    cols[0].metric("Total words", features.get("total_words", 0))
-    cols[1].metric("Sinhala words", features.get("sinhala_words", 0))
-    cols[2].metric(
-        "Categories used",
-        f"{len(features.get('categories_used', []))} / 5",
-    )
-
-    cats = features.get("categories_used", [])
-    if cats:
-        st.caption("Categories present: " + ", ".join(cats))
+    # NOTE: the 3-metric row (Total words / Sinhala words / Categories used) was intentionally removed 

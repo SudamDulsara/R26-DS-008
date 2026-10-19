@@ -241,6 +241,16 @@ else:
 
     if not runs.empty:
         st.markdown("### Recent runs")
+        # Make the timestamp human-readable and tidy up column names for display.
+        runs["started_at"] = pd.to_datetime(runs["started_at"]).dt.strftime("%Y-%m-%d %H:%M")
+        runs = runs.rename(columns={
+            "run_id":         "Run ID",
+            "started_at":     "Started at",
+            "docs_processed": "Docs processed",
+            "accepted":       "Accepted",
+            "review":         "Review",
+            "rejected":       "Rejected",
+        })
         st.dataframe(runs, use_container_width=True, hide_index=True)
 
     state = IncrementalState(verdicts_db)
