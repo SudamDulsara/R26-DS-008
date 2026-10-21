@@ -1,6 +1,4 @@
 """
-suffix_rules.py
----------------
 Sinhala suffix inventory used by the morphological analyzer.
 
 This is a *data file*, not logic. New patterns get appended here; the analyzer
@@ -52,8 +50,8 @@ Sources for the rules (verified citations — safe to put in the report):
     [Standard reference for the case system and the animacy / definiteness
      distinctions that drive form selection.]
 
-REGISTER
---------
+REGISTER:
+
 Sinhala is diglossic: spoken (colloquial) and literary (written) Sinhala
 differ in *verb morphology*, not just vocabulary. This table targets the
 **literary/written** register, which is what news, OCR'd documents, and the
@@ -65,22 +63,13 @@ spoken register and would otherwise score artificially low — but it is
 tagged so the scorer can tell the two apart if we ever add register-aware
 weighting (see quality/semantic_overlap.py for why register matters).
 
-ORDERING
---------
+ORDERING:
+
 The analyzer uses *longest-match-first*. SUFFIX_TABLE is sorted by codepoint
 length descending at the bottom of this file, so "ගෙන්" is attempted before
 "න්". Do not rely on the order within the individual category lists below —
 they are grouped for human readability only.
 
-A NOTE ON COVERAGE VS. DISCRIMINATION
--------------------------------------
-Adding suffixes raises the decomposition rate of *all* text, including OCR
-garbage that ends in a common grapheme by chance. The metric that matters is
-the GAP between clean and degraded text, not the absolute score. Before and
-after editing this file, re-run the scorer on the sample corpus and check
-that clean news still separates from OCR/ASR output. If the gap narrows, the
-new rules are hurting, not helping. LOW_CONFIDENCE_SUFFIXES and MIN_ROOT_LEN
-at the bottom exist to control this.
 """
 
 # ---------------------------------------------------------------------------

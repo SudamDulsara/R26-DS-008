@@ -1,10 +1,4 @@
 """
-quality/semantic_overlap.py
----------------------------
-Stage 3b: Cross-register semantic overlap detection. (Novelty 2)
-
-What this stage does
---------------------
 For each document, produce a sentence-embedding vector using a multilingual
 sentence-transformer (LaBSE by default), compare it against every previously-
 seen document's vector using cosine similarity, and apply register-aware
@@ -19,8 +13,7 @@ verdict logic:
   - Similarity ≤ threshold
         → NO ACTION
 
-Why the polarity check exists
------------------------------
+Why the polarity check exists:
 Sentence-embedding models like LaBSE are trained on paraphrase similarity.
 They are structurally weak at negation: two sentences that differ only by
 "X did Y" vs "X did NOT Y" often score >0.85 similar because 90%+ of the
@@ -40,19 +33,6 @@ De Abrew (1981) and Peiris (2018). It's a coarse binary check, not a
 full negation-scope analyzer — but it catches the specific failure mode
 (direct clausal negation of matched content) that generic sentence
 encoders miss.
-
-Why this is the second novelty
-------------------------------
-Stage 2 (exact-hash dedup) catches only byte-identical content after
-normalization. It cannot catch paraphrases: "the prime minister announced X"
-vs "today's announcement from the PM was X" produce completely different
-hashes. This stage catches them.
-
-Beyond generic semantic dedup, this stage is REGISTER-AWARE and
-POLARITY-AWARE — using both the `source` field and Sinhala-specific
-negation detection to make finer-grained decisions than a threshold-only
-approach. This combination is what makes it a Sinhala-corpus-engineering
-contribution rather than a generic semantic dedup step.
 
 Requires:  sentence-transformers  (pip install sentence-transformers)
 """

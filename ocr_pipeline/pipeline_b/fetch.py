@@ -41,7 +41,7 @@ FILE_PROXY = BASE + "/api/content-file-proxy?file=/"
 
 #: The server action behind the Acts listing. Lifted from the page's own
 #: JavaScript bundle, where it is registered as "TableDataAction".
-ACTION_ID = "7f679bcdf1c679caa0f2356b97387098c39c41312a"
+ACTION_ID = "40dd03742cae2465a031936880def365fdd014c22b"
 API_ENDPOINT = "http://gvp-api:4500/website-data/act/get-all"
 
 UA = "Mozilla/5.0"

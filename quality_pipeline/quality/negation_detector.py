@@ -1,44 +1,6 @@
 """
-quality/negation_detector.py
-----------------------------
-Detects the negation polarity of a Sinhala text.
+Sources for the negation inventory:
 
-Why this exists
----------------
-Sentence-embedding models like LaBSE are trained on paraphrase similarity.
-They are structurally weak at negation: two sentences that differ only by
-"X did Y" vs "X did NOT Y" often score >0.85 similar because 90%+ of the
-words are identical and the embedding space wasn't trained to be sensitive
-to that specific perturbation.
-
-This is a documented limitation of sentence encoders (see e.g. SICK-R
-and STS-B analyses across sentence-BERT variants). For a corpus quality
-pipeline, this matters: two documents making opposite claims are NOT
-duplicates and should not be treated as such.
-
-The polarity check runs after sentence-embedding similarity has already
-identified a candidate near-duplicate. If the two documents don't agree
-on whether they contain Sinhala negation markers, we do not treat them
-as duplicates regardless of similarity score.
-
-What this is NOT
-----------------
-- It is NOT a full negation-scope analyzer. It doesn't tell you what
-  is being negated, or handle sentences with multiple clauses where
-  one is negated and one isn't. It's a coarse binary check.
-- It does NOT catch semantic inversions without negation markers, such
-  as antonym flips ("won" vs "lost") or lexical negation ("dry" vs
-  "wet"). The proper solution for those is a Natural Language Inference
-  re-ranker, planned as future work.
-- It does NOT use context. "The article did NOT say X" is treated as
-  negated, even if X itself is a positive claim being reported.
-
-For the current prototype this is sufficient: the primary failure mode
-we observed is direct clausal negation of matched content, and this
-handles that case cleanly.
-
-Sources for the negation inventory
-----------------------------------
 - De Abrew (1981), "The Syntax and Semantics of Negation in Sinhala",
   Cornell PhD dissertation.
 - Peiris (2018), "A Comparative Analysis of Canonical Clausal Negation

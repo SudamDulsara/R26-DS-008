@@ -1,11 +1,8 @@
 """
-schema.py
----------
+
 Defines the Document object: the single data contract that flows through
 every stage of the quality pipeline.
 
-Every stage accepts a Document, mutates/annotates it, and passes it on.
-Need a new field, add it here once — not in each stage.
 """
 
 from dataclasses import dataclass, field

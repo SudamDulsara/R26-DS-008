@@ -17,8 +17,6 @@ tokenizer will learn two different tokens for what a human reads as one letter.
 NFC (Canonical Composition) is the standard choice: it composes characters
 into their shortest canonical form. It's deterministic, lossless, and every
 downstream NLP tool expects it.
-
-This is a  tiny stage. Everything fancy comes later.
 """
 
 import unicodedata

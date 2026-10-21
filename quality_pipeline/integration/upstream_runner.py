@@ -69,15 +69,18 @@ def default_configs(repo_root: Path) -> list[UpstreamConfig]:
             python_exe=root_venv_python,
             args=[
                 "-m", "pipeline_b.generate",
-                "--input", r"data\unseen_acts",
                 "--corrector", "byt5",
                 "--model", r"models\byt5-sinhala-ocr-v2",
+                "--input", r"data\unseen_acts",
+                "--fetch", "4",
+                "--cycles", "1",
             ],
             env={
                 "PYTHONIOENCODING": "utf-8",
                 "HF_HUB_OFFLINE": "1",
             },
-            description="OCR pipeline (ByT5 + Sinhala OCR model) — writes ocr_correction_pairs.db",
+            description="OCR pipeline (ByT5 + Sinhala OCR model) — fetches up to 4 new Acts, "
+                        "runs one pass, writes ocr_correction_pairs.db",
         ),
         UpstreamConfig(
             name="asr",

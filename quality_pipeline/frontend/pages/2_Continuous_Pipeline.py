@@ -28,12 +28,13 @@ from quality_pipeline.integration.upstream_runner import (
     default_configs,
     run_one_streaming,
 )
-
+from quality_pipeline.frontend.theme import inject_theme
 
 st.set_page_config(
     page_title="Continuous Pipeline",
     layout="wide",
 )
+inject_theme() 
 
 st.title("🔁 Continuous Data-Gathering Pipeline")
 st.caption(

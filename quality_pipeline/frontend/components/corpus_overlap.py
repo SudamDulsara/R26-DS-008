@@ -4,14 +4,7 @@ frontend/components/corpus_overlap.py
 Renders the cross-register semantic overlap results for a small corpus
 (3-6 documents processed in one batch).
 
-The single-doc and compare modes can only show pairwise overlap. To
-demonstrate the *register-aware* behaviour of Stage 3b — the whole point
-of the novelty — we need a mode where you can add several docs from
-different sources and see the pipeline decide which are duplicates and
-which are cross-register overlaps that need review.
-
-This component takes the already-processed list of Documents (Stage 3b
-has run on all of them) and renders:
+This component takes the already-processed list of Documents (Stage 3b has run on all of them) and renders:
   - A verdict summary table
   - A similarity heatmap (where the same-source vs cross-source structure
     is visually obvious)
