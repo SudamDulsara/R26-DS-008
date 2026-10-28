@@ -1,10 +1,4 @@
 """
-linguistic/normalizer.py
-------------------------
-Stage 1, minimal version: Unicode normalization.
-
-Why this matters for Sinhala specifically
------------------------------------------
 Sinhala characters can be encoded multiple ways in Unicode. The same visible
 character (say, ක් with a virama) may appear as:
   - a single precomposed codepoint, OR
