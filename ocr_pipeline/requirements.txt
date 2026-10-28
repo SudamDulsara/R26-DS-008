@@ -27,16 +27,23 @@ openai==2.53.0
 pytesseract==0.3.13
 pillow==12.2.0
 
-# ── Not required to run the app ────────────────────────────────
-# The dormant word-boundary subsystem (pipeline/word_boundary.py) needs
-# torch + transformers, and download_corpus.py needs datasets. Stage 1
-# guards its word_boundary import in a try/except, so the app runs fine
-# without them. Install only if reviving that subsystem or rebuilding the
-# Sinhala corpus — torch alone is a multi-gigabyte download.
+# ── Pipeline B: the deliverable ────────────────────────────────
+# Everything below is needed to RUN the generation pipeline, not just the
+# Streamlit demo. Without pymupdf the pipeline cannot open a PDF at all;
+# without torch and transformers the ByT5 corrector cannot load.
 #
-#   torch==2.11.0
-#   transformers==5.7.0
+# torch is CPU-only on Windows from PyPI, which is what this project uses
+# and what the measured 59 s/page was taken on. No GPU is required to run
+# the pipeline — only to train the model.
+pymupdf==1.28.2
+torch==2.11.0
+transformers==5.7.0
+
+# ── Training and evaluation only ───────────────────────────────
+# Needed by train_byt5.py and train_lighton_ocr.py, which run on Kaggle,
+# and by the optional acts-1010 contamination check in build_line_pairs.py.
+# Not needed to run the generation pipeline.
+#
 #   datasets==4.8.5
-#
-# These move above the line once the fine-tuned ByT5 model lands, since
-# local inference will need torch + transformers at runtime.
+#   peft==0.20.0
+#   accelerate==1.14.0
