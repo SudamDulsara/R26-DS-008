@@ -1,7 +1,4 @@
 """
-quality/deduplicator.py
------------------------
-Stage 3 (first piece): Exact-hash deduplication.
 
 Catches *exact* duplicates by hashing the cleaned text. Sounds basic, but
 news data is full of these — wire-service stories republished by 5 outlets,

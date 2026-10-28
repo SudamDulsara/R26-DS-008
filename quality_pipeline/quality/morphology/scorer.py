@@ -1,10 +1,5 @@
 """
-scorer.py
----------
-Stage 3b: Morphology-aware quality scoring for Sinhala documents.
-
-What this stage does
---------------------
+What this stage does:
 For each document, it analyzes every word with the morphological analyzer
 and computes a small set of features that reflect the *morphological
 richness* of the text. These features are then combined into a 0–100
@@ -12,7 +7,7 @@ quality score, and a per-feature breakdown is recorded so the frontend
 can show *why* a document scored what it did.
 
 Why morphology-based quality scoring is novel for Sinhala
---------------------------------------------------------
+
 1. Existing Sinhala morphological analyzers (Hettige & Karunananda 2006;
    Welgama et al. 2013; SinMorphy 2021) were all built to support
    *machine translation* or *parsing* — they consume morphology, they
@@ -34,13 +29,6 @@ Why morphology-based quality scoring is novel for Sinhala
    This is the part that's specific to agglutinative languages and is
    absent from prior corpus-quality work for Sinhala.
 
-What the score is NOT
----------------------
-It is *not* a substitute for human review. It's one signal among several
-(dedup, length, language ID, safety) that together drive the final
-accept/review/reject verdict. A document with low morphological richness
-might still be valid — a list of place names, a math problem, a song lyric. 
-The router (Stage 4) is what makes the actual decision.
 """
 
 from collections import Counter
@@ -73,22 +61,21 @@ class MorphologyQualityScorer(Stage):
         features = self._compute_features(analyses)
         score = self._combine_score(features) if features["scoreable"] else 0.0
 
+        # Record everything on the document.
         doc.quality["morphology"] = {
             "features": features,
             "score": round(score, 1),
             "per_word": [self._summarize_word(a) for a in analyses],
         }
 
-        # NEW: docs with no Sinhala at all are rejected regardless of why we couldn't score them. 
-        # The pipeline produces a Sinhala corpus; non-Sinhala has no place in it.
-        
+        # Docs with no Sinhala at all get rejected regardless of why we
+        # couldn't score them — the pipeline produces a Sinhala corpus.
         if features["sinhala_words"] == 0:
             doc.verdict = Verdict.REJECT
             doc.verdict_reasons.append("no_sinhala_content")
             return doc
 
-        # Docs that are too short to score reliably go to REVIEW, not ACCEPT.
-        # A human can decide; we shouldn't tentatively accept on no information.
+        # Docs too short to score reliably go to REVIEW, not silently to ACCEPT.
         if not features["scoreable"]:
             if doc.verdict == Verdict.PENDING:
                 doc.verdict = Verdict.REVIEW
@@ -97,16 +84,21 @@ class MorphologyQualityScorer(Stage):
                 )
             return doc
 
-        # Existing scoring-based routing.
+        # Score-based routing for scoreable docs.
         if score < REJECT_THRESHOLD:
             doc.verdict = Verdict.REJECT
-            doc.verdict_reasons.append(f"low_morphology_score:{score:.1f}<{REJECT_THRESHOLD}")
+            doc.verdict_reasons.append(
+                f"low_morphology_score:{score:.1f}<{REJECT_THRESHOLD}"
+            )
         elif score < ACCEPT_THRESHOLD:
             if doc.verdict == Verdict.PENDING:
                 doc.verdict = Verdict.REVIEW
-                doc.verdict_reasons.append(f"borderline_morphology:{score:.1f}")
+                doc.verdict_reasons.append(
+                    f"borderline_morphology:{score:.1f}"
+                )
 
         return doc
+
     # --- Feature computation ----------------------------------------------
 
     def _compute_features(self, analyses: list[MorphemeAnalysis]) -> dict:

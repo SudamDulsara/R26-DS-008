@@ -150,8 +150,10 @@ def main():
     lines_db = os.environ.get(
         "LINES_DB", os.path.join(root, "data", "inbox",
                                  "ocr_correction_pairs_lines.db"))
+    # Where pipeline_b/fetch.py caches it: ocr_pipeline/data, not the group's
+    # data/ that the line database lives in.
     catalogue = os.environ.get(
-        "CATALOGUE", os.path.join(root, "data", "_acts_catalogue.txt"))
+        "CATALOGUE", os.path.join(HERE, "data", "_acts_catalogue.txt"))
 
     if not os.path.exists(lines_db):
         sys.exit(f"no line database at {lines_db}")

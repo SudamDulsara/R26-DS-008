@@ -1,32 +1,6 @@
-"""
-frontend/app.py
----------------
-Streamlit prototype for the Sinhala Quality Pipeline (Component 4).
-
-Run from the repo root with:
-    streamlit run quality_pipeline/frontend/app.py
-
-Three modes selectable from the sidebar:
-
-1. Single Document — pipeline runs on one document; verdict, score, and
-   per-word breakdown. Stage 3b will show "no overlap" since there are
-   no prior docs to compare against — that's expected.
-
-2. Compare Two Documents — runs A then B through the SAME pipeline
-   instance. Stage 2 catches byte-identical dupes; Stage 3b catches
-   semantic ones. If they're same-source it's REJECT; if different-source
-   it's REVIEW (cross-register overlap — the register-aware novelty).
-
-3. Corpus overlap — add 3-6 documents from different sources, watch
-   Stage 3b decide which are same-source dupes vs cross-register overlap.
-   This is the mode that actually demonstrates the second novelty end-to-end.
-
-Note: first pipeline run downloads LaBSE (~470MB). Subsequent runs use
-the local cache and are fast.
-"""
-
 import sys
 from pathlib import Path
+
 
 # Make `quality_pipeline` importable when running `streamlit run` from repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +15,7 @@ from quality_pipeline.quality.deduplicator import ExactHashDeduplicator
 from quality_pipeline.quality.morphology.scorer import MorphologyQualityScorer
 from quality_pipeline.quality.semantic_overlap import CrossRegisterSemanticOverlap
 from quality_pipeline.schema import Document, Source, Verdict
+from quality_pipeline.frontend.theme import inject_theme
 
 from quality_pipeline.frontend.components.corpus_overlap import render_corpus_overlap
 from quality_pipeline.frontend.components.feature_chart import render_feature_chart
@@ -60,7 +35,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+inject_theme() 
 
 # ---------------------------------------------------------------------------
 # Demo examples

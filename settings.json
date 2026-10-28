@@ -1,0 +1,5 @@
+{
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\ffmpeg\\ffmpeg-2026-08-20-git-7d77562d2a-full_build\\bin;${env:PATH}"
+    }
+}

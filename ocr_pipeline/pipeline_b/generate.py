@@ -475,7 +475,9 @@ def run(args) -> int:
     # build_line_pairs drops all of them and exits 1 -- correct behaviour that
     # would print "FAILED" in the middle of a demo and look like a defect.
     if written and not args.no_lines and args.corrector != "none":
-        derive_line_pairs(store)
+        lines_db = derive_line_pairs(store)
+        if lines_db:
+            score_lines(lines_db)
 
     show_status(store)
     return 0
@@ -497,6 +499,8 @@ def derive_line_pairs(store) -> None:
     risk -- and isolating it means a failure in alignment costs a convenience
     file rather than the run. build_line_pairs.py only ever READS the page
     database; it writes to its own file.
+
+    Returns the line database path, or None when it was not written.
     """
     script = os.path.join(HERE, "build_line_pairs.py")
     if not os.path.exists(script):
@@ -531,6 +535,46 @@ def derive_line_pairs(store) -> None:
     for line in (proc.stdout or "").splitlines():
         t = line.strip()
         if t.startswith(("aligned pairs", "match rate", "identical pairs")):
+            print("  " + t)
+    return lines_db
+
+
+def score_lines(lines_db) -> None:
+    """
+    Score the freshly derived lines against the SinhaLegal reference.
+
+    Runs after every derive_line_pairs because build_line_pairs.py rebuilds
+    line_pairs from scratch, so line numbers can shift; rescoring each pass
+    keeps `line_scores` keyed to lines that actually exist. Same isolation as
+    above: a failure here costs the scores, never the pairs.
+    """
+    script = os.path.join(HERE, "score_against_reference.py")
+    if not os.path.exists(script):
+        return
+
+    print(f"\nscoring lines against the reference -> {lines_db}")
+    try:
+        proc = subprocess.run(
+            [sys.executable, script],
+            env={**os.environ, "LINES_DB": lines_db},
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as exc:                     # noqa: BLE001
+        print(f"  skipped: {type(exc).__name__}: {exc}")
+        return
+
+    if proc.returncode != 0:
+        # Usually the reference corpus or the Act catalogue is missing, and
+        # the scorer's last line says which. Not a failure of the run.
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        print(f"  skipped: {tail[-1].strip() if tail else 'no output'}")
+        return
+
+    for line in (proc.stdout or "").splitlines():
+        t = line.strip()
+        if t.startswith(("lines scored", "documents scored", "RAW",
+                         "CORRECTED", "change")):
             print("  " + t)
 
 

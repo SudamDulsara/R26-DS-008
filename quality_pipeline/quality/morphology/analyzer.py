@@ -1,8 +1,4 @@
 """
-analyzer.py
------------
-Rule-based morphological analyzer for Sinhala words.
-
 Given a word, returns its decomposition: a (probable) root plus a stack of
 recognized suffixes, each tagged with category (case / plural / verb / etc.).
 
@@ -11,17 +7,6 @@ How it works (longest-match iterative stripping):
   2. If matched, record (suffix, category), strip it, and repeat on the rest.
   3. Stop when no suffix matches OR what's left is too short to be a root.
   4. Return whatever's left as the root.
-
-Why this is sufficient for our purpose:
-  We don't need to be RIGHT about the analysis to score quality usefully.
-  We need our analyzer's *behavior* to differ between rich Sinhala and
-  degraded text — and it does, because:
-    - Rich Sinhala → many words decompose into root + 1-3 known suffixes
-    - OCR garbage  → words don't end in known patterns; few decompositions
-    - ASR junk     → same disfluency repeats; very few unique morphemes
-    - MT-translated → suspiciously *flat* morphology, all forms similar
-  A perfect analyzer would do this better, but a rule-based one already
-  produces signal that distinguishes these classes.
 
 What this analyzer is NOT:
   - It is NOT a full Sinhala lemmatizer (that's SinMorphy / Welgama et al.)

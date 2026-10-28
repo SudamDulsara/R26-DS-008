@@ -5,6 +5,7 @@
 from googleapiclient.discovery import build
 import isodate
 import random
+import time
 
 from config import (
     YOUTUBE_API_KEY,
@@ -13,6 +14,10 @@ from config import (
     MAX_RESULTS,
     MAX_VIDEO_DURATION
 )
+
+from network_utils import force_ipv4
+
+force_ipv4()
 
 # =====================================================
 # CREATE YOUTUBE CLIENT
@@ -23,6 +28,25 @@ youtube = build(
     "v3",
     developerKey=YOUTUBE_API_KEY
 )
+
+# =====================================================
+# RETRY WRAPPER FOR API CALLS
+# =====================================================
+
+def execute_with_retry(request, retries=3, delay=5):
+    for attempt in range(1, retries + 1):
+        try:
+            return request.execute()
+        except (TimeoutError, ConnectionError, OSError) as e:
+            if attempt == retries:
+                raise
+
+            print(
+                f"Network error ({e}). "
+                f"Retrying ({attempt}/{retries}) in {delay}s..."
+            )
+
+            time.sleep(delay)
 
 # =====================================================
 # REJECT KEYWORDS
@@ -86,7 +110,7 @@ def search_videos():
         order="relevance"
     )
 
-    response = request.execute()
+    response = execute_with_retry(request)
 
     return response.get(
         "items",
@@ -114,7 +138,7 @@ def search_channel_videos():
             maxResults=MAX_RESULTS
         )
 
-        response = request.execute()
+        response = execute_with_retry(request)
 
         videos.extend(
             response.get(
@@ -136,7 +160,7 @@ def get_video_details(video_id):
         id=video_id
     )
 
-    response = request.execute()
+    response = execute_with_retry(request)
 
     # -------------------------------------------------
     # DEBUG OUTPUT

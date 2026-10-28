@@ -1,10 +1,4 @@
 """
-linguistic/normalizer.py
-------------------------
-Stage 1, minimal version: Unicode normalization.
-
-Why this matters for Sinhala specifically
------------------------------------------
 Sinhala characters can be encoded multiple ways in Unicode. The same visible
 character (say, ක් with a virama) may appear as:
   - a single precomposed codepoint, OR
@@ -17,8 +11,6 @@ tokenizer will learn two different tokens for what a human reads as one letter.
 NFC (Canonical Composition) is the standard choice: it composes characters
 into their shortest canonical form. It's deterministic, lossless, and every
 downstream NLP tool expects it.
-
-This is a  tiny stage. Everything fancy comes later.
 """
 
 import unicodedata
